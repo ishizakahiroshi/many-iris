@@ -65,7 +65,10 @@ function wranglerJs() {
 
 let child = null;
 async function start() {
+  // --local-upstream keeps request.url on this test's own origin (not the production route),
+  // which is the origin the OAuth resource and issuer are configured with.
   child = spawn(process.execPath, [wranglerJs(), "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
+    "--local-upstream", `127.0.0.1:${port}`, "--upstream-protocol", "http",
     "--persist-to", join(temp, "state"), "--env-file", join(temp, "test.env"), "--show-interactive-dev-session=false"],
     { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1" } });
   let log = "";
@@ -110,7 +113,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=12\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=12\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -157,7 +160,8 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("three tools", res.body.result.tools.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list");
+  check("three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list",
+    `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
     (await rpc(K.alpha, "ping", { _meta: { "io.modelcontextprotocol/protocolVersion": "1999-01-01" } })).status === 400);
@@ -225,6 +229,99 @@ async function main() {
   list = await call(K.alpha, "board_list", { project: "other" });
   check("project filter", list.items.length === 1 && list.items[0].item_id === "o1");
 
+  // --- OAuth for clients that cannot send a writer key (ChatGPT)
+  const resource = `${base}/board/mcp`;
+  r = await mcpRaw(null, { jsonrpc: "2.0", id: 1, method: "ping", params: {} });
+  const challenge = r.headers.get("www-authenticate") ?? "";
+  check("MCP without a token points to the resource metadata",
+    r.status === 401 && challenge.includes(`resource_metadata="${base}/.well-known/oauth-protected-resource/board/mcp"`), challenge);
+  r = await fetch(`${base}/.well-known/oauth-protected-resource/board/mcp`);
+  const prm = await r.json();
+  check("resource metadata names the resource and the issuer",
+    r.status === 200 && prm.resource === resource && prm.authorization_servers?.[0] === base, JSON.stringify(prm));
+  r = await fetch(`${base}/.well-known/oauth-authorization-server`);
+  const asm = await r.json();
+  check("server metadata lists the endpoints",
+    r.status === 200 && asm.issuer === base && asm.authorization_endpoint === `${base}/authorize` &&
+    asm.token_endpoint === `${base}/oauth/token` && asm.registration_endpoint === `${base}/oauth/register`, JSON.stringify(asm));
+  check("server metadata requires S256 and sends iss",
+    JSON.stringify(asm.code_challenge_methods_supported) === '["S256"]' && asm.authorization_response_iss_parameter_supported === true);
+
+  const redirectUri = "https://client.example.com/cb";
+  r = await fetch(`${base}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+    client_name: "Test <App>", redirect_uris: [redirectUri], token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) });
+  const client = await r.json();
+  check("a client registers", r.status === 201 && typeof client.client_id === "string", `${r.status} ${JSON.stringify(client)}`);
+
+  const verifier = randomBytes(32).toString("base64url");
+  const pkce = createHash("sha256").update(verifier).digest("base64url");
+  const authorizeUrl = (state) => `${base}/authorize?${new URLSearchParams({ response_type: "code", client_id: client.client_id,
+    redirect_uri: redirectUri, code_challenge: pkce, code_challenge_method: "S256", state, scope: "board", resource })}`;
+  check("consent without Access is refused", (await fetch(authorizeUrl("s1"))).status === 401);
+  check("consent for another email is refused",
+    (await fetch(authorizeUrl("s1"), { headers: asOwner(jwt({ email: "someone@example.com" })) })).status === 403);
+
+  const cookiesOf = (res) => res.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+  async function consent(state) {
+    const res = await fetch(authorizeUrl(state), { headers: asOwner() });
+    const text = await res.text();
+    return { res, text, handle: /name="handle" value="([^"]+)"/.exec(text)?.[1] ?? "", cookie: cookiesOf(res) };
+  }
+  const answer = (c, decision, headers = asOwner()) => fetch(`${base}/authorize`, { method: "POST", redirect: "manual",
+    headers: { ...headers, "content-type": "application/x-www-form-urlencoded", cookie: c.cookie },
+    body: new URLSearchParams({ handle: c.handle, decision }) });
+
+  let page1 = await consent("s1");
+  const csp = page1.res.headers.get("content-security-policy") ?? "";
+  check("consent page for the owner", page1.res.status === 200 && page1.handle.length > 0 && page1.text.includes("client.example.com"));
+  check("consent page escapes the client's name", page1.text.includes("Test &#60;App&#62;") && !page1.text.includes("Test <App>"));
+  check("consent page names the actor", page1.text.includes("oauth-test-app"));
+  check("consent page has no scripts and posts only here and to the client",
+    csp.includes("default-src 'none'") && csp.includes("form-action 'self' https://client.example.com") && csp.includes("frame-ancestors 'none'"), csp);
+  check("approval without Access is refused", (await answer(page1, "approve", {})).status === 401);
+
+  r = await answer(page1, "approve");
+  const back = new URL(r.headers.get("location") ?? "about:blank");
+  check("approval returns a code to the client",
+    r.status === 302 && back.origin + back.pathname === redirectUri && back.searchParams.get("state") === "s1" &&
+    back.searchParams.get("iss") === base && (back.searchParams.get("code") ?? "").length > 0, String(back));
+  check("the consent form works once", (await answer(page1, "approve")).status === 400);
+
+  const tokenRequest = (params) => fetch(`${base}/oauth/token`, { method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(params) });
+  const grant = { grant_type: "authorization_code", code: back.searchParams.get("code"), redirect_uri: redirectUri,
+    client_id: client.client_id, resource };
+  check("a code without its PKCE verifier gets no token", (await tokenRequest(grant)).status === 400);
+  page1 = await consent("s2");
+  r = await answer(page1, "approve");
+  const code2 = new URL(r.headers.get("location") ?? "about:blank").searchParams.get("code");
+  r = await tokenRequest({ ...grant, code: code2, code_verifier: verifier });
+  const tokens = await r.json();
+  check("the code and its verifier get a token",
+    r.status === 200 && typeof tokens.access_token === "string" && typeof tokens.refresh_token === "string", `${r.status} ${JSON.stringify(tokens)}`);
+  r = await mcpRaw(tokens.access_token, { jsonrpc: "2.0", id: ++rpcId, method: "tools/call",
+    params: { name: "board_add_event", arguments: { item_id: "p1", kind: "note", text: "from an OAuth client" } } });
+  const written = await r.text();
+  out = (() => { try { return JSON.parse(written).result?.structuredContent ?? {}; } catch { return {}; } })();
+  check("an OAuth token writes as its client's actor", out.ok === true && out.event?.actor === "oauth-test-app",
+    `${r.status} ${r.headers.get("www-authenticate") ?? ""} ${written.slice(0, 300)}`);
+  check("an OAuth token cannot read the page data",
+    (await status({ authorization: `Bearer ${tokens.access_token}` })) === 401);
+  check("a broken token is refused at MCP",
+    (await mcpRaw(`${tokens.access_token}x`, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
+  check("the code works once", (await tokenRequest({ ...grant, code: code2, code_verifier: verifier })).status === 400);
+  check("a replayed code revokes the tokens it gave",
+    (await mcpRaw(tokens.access_token, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
+
+  page1 = await consent("s3");
+  r = await answer(page1, "deny");
+  const denied = new URL(r.headers.get("location") ?? "about:blank");
+  check("declining returns access_denied", r.status === 302 && denied.searchParams.get("error") === "access_denied" &&
+    denied.searchParams.get("state") === "s3", String(denied));
+  check("an unknown client gets no consent page",
+    (await fetch(authorizeUrl("s4").replace(encodeURIComponent(client.client_id), "unknown-client"), { headers: asOwner() })).status === 400);
+
   // --- the item limit (12 in this run)
   let lastCode = "OK";
   for (let n = 0; n < 12 && lastCode === "OK"; n++) {
@@ -261,6 +358,8 @@ try {
 }
 if (crashed) {
   console.error(`CRASHED: ${crashed.stack ?? crashed}`);
+  console.error(`before the crash: passed ${passed}, failed ${failures.length}`);
+  for (const f of failures) console.error(`FAIL ${f}`);
   process.exit(2);
 }
 console.log(`passed ${passed}, failed ${failures.length}`);

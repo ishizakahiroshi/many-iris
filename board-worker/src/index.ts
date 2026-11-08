@@ -2,19 +2,33 @@
 //
 //   GET  /board        read-only page (people, through Cloudflare Access)
 //   GET  /api/board    page data (people, through Cloudflare Access)
-//   POST /board/mcp    MCP for writers (writer key as a Bearer token; Access lets this path through)
+//   POST /board/mcp    MCP for writers: a writer key, or an OAuth access token
+//                      for this resource, as a Bearer token (Access lets this path through)
+//   GET/POST /authorize  OAuth consent page (a board owner, through Cloudflare Access)
+//   /.well-known/oauth-*, /oauth/token, /oauth/register
+//                      OAuth discovery, tokens and client registration (the library;
+//                      Access lets these through)
 //   GET  /healthz      "ok"
 //
 // Scripts and styles come from ./public (static assets, no secrets in them).
 import { DurableObject } from "cloudflare:workers";
+import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
 import { accessUser, type AccessResult } from "./access";
-import { authenticate, bearer, type AuthResult } from "./keys";
+import { authenticate } from "./keys";
 import { handle } from "./mcp";
+import { SCOPE, authorize } from "./oauth";
+import { validActor } from "./rules";
 import { DEFAULT_LIMITS, Store, guarded, type Limits } from "./store";
 
 export interface Env {
   BOARD: DurableObjectNamespace<BoardStore>;
+  /** OAuth clients, grants and tokens (the library's storage). */
+  OAUTH_KV: KVNamespace;
+  /** Injected by the OAuth library into the handlers it calls. */
+  OAUTH_PROVIDER: OAuthHelpers;
+  /** The public origin, e.g. https://iris.example.com: the OAuth issuer. */
+  BOARD_PUBLIC_ORIGIN?: string;
   /** JSON: {"schema_version":1,"writers":[{"actor","token_sha256","enabled"}]} */
   BOARD_WRITERS?: string;
   /** Cloudflare Access settings for the people who read the page (see access.ts). */
@@ -25,6 +39,8 @@ export interface Env {
   BOARD_LIMIT_ITEMS?: string;
   BOARD_LIMIT_EVENTS?: string;
 }
+
+const MCP_PATH = "/board/mcp";
 
 const MAX_BODY = 65536;
 
@@ -110,22 +126,34 @@ function accessFailure(result: Exclude<AccessResult, { ok: true }>): Response {
   }
 }
 
-function authFailure(result: Exclude<AuthResult, { ok: true }>): Response {
-  switch (result.reason) {
-    case "unavailable":
-      return failure(503, "KEYS_UNAVAILABLE", "The key list is not set up");
-    case "disabled":
-      return failure(403, "KEY_DISABLED", "This key is switched off");
-    default:
-      return failure(401, "AUTH", "A valid key is required");
-  }
-}
-
 function boardStub(env: Env) {
   return env.BOARD.get(env.BOARD.idFromName("board"));
 }
 
-export default {
+/**
+ * /board/mcp, reached only with a valid Bearer token for this resource: an OAuth
+ * access token (props from the grant) or a writer key (props from
+ * resolveExternalToken). The actor always comes from those props.
+ */
+const mcpHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== MCP_PATH) return failure(404, "NOT_FOUND", "Not found");
+    if (request.method !== "POST") return failure(405, "METHOD", "Use POST");
+    if (foreignOrigin(request, url)) return failure(403, "ORIGIN", "Requests from other sites are refused");
+    const actor = (ctx as ExecutionContext & { props?: { actor?: unknown } }).props?.actor;
+    if (typeof actor !== "string" || !validActor(actor)) return failure(401, "AUTH", "A valid key is required");
+    const body = await readBody(request);
+    if (body instanceof Response) return body;
+    const stub = boardStub(env);
+    const result = await handle(body.value, (tool, args) => stub.run(tool, actor, args));
+    if (result === null) return respond(202, null, "text/plain");
+    return json(result.status, result.body);
+  },
+};
+
+/** Everything that is not the protected resource or the library's own OAuth endpoints. */
+const siteHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -133,6 +161,7 @@ export default {
 
     if (path === "/healthz" && method === "GET") return respond(200, "ok", "text/plain; charset=utf-8");
     if (path === "/" && method === "GET") return respond(302, null, "text/plain", { location: "/board" });
+    if (path === "/authorize") return authorize(request, env);
 
     if (path === "/board" && method === "GET") {
       const who = await accessUser(request, env);
@@ -147,19 +176,67 @@ export default {
       return data.ok === false ? failure(503, "STORAGE", "Board unavailable") : json(200, data);
     }
 
-    if (path === "/board/mcp") {
-      if (method !== "POST") return failure(405, "METHOD", "Use POST");
-      if (foreignOrigin(request, url)) return failure(403, "ORIGIN", "Requests from other sites are refused");
-      const who = await authenticate(env.BOARD_WRITERS, bearer(request));
-      if (!who.ok) return authFailure(who);
-      const body = await readBody(request);
-      if (body instanceof Response) return body;
-      const stub = boardStub(env);
-      const result = await handle(body.value, (tool, args) => stub.run(tool, who.actor, args));
-      if (result === null) return respond(202, null, "text/plain");
-      return json(result.status, result.body);
-    }
-
     return failure(404, "NOT_FOUND", "Not found");
+  },
+};
+
+/** The configured public origin, only in its canonical form (https, or http on a loopback host for tests). */
+function publicOrigin(raw: string | undefined): string | null {
+  const value = (raw ?? "").trim();
+  try {
+    const url = new URL(value);
+    const loopback = url.hostname === "127.0.0.1" || url.hostname === "localhost";
+    if (url.origin !== value || !(url.protocol === "https:" || (url.protocol === "http:" && loopback))) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+const providers = new Map<string, OAuthProvider<Env>>();
+
+function providerFor(origin: string): OAuthProvider<Env> {
+  const known = providers.get(origin);
+  if (known) return known;
+  const resource = `${origin}${MCP_PATH}`;
+  const provider = new OAuthProvider<Env>({
+    apiRoute: MCP_PATH,
+    apiHandler: mcpHandler,
+    defaultHandler: siteHandler,
+    authorizeEndpoint: "/authorize",
+    tokenEndpoint: "/oauth/token",
+    clientRegistrationEndpoint: "/oauth/register",
+    clientIdMetadataDocumentEnabled: true,
+    scopesSupported: [SCOPE],
+    requiredScopes: [SCOPE],
+    resourceMetadata: {
+      resource,
+      authorization_servers: [origin],
+      bearer_methods_supported: ["header"],
+      resource_name: "Many Iris board",
+    },
+    // Writer keys (many-ai-cli, Muse) keep working: they are this board's own keys,
+    // checked against the hashes in BOARD_WRITERS, never forwarded anywhere.
+    resolveExternalToken: async ({ token, env }) => {
+      const who = await authenticate(env.BOARD_WRITERS, token);
+      if (who.ok) return { props: { actor: who.actor }, audience: resource };
+      if (who.reason === "disabled") {
+        throw new ExternalTokenError("invalid_token", { description: "This key is switched off", statusCode: 403 });
+      }
+      if (who.reason === "unavailable") {
+        throw new ExternalTokenError("temporarily_unavailable", { description: "The key list is not set up", statusCode: 503 });
+      }
+      return null;
+    },
+  });
+  providers.set(origin, provider);
+  return provider;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const origin = publicOrigin(env.BOARD_PUBLIC_ORIGIN);
+    if (origin === null) return failure(503, "CONFIG", "The board's public origin is not set up");
+    return providerFor(origin).fetch(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;

@@ -16,8 +16,9 @@
 案件・計画・Issue・PR・作業を項目として並べ、それぞれに「始めた」「終わった」「メモ」などの出来事を書き足していく看板です。
 
 - 人は、ブラウザで `/board` を開いて読みます。入口は Cloudflare Access で、許可したメールアドレスの人だけが入れます。Worker も Access の署名を自分で確かめます。
-- AI や道具は、`/board/mcp`（MCP）へ書き込み用の鍵で書きます。道具は `board_upsert_item`（項目の作成と更新）・`board_add_event`（出来事の追加）・`board_list`（読み取り）の 3 つです。
-- 書いた人は鍵から決まり、本文で名乗ることはできません。項目や出来事を消す道具はありません。
+- AI や道具は、`/board/mcp`（MCP）へ書きます。道具は `board_upsert_item`（項目の作成と更新）・`board_add_event`（出来事の追加）・`board_list`（読み取り）の 3 つです。
+- 書く側の本人確認は 2 通りです。手元の道具は、書き込み用の鍵を Bearer で送ります。ChatGPT のように鍵を送れない MCP の client は、OAuth で接続します。OAuth の許可の画面（`/authorize`）は、Access でログインした看板の持ち主だけが開けます。OAuth の部分は Cloudflare の [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) を使っています。
+- 書いた人は、鍵か、許可した client から決まります。本文で名乗ることはできません。項目や出来事を消す道具はありません。
 - 項目と出来事の決まり（使える文字・長さ・状態の種類・親子）は、Rust 版の看板と同じです。[`iris/README.md`](iris/README.md) の「看板（board）」を見てください。
 
 ### 自分の Cloudflare に置く
@@ -25,10 +26,10 @@
 Cloudflare のアカウントと、Cloudflare で管理しているドメインが要ります。以下は `board.example.com` に置く例です。
 
 1. `board-worker/` で依存を入れます（`pnpm install`）。
-2. `wrangler.toml` の `routes` の `pattern` を、自分のドメインに書き換えます。
+2. `wrangler.toml` の `routes` の `pattern` と `BOARD_PUBLIC_ORIGIN` を、自分のドメインに書き換えます。OAuth の保存先の KV を作り（`wrangler kv namespace create <名前>`）、出てきた id を `[[kv_namespaces]]` の `id` に書きます。
 3. Cloudflare Zero Trust で、Access のアプリを 2 つ作ります。
-   - `board.example.com` 全体：自分のメールアドレスだけを許可する
-   - `board.example.com/board/mcp` だけ：Bypass（ここは Worker が鍵で確かめるため）
+   - `board.example.com` 全体：自分のメールアドレスだけを許可する（`/authorize` もここに入る）
+   - `board.example.com/board/mcp`・`board.example.com/.well-known/*`・`board.example.com/oauth/*`：Bypass（MCP は Worker が鍵か OAuth の token で確かめ、OAuth の発見と token の受け渡しは client が直接呼ぶため）
 4. 書き込み用の鍵を作ります。鍵は新しいファイルに書かれ、画面には出ません。一覧には鍵の SHA-256 だけが入ります。
 
    ```powershell
@@ -46,7 +47,7 @@ Cloudflare のアカウントと、Cloudflare で管理しているドメイン�
 
 ### 試験
 
-`board-worker/` で `node test/board.test.mjs` を実行します。`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・項目と出来事の規則・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
+`board-worker/` で `node test/board.test.mjs` を実行します。`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・OAuth の一周（発見・client の登録・許可の画面・PKCE・token・使い回した code の取り消し）・項目と出来事の規則・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
 
 ## 本体（iris）
 
