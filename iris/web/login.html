@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Many Iris — 本人用画面</title><link rel="stylesheet" href="/app.css"><script src="/login.js" defer></script></head>
+<body><header class="masthead"><div><p class="eyebrow">Many Iris</p><h1>本人用の画面へ。</h1></div><div class="mode"><strong>ローカル・合成環境</strong><span>実AI・ChatGPTは未接続</span></div></header>
+<main id="main"><section class="welcome"><h2>本人用キーで接続します</h2><p>起動時に状態フォルダへ保存された <code>iris.ui.key</code> の内容を入力してください。キーをAIや外部サービスへ渡さないでください。</p><p>キーはこのPCのMany Irisだけへ送ります。MCP用の資格では本人判断を確定できません。</p>
+<form id="login-form"><label for="ui-key">本人用キー</label><input id="ui-key" type="password" autocomplete="off" spellcheck="false" required maxlength="64"><button type="submit">本人用画面を開く</button></form><p id="login-result" role="status" aria-live="polite"></p><p class="small">同じOSユーザー権限を持つプログラムからの完全隔離や、遠隔公開用の認証ではありません。</p></section></main></body></html>

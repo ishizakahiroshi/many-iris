@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "command": [],
+  "timeout": 10,
+  "max_output": 65536
+}

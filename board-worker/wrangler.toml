@@ -1,0 +1,27 @@
+name = "many-iris-board"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+# Reachable only through the custom domain added at deploy time (no workers.dev, no preview URLs).
+workers_dev = false
+preview_urls = false
+# Custom domain: Cloudflare adds the DNS record and the certificate.
+routes = [{ pattern = "iris.ishizakahiroshi.com", custom_domain = true }]
+
+[build]
+command = "node scripts/sync-web.mjs"
+
+# Scripts and styles only. Pages are served by the Worker, which checks the key first.
+[assets]
+directory = "./public"
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "BoardStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BoardStore"]
+
+# Secrets (set with `wrangler secret put`, never in this file):
+#   BOARD_WRITERS  key list of the writers (hashes only)
+#   BOARD_READERS  key list of the readers (hashes only)

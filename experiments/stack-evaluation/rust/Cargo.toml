@@ -1,0 +1,16 @@
+[package]
+name = "iris-stack-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "=0.8.9"
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net"] }
+serde_json = "=1.0.151"
+rusqlite = { version = "=0.40.2", features = ["bundled", "backup"] }
+sha2 = "=0.10.9"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

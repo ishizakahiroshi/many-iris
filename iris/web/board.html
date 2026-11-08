@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="iris-ui-token" content="__IRIS_UI_TOKEN__">
+  <title>Many Iris — 看板</title>
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/board.css">
+  <script src="/board.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#board-main">看板へ移動</a>
+  <header class="masthead">
+    <div><p class="eyebrow">Many Iris</p><h1>案件の看板</h1></div>
+    <div class="mode"><span class="mode-dot" aria-hidden="true"></span><strong>読み取り専用</strong><span>この画面から書き込むことはできません</span></div>
+  </header>
+  <section class="connection-bar" aria-label="接続と情報の鮮度">
+    <p id="board-status">看板を読み込んでいます…</p>
+    <p id="board-observed">確認時点：未取得</p>
+    <button id="board-refresh" type="button" class="quiet">読み直す</button>
+  </section>
+  <main id="board-main" tabindex="-1" class="board-main">
+    <div id="board-projects"><p class="empty">看板を読み込んでいます。</p></div>
+    <section class="content-section" aria-labelledby="board-events-title">
+      <div class="section-heading"><h2 id="board-events-title">最近の出来事</h2><span id="board-event-count" class="count">—</span></div>
+      <ol id="board-events" class="board-events"></ol>
+    </section>
+  </main>
+  <footer><span>Many Iris / 看板（読み取り専用）</span><span>書き込みは鍵を持つ担当だけが行います。この画面は鍵を扱いません。</span></footer>
+</body>
+</html>

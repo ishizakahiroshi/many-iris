@@ -1,0 +1,89 @@
+# === OS / エディタ ===
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === ログ・一時・スクラッチ ===
+*.log
+*.jsonl
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# === Local video compositions, source assets, and renders ===
+/brag-output/
+
+# === AI ツールのローカル状態（トークンを含む可能性あり） ===
+.claude/
+.commandcode/
+# Cursor Agent CLI にはグローバル指示の口が無いため、共通ルールへのポインタを
+# .cursor/rules に置く運用。ローカル環境固有の内容を含むので追跡しない。
+.cursor/
+.codex-tmp/
+# many-ai-cli が opencode セッション中だけ cwd に書く permission 設定と排他ロック。
+# セッションが kill されると置き去りになる（orchestration 子が書くのは "*": "allow"）。
+# tracked file には gitignore が効かないので、opencode 設定を意図して commit する
+# リポジトリがあってもこの行は影響しない。
+opencode.json*
+
+# === ツール生成キャッシュ（アカウント ID 等の識別子を含み得る・追跡しない） ===
+.wrangler/
+.vercel/
+.netlify/
+.firebase/
+.turbo/
+.parcel-cache/
+.terraform/
+.serverless/
+**/supabase/.temp/
+# docsweep のローカル state / 旧世代 backup（v0.4+ は no-op だが旧版が生成し得るため常に ignore）
+.docsweep/
+
+# === ローカル/プライベート追記（fresh public clone から除外） ===
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+*.local.md
+*.local.json
+# docs/local/ は作業ノート（plan / bugfix / pending / recap）の置き場。
+# public リポでは追跡しない。private リポでのみ tracked にしてよい（後日 grep するため）。
+# 判断軸は「秘匿情報を書くか」ではなく「リポが公開されているか」。
+docs/local/
+scripts/local/
+
+# === 認証情報・secrets・鍵（public へ絶対に出さない） ===
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+secrets.*
+*.secret.*
+*credential*
+.netrc
+.npmrc
+.pypirc
+# === Python 試作（prototype/・tests/）の生成物と状態 ===
+__pycache__/
+*.pyc
+.state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.pytest_cache/
+artifacts/
+
+# === obsidian-link: managed ===
+/docs/obsidian/
+# === /obsidian-link: managed ===

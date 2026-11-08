@@ -1,0 +1,21 @@
+.board-main{max-width:1180px;margin:0 auto;padding:26px 40px 50px}
+.connection-bar,footer{width:min(1100px,calc(100% - 80px));margin-left:auto;margin-right:auto}
+.board-project{margin-bottom:34px}
+.board-project>h2{font-size:1.25rem;overflow-wrap:anywhere;margin-bottom:12px}
+.board-tree,.board-tree ul{list-style:none;margin:0;padding:0}
+.board-tree ul{margin-left:22px;border-left:2px solid var(--line);padding-left:14px}
+.board-node{margin:0 0 10px}
+.board-card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:12px 15px;overflow-wrap:anywhere}
+.board-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+.board-title{font-size:.95rem;font-weight:650;margin:0}
+.board-badges{display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0}
+.badge.active{color:#9b431b;border-color:var(--accent);background:#fff1e6}
+.board-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:.76rem;color:var(--soft);margin-top:6px}
+.board-wait{font-size:.82rem;margin-top:6px;color:var(--warn)}
+.board-last{font-size:.8rem;margin-top:8px;padding-top:7px;border-top:1px dashed var(--line);color:var(--ink)}
+.board-last time,.board-event time{display:block;font-size:.71rem;color:var(--soft)}
+.board-events{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:9px}
+.board-event{border-left:2px solid var(--line);padding:2px 0 5px 13px;font-size:.82rem;overflow-wrap:anywhere}
+.board-event .who{color:var(--soft);font-size:.74rem}
+.board-text{white-space:pre-wrap}
+@media(max-width:700px){.connection-bar,footer{width:calc(100% - 38px)}.board-main{padding:20px 19px 35px}.board-tree ul{margin-left:10px;padding-left:9px}}

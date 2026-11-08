@@ -1,0 +1,5 @@
+**/__pycache__/
+output/
+commands/
+artifacts/
+fixtures/tasks-10000.json

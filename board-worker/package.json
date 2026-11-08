@@ -1,0 +1,12 @@
+{
+  "name": "many-iris-board-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "node test/board.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.158.0"
+  }
+}

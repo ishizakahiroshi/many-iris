@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Many Iris — ローカル実行候補</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><main class="shell">
+<header class="masthead"><div><a class="brand" href="/">Many Iris</a><p class="eyebrow">自分の仕事を、見渡して任せる</p></div><div class="environment"><strong>合成データ / ローカル限定</strong><span>実AI・外部サービスには接続しません</span></div></header>
+<section class="intro"><div><h1>今どこで、次は誰の番か。</h1><p>計画を選んで開始すると、その範囲で架空のAI担当が作業を進めます。</p></div><button id="refresh" class="secondary" type="button">最新の状態を読む</button></section>
+<p id="connection" class="connection" role="status">状態を取得しています。</p><p id="error" class="message error" role="alert" hidden></p><p id="notice" class="message notice" role="status" hidden></p>
+<section class="stats" aria-label="現在地"><article><span>進行している仕事</span><strong id="running-count">—</strong></article><article><span>本人の判断待ち</span><strong id="approval-count">—</strong></article><article><span>通知候補</span><strong id="notification-count">—</strong></article></section>
+<div class="workspace"><aside class="surface plan-surface"><div class="section-title"><h2>案件と計画</h2><span>任せる範囲</span></div><div id="plans" class="plan-list"></div></aside>
+<section class="surface detail-surface" aria-labelledby="detail-title"><div class="section-title"><h2 id="detail-title">計画を選んでください</h2><span id="plan-revision"></span></div><p id="plan-note" class="muted">一覧から、進めたい計画を選びます。</p><div id="start-controls" class="actions"></div><div id="run-status" class="run-status"></div><div id="tasks" class="task-list"></div><section id="approval-section" class="approval-section" hidden><h3>本人の判断を待っています</h3><p>対象と版を確認して返答してください。別の計画は独立して進みます。</p><div id="approvals"></div></section><details class="exercise"><summary>合成の停止・引き継ぎを試す</summary><p>実AIへの停止命令ではありません。架空の担当の停止を確定し、別担当へ同じ範囲を引き継ぐ試験です。</p><div id="exercise-controls" class="actions"></div></details></section></div>
+<section id="document-surface" class="surface document-surface" hidden><div class="section-title"><h2 id="document-title">原文</h2><button id="close-document" class="secondary" type="button">原文を閉じる</button></div><p id="document-revision" class="muted"></p><pre id="document-body"></pre></section>
+<div class="bottom-grid"><section class="surface"><div class="section-title"><h2>実行の経過</h2><span>最後の20件</span></div><ol id="events" class="event-list"></ol></section><section class="surface"><div class="section-title"><h2>通知の候補</h2><span>端末への送信なし</span></div><p class="muted">判断待ち・人の対応が必要な停止・完了を知らせるための記録です。</p><ol id="notifications" class="event-list"></ol></section></div>
+<footer>この画面は初版の実装候補です。合成試験の成功は、実案件・実スマホでの受入や実AIの長時間稼働を意味しません。</footer>
+</main></body></html>

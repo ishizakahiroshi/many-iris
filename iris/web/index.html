@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="iris-ui-token" content="__IRIS_UI_TOKEN__">
+  <title>Many Iris — 案件と仕事</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">仕事の内容へ移動</a>
+  <header class="masthead">
+    <div><p class="eyebrow">Many Iris</p><h1>任せた仕事の、<br class="mobile-break">今と次を。</h1></div>
+    <div class="mode"><span class="mode-dot" aria-hidden="true"></span><strong id="mode-title">合成データの確認用</strong><span id="mode-detail">実AI・ChatGPTは未接続</span></div>
+  </header>
+  <section class="connection-bar" aria-label="接続と情報の鮮度">
+    <p id="connection-label">状態を確認しています…</p>
+    <p id="observed-label">確認時点：未取得</p>
+    <button id="refresh" type="button" class="quiet">状態を確認</button>
+  </section>
+  <p id="live-message" class="sr-only" role="status" aria-live="polite"></p>
+  <section id="notice" class="notice" hidden aria-labelledby="notice-title">
+    <h2 id="notice-title">確認が必要です</h2><p id="notice-text"></p>
+    <div class="action-row"><button id="reconcile" type="button" class="quiet">状態を確認</button><button id="check-receipt" type="button" class="quiet" hidden>同じ依頼の受付確認</button></div>
+  </section>
+  <main id="main" tabindex="-1">
+    <div class="workspace">
+      <aside class="project-pane" aria-labelledby="projects-title">
+        <div class="section-heading"><div><p class="eyebrow">案件と計画</p><h2 id="projects-title">どの仕事を見ますか</h2></div><span id="plan-count" class="count">—</span></div>
+        <label class="search-label" for="plan-search">案件名・計画名で絞り込む</label>
+        <input type="search" id="plan-search" placeholder="案件・計画を探す" autocomplete="off">
+        <div id="plan-list" class="plan-list"><p class="empty">案件を読み込んでいます。</p></div>
+      </aside>
+      <section id="detail" class="detail" aria-labelledby="detail-title" hidden>
+        <button id="back-to-list" type="button" class="text-button">← 案件と計画へ戻る</button>
+        <div class="detail-heading"><div><p id="project-label" class="eyebrow"></p><h2 id="detail-title"></h2></div><span id="plan-state" class="badge"></span></div>
+        <div id="detail-update" class="update-banner" hidden><p>新しい状態があります。読んでいる内容を保つため、表示を更新していません。</p><button id="apply-update" type="button" class="quiet">内容を更新する</button></div>
+        <p id="summary" class="summary"></p>
+        <div class="facts"><div><span>許可の状態</span><strong id="approval-state">未確認</strong></div><div><span>許可の有効期限</span><strong id="approval-expiry">未確認</strong></div></div>
+        <div id="blocked" class="blocked" hidden></div>
+        <div id="plan-actions" class="action-row"></div>
+        <section class="content-section" aria-labelledby="tasks-title"><div class="section-heading"><h3 id="tasks-title">作業の流れ</h3><span class="small">状態と結果は別々に確認します</span></div><ol id="tasks" class="tasks"></ol></section>
+        <section id="decision-section" class="decision content-section" hidden aria-labelledby="decision-title">
+          <p class="eyebrow">本人の判断が必要</p><h3 id="decision-title">内容を確認して返答してください</h3>
+          <p>この返答は、下に示す対象と版にだけ反映します。AI会話から承認を確定することはできません。</p>
+          <p id="decision-binding" class="small"></p><div id="decision-content" class="prose"></div><p id="decision-warning" class="blocked" hidden></p>
+          <div id="decision-actions" class="action-row"></div>
+        </section>
+        <section class="content-section" aria-labelledby="source-title"><div class="section-heading"><h3 id="source-title">計画と原文</h3><button id="open-source" type="button" class="text-button">原文を読む →</button></div><p id="source-reference" class="source-ref"></p><p id="source-note" class="small">合成の原文です。元ファイルや外部サイトを自動で開くことはありません。</p></section>
+        <section class="content-section" aria-labelledby="history-title"><h3 id="history-title">進行の記録と根拠</h3><div id="history" class="history"></div></section>
+        <details class="technical"><summary>照合用の対象と版</summary><pre id="bindings"></pre></details>
+      </section>
+      <section id="no-selection" class="welcome"><p class="eyebrow">仕事の見取り図</p><h2>計画を選んで、<br>今の状況から確かめる。</h2><p>任せる範囲、判断待ち、結果と根拠をひとつの流れで確認できます。</p><p id="welcome-note" class="small">ここで動くのは合成の実行候補です。実案件や実AIを動かす画面ではありません。</p></section>
+    </div>
+  </main>
+  <dialog id="source-dialog" aria-labelledby="source-dialog-title"><div class="dialog-heading"><h2 id="source-dialog-title">計画の原文</h2><button id="close-source" type="button" class="quiet">閉じて戻る</button></div><p id="dialog-source-reference" class="source-ref"></p><pre id="source-text" class="prose"></pre></dialog>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title"><form id="confirm-form"><p class="eyebrow">実行前の確認</p><h2 id="confirm-title"></h2><p id="confirm-target"></p><p id="confirm-explanation"></p><p id="confirm-binding" class="small"></p><div class="action-row"><button id="confirm-cancel" type="button" class="quiet">戻る</button><button id="confirm-submit" type="submit">この内容で依頼する</button></div></form></dialog>
+  <footer><span id="footer-mode">Many Iris / ローカルの合成実行候補</span><span>停止の依頼と停止の確認、成果の報告と検証済みの結果を分けて表示します。</span></footer>
+</body>
+</html>

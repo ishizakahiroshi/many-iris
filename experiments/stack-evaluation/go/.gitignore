@@ -1,0 +1,7 @@
+.cache/
+bin/
+*.db
+*.db-shm
+*.db-wal
+*.events.jsonl
+*.controller.lock

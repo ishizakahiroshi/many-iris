@@ -1,0 +1,24 @@
+[package]
+name = "many-iris"
+version = "0.1.0-dev.1"
+edition = "2024"
+publish = false
+description = "Local plan, approval and evidence core with a synthetic MCP executor"
+license = "MIT"
+
+[dependencies]
+axum = "=0.8.9"
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "time", "process", "io-util", "sync", "signal"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+rusqlite = { version = "=0.40.2", features = ["bundled", "backup"] }
+sha2 = "=0.10.9"
+getrandom = "=0.4.3"
+base64 = "=0.22.1"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[profile.release]
+lto = "thin"
+strip = true

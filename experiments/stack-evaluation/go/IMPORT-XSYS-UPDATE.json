@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "kind": "go-module-update",
+  "module": "golang.org/x/sys",
+  "old_version": "v0.42.0",
+  "new_version": "v0.44.0",
+  "reason": "GO-2026-5024 / CVE-2026-39824 first-fixed version; retain the same comparison behavior",
+  "advisory_reference": "https://pkg.go.dev/vuln/GO-2026-5024",
+  "acquisition_started": "2026-11-02T14:18:10.1629526+09:00",
+  "acquisition_completed": "2026-11-02T14:18:11.3370836+09:00",
+  "acquisition_path": "fresh public-registry download into task-local .cache/mod; no shared-cache copy",
+  "source": "https://proxy.golang.org/golang.org/x/sys/@v/v0.44.0.zip",
+  "origin": {
+    "vcs": "git",
+    "url": "https://go.googlesource.com/sys",
+    "commit": "fb1facd76f95fa87c151018200ea5e4892ff115d",
+    "ref": "refs/tags/v0.44.0"
+  },
+  "module_checksum": "h1:ildZl3J4uzeKP07r2F++Op7E9B29JRUy+a27EibtBTQ=",
+  "go_mod_checksum": "h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=",
+  "zip_sha256": "f1fa1052808e6bd6eb9c5372c053b2370a582532fac5d6a4600e7a6fab190ff3",
+  "zip_cache_path": ".cache/mod/cache/download/golang.org/x/sys/@v/v0.44.0.zip",
+  "verification": {
+    "go_test": "go test -count=1 -v ./...; 16 top-level tests including explicit shared-helper lifecycle; exit 0",
+    "go_vet": "go vet ./...; exit 0",
+    "go_build": "go build -o bin/iris-stack-go.exe .; exit 0",
+    "sqlite_runtime": "3.53.1; WAL; synchronous FULL; foreign_keys ON; busy_timeout 1000ms",
+    "osv": "osv-scanner 2.4.0 scan source --lockfile go.mod --format json --output-file .cache/osv-after-xsys044.json; 11 packages; exit 0; results []",
+    "osv_limits": "Known-vulnerability lockfile query, not a whole-toolchain or call-graph security audit",
+    "comparative_benchmark": "Not run on this updated executable; prior measurements belong to the prior executable"
+  },
+  "global_provenance_ledger": "No shared ledger mutation; root is preserving a project-local receipt because unrelated shared-ledger changes exist"
+}
