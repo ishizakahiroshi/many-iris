@@ -23,5 +23,7 @@ tag = "v1"
 new_sqlite_classes = ["BoardStore"]
 
 # Secrets (set with `wrangler secret put`, never in this file):
-#   BOARD_WRITERS  key list of the writers (hashes only)
-#   BOARD_READERS  key list of the readers (hashes only)
+#   BOARD_WRITERS       key list of the writers (hashes only)
+#   ACCESS_TEAM_DOMAIN  https://<team>.cloudflareaccess.com
+#   ACCESS_AUD          Application Audience (AUD) tag of the Access application
+#   BOARD_OWNERS        comma-separated emails allowed to read the page

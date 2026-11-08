@@ -383,9 +383,10 @@ impl RealProject {
             }
             if b.execution_host_id != first.execution_host_id
                 || b.executor_instance_id != first.executor_instance_id
+                || b.profile_id != first.profile_id
             {
                 return Err(format!(
-                    "Real case {n}: every case must name the same execution host and executor instance"
+                    "Real case {n}: every case must name the same execution host, executor instance and subscription profile"
                 ));
             }
         }

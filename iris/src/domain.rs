@@ -819,6 +819,7 @@ impl Store {
             profile,
             &binding.executor_instance_id,
             &binding.execution_host_id,
+            &binding.profile_id,
         )
         .map_err(|_| err("INVALID_BINDING"))?;
         let actual = crate::cli_binding::from_snapshot(

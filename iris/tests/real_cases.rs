@@ -88,7 +88,7 @@ fn binding_json(n: usize, source_sha: &str, instruction_sha: &str) -> Value {
         "task_id":task,"instruction_revision":1,"instruction_hash":instruction_sha,"approval_id":approval,
         "approval_revision":1,"scope_hash":real_project_scope_hash(&plan,&task,source_sha,instruction_sha),
         "execution_host_id":HOST,"executor_instance_id":"owned-boot","attempt_id":format!("attempt-{task}-1"),
-        "fence":1,"provider":"claude","profile_id":"claude-hiroshi"})
+        "fence":1,"provider":"claude","profile_id":"claude-example"})
 }
 fn case_json(n: usize, case: &Case) -> Value {
     let s = sha(case.source_text.as_bytes());
@@ -164,7 +164,8 @@ fn rc_the_profile_string_is_exact_and_never_inferred_from_a_binding() {
     );
     assert_eq!(OwnedProfile::RealProject.as_str(), PROFILE);
     assert_eq!(OwnedProfile::RealProject.provider(), "claude");
-    assert_eq!(OwnedProfile::RealProject.profile_id(), "claude-hiroshi");
+    assert!(OwnedProfile::RealProject.admits_profile_id("claude-example"));
+    assert!(!OwnedProfile::RealProject.admits_profile_id("synthetic"));
     for near in [
         "iris-owned-real-project",
         "iris-owned-real-project/0",
@@ -388,6 +389,10 @@ fn rc_configuration_negatives_are_refused_at_startup() {
         (
             "another executor instance for one case",
             Box::new(|v| v["real_cases"][1]["binding"]["executor_instance_id"] = json!("other")),
+        ),
+        (
+            "another subscription profile for one case",
+            Box::new(|v| v["real_cases"][1]["binding"]["profile_id"] = json!("claude-other")),
         ),
         (
             "codex provider",
@@ -996,7 +1001,7 @@ fn rc_an_intent_is_recorded_under_the_real_project_profile_only_on_its_own_store
         "approval_id":p["approval"]["approval_id"],"approval_revision":p["approval"]["revision"],
         "scope_hash":p["approval"]["scope_hash"],"execution_host_id":HOST,"executor_instance_id":"owned-boot",
         "attempt_id":format!("attempt-{}-1",t["task_id"].as_str().unwrap()),"fence":1,
-        "provider":"claude","profile_id":"claude-hiroshi"})).unwrap();
+        "provider":"claude","profile_id":"claude-example"})).unwrap();
     default.begin_owned(&claude, "owned-start").unwrap();
     assert_eq!(
         default.snapshot().unwrap()["plans"][0]["tasks"][0]["transport_profile"],

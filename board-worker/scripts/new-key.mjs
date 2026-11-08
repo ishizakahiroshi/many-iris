@@ -4,8 +4,8 @@
 //   node scripts/new-key.mjs --list <keys.json> --actor <name> --key-out <file>
 //
 // Then upload the list (hashes only) as the Worker secret:
-//   writers: Get-Content <keys.json> -Raw | wrangler secret put BOARD_WRITERS
-//   readers: Get-Content <keys.json> -Raw | wrangler secret put BOARD_READERS
+//   Get-Content <keys.json> -Raw | wrangler secret put BOARD_WRITERS
+// People read the board through Cloudflare Access, not with a key.
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 

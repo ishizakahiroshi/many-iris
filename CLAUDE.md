@@ -28,4 +28,4 @@ legacy scanner: `node scripts/secrets-scan.mjs --staged --block`。ローカル 
 
 ## 関連ドキュメント
 
-`AGENTS.md` は AI 用入口です。ルートの `README.md` は旧 Python 試作の説明のままで、本体の説明は `iris/README.md` にあります。
+`AGENTS.md` は AI 用入口です。ルートの `README.md` は全体の案内と看板の置き方、本体の説明は `iris/README.md` にあります。

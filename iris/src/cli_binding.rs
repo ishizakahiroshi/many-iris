@@ -134,6 +134,8 @@ pub const OWNED_PROFILE_REAL_PROJECT: &str = "iris-owned-real-project/1";
 /// name it; the real-bounded profile's binding names a configured host instead,
 /// and the plan keeps naming this one.
 pub const FIXTURE_HOST: &str = "synthetic-host";
+/// The subscription profile the default, synthetic-only profile names.
+pub const SYNTHETIC_PROFILE_ID: &str = "synthetic";
 
 /// The only owned CLI profiles Iris speaks. This is the single place that maps a
 /// profile string to the exact provider scope its binding may name; any other
@@ -144,8 +146,8 @@ pub const FIXTURE_HOST: &str = "synthetic-host";
 pub enum OwnedProfile {
     Synthetic,
     RealBounded,
-    /// Shares the real-bounded profile's binding scope (claude, claude-hiroshi,
-    /// configured host), so it is never inferred from a binding: only an explicit
+    /// Shares the real-bounded profile's binding scope (claude, configured
+    /// subscription profile, configured host), so it is never inferred from a binding: only an explicit
     /// configuration or a store made for real-project cases names it.
     RealProject,
 }
@@ -171,10 +173,17 @@ impl OwnedProfile {
             Self::RealBounded | Self::RealProject => "claude",
         }
     }
-    pub fn profile_id(self) -> &'static str {
+    /// The default profile admits only the synthetic subscription profile. The
+    /// real profiles admit the CLI subscription profile the user configured
+    /// (there is no default name): Iris checks only its shape and that it is not
+    /// `synthetic`; the CLI refuses a binding whose profile is not the one its
+    /// session actually runs.
+    pub fn admits_profile_id(self, profile_id: &str) -> bool {
         match self {
-            Self::Synthetic => "synthetic",
-            Self::RealBounded | Self::RealProject => "claude-hiroshi",
+            Self::Synthetic => profile_id == SYNTHETIC_PROFILE_ID,
+            Self::RealBounded | Self::RealProject => {
+                valid_id(profile_id, 128) && profile_id != SYNTHETIC_PROFILE_ID
+            }
         }
     }
     /// True for the profiles that send to a real provider.
@@ -195,7 +204,7 @@ impl OwnedProfile {
     /// provider and subscription profile differ, and so may the host.
     pub fn admits(self, binding: &CliBinding) -> bool {
         binding.provider == self.provider()
-            && binding.profile_id == self.profile_id()
+            && self.admits_profile_id(&binding.profile_id)
             && self.admits_host(&binding.execution_host_id)
     }
     /// The one profile whose scope this binding is inside, if any. The
@@ -224,25 +233,36 @@ pub struct ExecutorRegistration {
     instance: String,
     profile: OwnedProfile,
     host: String,
+    profile_id: String,
 }
 impl ExecutorRegistration {
     pub fn synthetic(instance: &str) -> Result<Self, BindingError> {
-        Self::for_profile(OwnedProfile::Synthetic, instance, FIXTURE_HOST)
+        Self::for_profile(
+            OwnedProfile::Synthetic,
+            instance,
+            FIXTURE_HOST,
+            SYNTHETIC_PROFILE_ID,
+        )
     }
-    /// There is no default host: the caller passes the configured one, and the
-    /// profile refuses a value it does not admit.
+    /// There is no default host or subscription profile: the caller passes the
+    /// configured ones, and the profile refuses a value it does not admit.
     pub fn for_profile(
         profile: OwnedProfile,
         instance: &str,
         host: &str,
+        profile_id: &str,
     ) -> Result<Self, BindingError> {
-        if !valid_id(instance, 80) || !profile.admits_host(host) {
+        if !valid_id(instance, 80)
+            || !profile.admits_host(host)
+            || !profile.admits_profile_id(profile_id)
+        {
             return Err(error("INVALID_REGISTRATION"));
         }
         Ok(Self {
             instance: instance.into(),
             profile,
             host: host.into(),
+            profile_id: profile_id.into(),
         })
     }
     pub fn executor_id(&self) -> &'static str {
@@ -500,7 +520,7 @@ pub fn from_snapshot(
         attempt_id: attempt.into(),
         fence,
         provider: registration.profile.provider().into(),
-        profile_id: registration.profile.profile_id().into(),
+        profile_id: registration.profile_id.clone(),
     };
     binding.validate()?;
     Ok(binding)
@@ -712,9 +732,35 @@ mod tests {
             assert_eq!(OwnedProfile::parse(profile.as_str()).unwrap(), profile);
         }
         assert_eq!(OwnedProfile::Synthetic.provider(), "synthetic");
-        assert_eq!(OwnedProfile::Synthetic.profile_id(), "synthetic");
+        assert!(OwnedProfile::Synthetic.admits_profile_id("synthetic"));
+        assert!(!OwnedProfile::Synthetic.admits_profile_id("claude-example"));
         assert_eq!(OwnedProfile::RealBounded.provider(), "claude");
-        assert_eq!(OwnedProfile::RealBounded.profile_id(), "claude-hiroshi");
+        // The real profiles have no built-in subscription profile: any configured
+        // name of the id shape is admitted, except the synthetic one.
+        for configured in ["claude-example", "work_2", "A", &"p".repeat(128)] {
+            assert!(
+                OwnedProfile::RealBounded.admits_profile_id(configured),
+                "{configured:?}"
+            );
+            assert!(
+                OwnedProfile::RealProject.admits_profile_id(configured),
+                "{configured:?}"
+            );
+        }
+        for bad in [
+            "",
+            "synthetic",
+            "claude example",
+            "claude.example",
+            " claude",
+            "claude\u{7}",
+            "claude\u{202e}",
+            "プロファイル",
+            &"p".repeat(129),
+        ] {
+            assert!(!OwnedProfile::RealBounded.admits_profile_id(bad), "{bad:?}");
+            assert!(!OwnedProfile::RealProject.admits_profile_id(bad), "{bad:?}");
+        }
         for unknown in [
             "",
             "iris-owned-real-bounded",
@@ -757,7 +803,7 @@ mod tests {
         );
         let mut real = synthetic.clone();
         real.provider = "claude".into();
-        real.profile_id = "claude-hiroshi".into();
+        real.profile_id = "claude-example".into();
         assert!(OwnedProfile::RealBounded.admits(&real));
         assert!(!OwnedProfile::Synthetic.admits(&real));
         assert_eq!(
@@ -766,14 +812,14 @@ mod tests {
         );
         for (provider, profile_id, host) in [
             ("claude", "synthetic", "synthetic-host"),
-            ("synthetic", "claude-hiroshi", "synthetic-host"),
-            ("claude", "claude-other", "synthetic-host"),
-            ("claude", "default", "synthetic-host"),
-            ("codex", "claude-hiroshi", "synthetic-host"),
+            ("synthetic", "claude-example", "synthetic-host"),
+            ("claude", "claude other", "synthetic-host"),
+            ("claude", "", "synthetic-host"),
+            ("codex", "claude-example", "synthetic-host"),
             ("codex", "default", "synthetic-host"),
-            ("Claude", "claude-hiroshi", "synthetic-host"),
-            ("claude", "claude-hiroshi", ""),
-            ("claude", "claude-hiroshi", "host\u{7}"),
+            ("Claude", "claude-example", "synthetic-host"),
+            ("claude", "claude-example", ""),
+            ("claude", "claude-example", "host\u{7}"),
             ("synthetic", "synthetic", "other-host"),
             ("synthetic", "synthetic", "host-example-test"),
             ("synthetic", "synthetic", ""),
@@ -888,12 +934,52 @@ mod tests {
     fn registration_writes_only_the_chosen_profiles_pair_and_keeps_every_snapshot_check() {
         let (_root, snapshot, now) = fixture();
         let synthetic = convert(&snapshot, now).unwrap();
-        let registration =
-            ExecutorRegistration::for_profile(OwnedProfile::RealBounded, "boot-1", FIXTURE_HOST)
-                .unwrap();
+        let registration = ExecutorRegistration::for_profile(
+            OwnedProfile::RealBounded,
+            "boot-1",
+            FIXTURE_HOST,
+            "claude-example",
+        )
+        .unwrap();
         let real = from_snapshot(&snapshot, "plan-1", "plan-1-task-1", &registration, now).unwrap();
         assert_eq!(real.provider, "claude");
-        assert_eq!(real.profile_id, "claude-hiroshi");
+        assert_eq!(real.profile_id, "claude-example");
+        // The binding names the registration's configured subscription profile.
+        let other_profile = ExecutorRegistration::for_profile(
+            OwnedProfile::RealBounded,
+            "boot-1",
+            FIXTURE_HOST,
+            "work_2",
+        )
+        .unwrap();
+        let other =
+            from_snapshot(&snapshot, "plan-1", "plan-1-task-1", &other_profile, now).unwrap();
+        assert_eq!(other.profile_id, "work_2");
+        assert_ne!(
+            request_id(RequestOperation::Start, &real, None).unwrap(),
+            request_id(RequestOperation::Start, &other, None).unwrap()
+        );
+        for bad in ["", "synthetic", "claude example", &"p".repeat(129)] {
+            assert!(
+                ExecutorRegistration::for_profile(
+                    OwnedProfile::RealBounded,
+                    "boot-1",
+                    FIXTURE_HOST,
+                    bad
+                )
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            ExecutorRegistration::for_profile(
+                OwnedProfile::Synthetic,
+                "boot-1",
+                FIXTURE_HOST,
+                "claude-example"
+            )
+            .is_err()
+        );
         let mut rest = real.clone();
         rest.provider = synthetic.provider.clone();
         rest.profile_id = synthetic.profile_id.clone();
@@ -903,11 +989,22 @@ mod tests {
             request_id(RequestOperation::Start, &synthetic, None).unwrap()
         );
         assert!(
-            ExecutorRegistration::for_profile(OwnedProfile::RealBounded, "bad id", FIXTURE_HOST)
-                .is_err()
+            ExecutorRegistration::for_profile(
+                OwnedProfile::RealBounded,
+                "bad id",
+                FIXTURE_HOST,
+                "claude-example"
+            )
+            .is_err()
         );
         assert!(
-            ExecutorRegistration::for_profile(OwnedProfile::RealBounded, "", FIXTURE_HOST).is_err()
+            ExecutorRegistration::for_profile(
+                OwnedProfile::RealBounded,
+                "",
+                FIXTURE_HOST,
+                "claude-example"
+            )
+            .is_err()
         );
         for mutate in [
             (|v: &mut Value| v["plans"][0]["source_text"] = json!("changed")) as fn(&mut Value),
@@ -935,9 +1032,13 @@ mod tests {
         let synthetic = convert(&snapshot, now).unwrap();
         assert_eq!(synthetic.execution_host_id, FIXTURE_HOST);
         for host in ["claude-host-01", "host-example-test", "Lab_PC-2-local"] {
-            let registration =
-                ExecutorRegistration::for_profile(OwnedProfile::RealBounded, "boot-1", host)
-                    .unwrap();
+            let registration = ExecutorRegistration::for_profile(
+                OwnedProfile::RealBounded,
+                "boot-1",
+                host,
+                "claude-example",
+            )
+            .unwrap();
             let real =
                 from_snapshot(&snapshot, "plan-1", "plan-1-task-1", &registration, now).unwrap();
             assert_eq!(real.execution_host_id, host);
@@ -952,6 +1053,7 @@ mod tests {
                 OwnedProfile::RealBounded,
                 "boot-1",
                 FIXTURE_HOST,
+                "claude-example",
             )
             .unwrap();
             let fixture_binding =
@@ -979,7 +1081,13 @@ mod tests {
         // registration may be built without an admitted host.
         for host in ["claude-host-01", "other-host", "", "host\u{7}"] {
             assert!(
-                ExecutorRegistration::for_profile(OwnedProfile::Synthetic, "boot-1", host).is_err(),
+                ExecutorRegistration::for_profile(
+                    OwnedProfile::Synthetic,
+                    "boot-1",
+                    host,
+                    SYNTHETIC_PROFILE_ID
+                )
+                .is_err(),
                 "{host:?}"
             );
         }
@@ -996,14 +1104,24 @@ mod tests {
             &"h".repeat(257),
         ] {
             assert!(
-                ExecutorRegistration::for_profile(OwnedProfile::RealBounded, "boot-1", host)
-                    .is_err(),
+                ExecutorRegistration::for_profile(
+                    OwnedProfile::RealBounded,
+                    "boot-1",
+                    host,
+                    "claude-example"
+                )
+                .is_err(),
                 "{host:?}"
             );
         }
         assert!(
-            ExecutorRegistration::for_profile(OwnedProfile::Synthetic, "boot-1", FIXTURE_HOST)
-                .is_ok()
+            ExecutorRegistration::for_profile(
+                OwnedProfile::Synthetic,
+                "boot-1",
+                FIXTURE_HOST,
+                SYNTHETIC_PROFILE_ID
+            )
+            .is_ok()
         );
     }
 

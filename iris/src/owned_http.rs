@@ -599,7 +599,7 @@ mod tests {
         let mut real = config();
         real["profile"] = json!(REAL);
         real["binding"]["provider"] = json!("claude");
-        real["binding"]["profile_id"] = json!("claude-hiroshi");
+        real["binding"]["profile_id"] = json!("claude-example");
         assert_eq!(load(&real).unwrap().profile(), OwnedProfile::RealBounded);
         // Naming one profile with the other's binding never selects a third one.
         let mut mixed = real.clone();

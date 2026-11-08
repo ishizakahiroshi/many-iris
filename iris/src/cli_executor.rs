@@ -928,7 +928,7 @@ mod tests {
         let mut args = owned_args();
         args["profile"] = json!(REAL);
         args["binding"]["provider"] = json!("claude");
-        args["binding"]["profile_id"] = json!("claude-hiroshi");
+        args["binding"]["profile_id"] = json!("claude-example");
         args
     }
     #[tokio::test]
@@ -999,12 +999,14 @@ mod tests {
         }
         for (provider, profile_id) in [
             ("claude", "synthetic"),
-            ("synthetic", "claude-hiroshi"),
+            ("synthetic", "claude-example"),
             ("synthetic", "synthetic"),
-            ("claude", "claude-other"),
-            ("claude", "default"),
-            ("codex", "claude-hiroshi"),
-            ("Claude", "claude-hiroshi"),
+            // The configured subscription profile is admitted by its shape; the CLI
+            // refuses one its session does not run.
+            ("claude", "claude other"),
+            ("claude", ""),
+            ("codex", "claude-example"),
+            ("Claude", "claude-example"),
         ] {
             for tool in ["owned_start", "owned_stop"] {
                 let mut args = real_args();
@@ -1047,7 +1049,7 @@ mod tests {
         assert!(client.call_owned("owned_start", args).await.is_err());
         let mut args = owned_args();
         args["binding"]["provider"] = json!("claude");
-        args["binding"]["profile_id"] = json!("claude-hiroshi");
+        args["binding"]["profile_id"] = json!("claude-example");
         assert!(client.call_owned("owned_start", args).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         server.abort();

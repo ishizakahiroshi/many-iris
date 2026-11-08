@@ -121,18 +121,21 @@ fn configuration_names_the_profile_and_the_binding_must_be_that_profiles_exact_s
     // (profile, provider, profile_id, expected to load)
     for (profile, provider, profile_id, ok) in [
         (SYNTHETIC, "synthetic", "synthetic", true),
-        (REAL, "claude", "claude-hiroshi", true),
+        (REAL, "claude", "claude-example", true),
         (REAL, "synthetic", "synthetic", false),
-        (SYNTHETIC, "claude", "claude-hiroshi", false),
+        (SYNTHETIC, "claude", "claude-example", false),
         (REAL, "claude", "synthetic", false),
-        (REAL, "synthetic", "claude-hiroshi", false),
-        (REAL, "claude", "claude-other", false),
-        (REAL, "claude", "default", false),
-        (REAL, "codex", "claude-hiroshi", false),
-        (REAL, "Claude", "claude-hiroshi", false),
-        (REAL, "claude", "Claude-Hiroshi", false),
+        (REAL, "synthetic", "claude-example", false),
+        // The real profile takes the configured subscription profile by its shape.
+        (REAL, "claude", "claude-other", true),
+        (REAL, "claude", "Claude-Example", true),
+        (REAL, "claude", "claude other", false),
+        (REAL, "claude", "claude.example", false),
+        (REAL, "claude", "", false),
+        (REAL, "codex", "claude-example", false),
+        (REAL, "Claude", "claude-example", false),
         (SYNTHETIC, "claude", "synthetic", false),
-        (SYNTHETIC, "synthetic", "claude-hiroshi", false),
+        (SYNTHETIC, "synthetic", "claude-example", false),
     ] {
         assert_eq!(
             loads(&path, &config(json!(profile), provider, profile_id, host)),
@@ -143,7 +146,7 @@ fn configuration_names_the_profile_and_the_binding_must_be_that_profiles_exact_s
     // The real profile takes the configured host; the default one stays pinned.
     assert!(loads(
         &path,
-        &config(json!(REAL), "claude", "claude-hiroshi", "other-host")
+        &config(json!(REAL), "claude", "claude-example", "other-host")
     ));
     assert!(!loads(
         &path,
@@ -178,7 +181,7 @@ fn unknown_or_malformed_profile_choices_are_refused_at_startup_never_defaulted()
         "real",
         "",
     ] {
-        for (provider, profile_id) in [("synthetic", "synthetic"), ("claude", "claude-hiroshi")] {
+        for (provider, profile_id) in [("synthetic", "synthetic"), ("claude", "claude-example")] {
             assert!(
                 !loads(
                     &path,
@@ -196,11 +199,11 @@ fn unknown_or_malformed_profile_choices_are_refused_at_startup_never_defaulted()
     ] {
         assert!(!loads(
             &path,
-            &config(profile, "claude", "claude-hiroshi", "synthetic-host")
+            &config(profile, "claude", "claude-example", "synthetic-host")
         ));
     }
     // No profile key at all is not completed with a default.
-    let mut value = config(json!(REAL), "claude", "claude-hiroshi", "synthetic-host");
+    let mut value = config(json!(REAL), "claude", "claude-example", "synthetic-host");
     value.as_object_mut().unwrap().remove("profile");
     assert!(!loads(&path, &value));
     // A second, conflicting profile key is refused rather than last-one-wins.
@@ -209,10 +212,10 @@ fn unknown_or_malformed_profile_choices_are_refused_at_startup_never_defaulted()
     std::fs::write(&path, format!("{{\"profile\":\"{REAL}\",{}", &first[1..])).unwrap();
     assert!(ExecutorConfig::load(&path).is_err());
     // Extra fields that could widen scope are still refused for the real profile.
-    let mut value = config(json!(REAL), "claude", "claude-hiroshi", "synthetic-host");
+    let mut value = config(json!(REAL), "claude", "claude-example", "synthetic-host");
     value["launch_mode"] = json!("bounded-edit");
     assert!(!loads(&path, &value));
-    value = config(json!(REAL), "claude", "claude-hiroshi", "synthetic-host");
+    value = config(json!(REAL), "claude", "claude-example", "synthetic-host");
     value["schema_version"] = json!(2);
     assert!(!loads(&path, &value));
 }
@@ -225,12 +228,12 @@ fn store_accepts_the_claude_scope_only_and_records_it_under_the_real_profile() {
     let before = store.snapshot().unwrap();
     for (provider, profile_id) in [
         ("claude", "synthetic"),
-        ("synthetic", "claude-hiroshi"),
-        ("claude", "claude-other"),
-        ("claude", "default"),
-        ("codex", "claude-hiroshi"),
+        ("synthetic", "claude-example"),
+        ("codex", "claude-example"),
         ("codex", "default"),
     ] {
+        // Any configured subscription profile of the id shape is the claude scope;
+        // the CLI refuses one its session does not run.
         let wrong = binding(&store, provider, profile_id);
         assert_eq!(
             store.begin_owned(&wrong, "owned-start").unwrap_err().code,
@@ -240,7 +243,7 @@ fn store_accepts_the_claude_scope_only_and_records_it_under_the_real_profile() {
         assert_eq!(store.owned_request(&wrong).unwrap(), None);
         assert_eq!(store.snapshot().unwrap(), before);
     }
-    let real = binding(&store, "claude", "claude-hiroshi");
+    let real = binding(&store, "claude", "claude-example");
     assert_eq!(
         store.begin_owned(&real, "owned-start").unwrap()["fresh"],
         true
@@ -248,7 +251,7 @@ fn store_accepts_the_claude_scope_only_and_records_it_under_the_real_profile() {
     let task = store.snapshot().unwrap()["plans"][0]["tasks"][0].clone();
     assert_eq!(task["transport_profile"], REAL);
     assert_eq!(task["owned_binding"]["provider"], "claude");
-    assert_eq!(task["owned_binding"]["profile_id"], "claude-hiroshi");
+    assert_eq!(task["owned_binding"]["profile_id"], "claude-example");
     // The intent is already unknown: no success is implied by sending it.
     assert_eq!(task["outcome"], "unknown");
     assert_eq!(task["effects"], "unknown");
@@ -284,7 +287,7 @@ fn store_accepts_the_claude_scope_only_and_records_it_under_the_real_profile() {
 #[test]
 fn an_observation_must_name_the_profile_its_intent_was_recorded_under() {
     for (provider, profile_id, own, other) in [
-        ("claude", "claude-hiroshi", REAL, SYNTHETIC),
+        ("claude", "claude-example", REAL, SYNTHETIC),
         ("synthetic", "synthetic", SYNTHETIC, REAL),
     ] {
         let root = tempfile::tempdir().unwrap();
@@ -340,7 +343,7 @@ fn stop_delivery_is_claimed_once_and_restore_only_queries_for_the_real_profile()
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state.sqlite3");
     let mut store = started(&path);
-    let b = binding(&store, "claude", "claude-hiroshi");
+    let b = binding(&store, "claude", "claude-example");
     store.begin_owned(&b, "owned-start").unwrap();
     apply(
         &mut store,
@@ -381,17 +384,17 @@ fn stop_delivery_is_claimed_once_and_restore_only_queries_for_the_real_profile()
 fn c4_tampered_stored_profile_or_profile_binding_pair_is_refused_on_open_and_restore() {
     for (provider, profile_id, tampered, ok) in [
         // Controls: rewriting the same value must still open.
-        ("claude", "claude-hiroshi", REAL, true),
+        ("claude", "claude-example", REAL, true),
         ("synthetic", "synthetic", SYNTHETIC, true),
-        ("claude", "claude-hiroshi", SYNTHETIC, false),
+        ("claude", "claude-example", SYNTHETIC, false),
         ("synthetic", "synthetic", REAL, false),
         (
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             "iris-owned-real-bounded/2",
             false,
         ),
-        ("claude", "claude-hiroshi", "", false),
+        ("claude", "claude-example", "", false),
     ] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.sqlite3");
@@ -436,7 +439,7 @@ fn c4_tampered_stored_profile_or_profile_binding_pair_is_refused_on_open_and_res
 fn a_real_provider_attempt_cannot_be_completed_through_the_synthetic_event_path() {
     let root = tempfile::tempdir().unwrap();
     let mut store = started(&root.path().join("state.sqlite3"));
-    let b = binding(&store, "claude", "claude-hiroshi");
+    let b = binding(&store, "claude", "claude-example");
     store.begin_owned(&b, "owned-start").unwrap();
     let t = store.snapshot().unwrap()["plans"][0]["tasks"][0].clone();
     let before = store.snapshot().unwrap();
@@ -514,7 +517,7 @@ fn the_real_profile_takes_its_host_from_the_configuration_and_validates_it() {
         assert!(
             loads(
                 &path,
-                &config(json!(REAL), "claude", "claude-hiroshi", &host)
+                &config(json!(REAL), "claude", "claude-example", &host)
             ),
             "{host:?}"
         );
@@ -523,7 +526,7 @@ fn the_real_profile_takes_its_host_from_the_configuration_and_validates_it() {
         assert!(
             !loads(
                 &path,
-                &config(json!(REAL), "claude", "claude-hiroshi", &host)
+                &config(json!(REAL), "claude", "claude-example", &host)
             ),
             "{host:?}"
         );
@@ -539,14 +542,14 @@ fn the_real_profile_takes_its_host_from_the_configuration_and_validates_it() {
         );
     }
     // A missing or non-text host is never completed with a default.
-    let mut value = config(json!(REAL), "claude", "claude-hiroshi", "claude-host-01");
+    let mut value = config(json!(REAL), "claude", "claude-example", "claude-host-01");
     value["binding"]
         .as_object_mut()
         .unwrap()
         .remove("execution_host_id");
     assert!(!loads(&path, &value));
     for host in [json!(null), json!(1), json!(true), json!(["h"]), json!({})] {
-        let mut value = config(json!(REAL), "claude", "claude-hiroshi", "claude-host-01");
+        let mut value = config(json!(REAL), "claude", "claude-example", "claude-host-01");
         value["binding"]["execution_host_id"] = host;
         assert!(!loads(&path, &value));
     }
@@ -558,7 +561,7 @@ fn the_store_keeps_the_configured_host_in_the_binding_and_the_plan_on_the_fixtur
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.sqlite3");
         let mut store = started(&path);
-        let real = binding_on(&store, "claude", "claude-hiroshi", &host);
+        let real = binding_on(&store, "claude", "claude-example", &host);
         assert_eq!(
             store.begin_owned(&real, "owned-start").unwrap()["fresh"],
             true,
@@ -591,7 +594,7 @@ fn the_store_keeps_the_configured_host_in_the_binding_and_the_plan_on_the_fixtur
             .observe_owned(&real, "owned-start", &native(REAL, &real))
             .unwrap();
         // Another host is another binding: it neither finds nor re-sends it.
-        let other = binding_on(&store, "claude", "claude-hiroshi", "another-host");
+        let other = binding_on(&store, "claude", "claude-example", "another-host");
         assert!(store.owned_request(&other).is_err());
         assert!(store.begin_owned(&other, "owned-start").is_err());
         // The default profile's pair is never admitted on a configured host.
@@ -606,7 +609,7 @@ fn the_store_refuses_a_bad_host_and_the_default_profile_on_a_configured_host() {
         let root = tempfile::tempdir().unwrap();
         let mut store = started(&root.path().join("state.sqlite3"));
         let before = store.snapshot().unwrap();
-        let wrong = binding_on(&store, "claude", "claude-hiroshi", &host);
+        let wrong = binding_on(&store, "claude", "claude-example", &host);
         assert_eq!(
             store.begin_owned(&wrong, "owned-start").unwrap_err().code,
             "INVALID_BINDING",
@@ -736,7 +739,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             configured,
             true,
@@ -744,7 +747,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "other-host",
             false,
@@ -752,7 +755,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "synthetic-host",
             false,
@@ -760,16 +763,16 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             "synthetic-host",
             "synthetic-host",
             true,
         ),
-        (REAL, "claude", "claude-hiroshi", configured, "", false),
+        (REAL, "claude", "claude-example", configured, "", false),
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "host\u{7}",
             false,
@@ -777,7 +780,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "claude host",
             false,
@@ -785,7 +788,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             " claude-host-01-example-test",
             false,
@@ -793,7 +796,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "claude-host-01-example-test ",
             false,
@@ -801,7 +804,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "claude-host\u{202e}",
             false,
@@ -809,7 +812,7 @@ async fn the_scheduler_sends_the_configured_host_and_refuses_a_peer_that_names_a
         (
             REAL,
             "claude",
-            "claude-hiroshi",
+            "claude-example",
             configured,
             "クロード",
             false,
@@ -937,7 +940,7 @@ fn real_config(instruction_hash: &str, file: &str, tasks: Value) -> Value {
             "plan_revision":1,"task_id":"real-task-1","instruction_revision":1,
             "instruction_hash":instruction_hash,"approval_id":"real-approval-1","approval_revision":1,
             "scope_hash":"b".repeat(64),"execution_host_id":"synthetic-host","executor_instance_id":"boot",
-            "attempt_id":"attempt-real-task-1-1","fence":1,"provider":"claude","profile_id":"claude-hiroshi"},
+            "attempt_id":"attempt-real-task-1-1","fence":1,"provider":"claude","profile_id":"claude-example"},
         "request_id":"start-request",
         "real_bounded":{"instruction_file":file,"tasks":tasks}})
 }
@@ -973,7 +976,7 @@ fn real_binding(store: &Store, index: usize) -> CliBinding {
         "approval_id":p["approval"]["approval_id"],"approval_revision":p["approval"]["revision"],
         "scope_hash":p["approval"]["scope_hash"],"execution_host_id":"synthetic-host",
         "executor_instance_id":"owned-boot","attempt_id":format!("attempt-{}-1",t["task_id"].as_str().unwrap()),
-        "fence":1,"provider":"claude","profile_id":"claude-hiroshi"})).unwrap()
+        "fence":1,"provider":"claude","profile_id":"claude-example"})).unwrap()
 }
 
 #[test]
@@ -1361,7 +1364,7 @@ fn c7_the_existing_profiles_refuse_the_real_bounded_settings() {
     assert!(loads(&config_path, &synthetic(None)));
     assert!(loads(
         &config_path,
-        &config(json!(REAL), "claude", "claude-hiroshi", "synthetic-host")
+        &config(json!(REAL), "claude", "claude-example", "synthetic-host")
     ));
     assert!(load_fixture(&config_path, &synthetic(None)).is_none());
     // The default profile refuses the section in every form, even a valid one.
@@ -1394,7 +1397,7 @@ fn c7_the_existing_profiles_refuse_the_real_bounded_settings() {
     let mut allowed = aligned.clone();
     allowed["profile"] = json!(REAL);
     allowed["binding"]["provider"] = json!("claude");
-    allowed["binding"]["profile_id"] = json!("claude-hiroshi");
+    allowed["binding"]["profile_id"] = json!("claude-example");
     assert!(load_fixture(&config_path, &allowed).is_some());
     // The stdio profile has no such section either.
     let stdio = json!({"schema_version":1,"profile":"stdio-synthetic/1","real_bounded":section});
@@ -1402,7 +1405,7 @@ fn c7_the_existing_profiles_refuse_the_real_bounded_settings() {
     // Neither profile accepts the settings spread over top-level keys.
     for profile in [
         (SYNTHETIC, "synthetic", "synthetic"),
-        (REAL, "claude", "claude-hiroshi"),
+        (REAL, "claude", "claude-example"),
     ] {
         for (key, value) in [
             ("instruction_file", json!("c5-instruction.txt")),
@@ -1749,7 +1752,7 @@ async fn c7_the_scheduler_sends_the_instruction_files_hash_in_the_binding() {
         assert_eq!(start["binding"]["task_id"], "real-task-2");
         assert_eq!(start["binding"]["approval_id"], "real-approval-2");
         assert_eq!(start["binding"]["provider"], "claude");
-        assert_eq!(start["binding"]["profile_id"], "claude-hiroshi");
+        assert_eq!(start["binding"]["profile_id"], "claude-example");
         assert_eq!(start["request_id"], "start-request");
     }
     let recorded = store.lock().unwrap().owned_request(&binding).unwrap();
@@ -1805,7 +1808,7 @@ async fn c7_a_placeholder_scope_hash_loads_but_nothing_is_stored_or_sent() {
 /// A started store with the real-profile intent recorded, and its binding.
 fn c10_store(root: &Path) -> (Store, CliBinding) {
     let mut store = started(&root.join("state.sqlite3"));
-    let b = binding(&store, "claude", "claude-hiroshi");
+    let b = binding(&store, "claude", "claude-example");
     store.begin_owned(&b, "owned-start").unwrap();
     (store, b)
 }
