@@ -76,6 +76,41 @@ export class BoardStore extends DurableObject<Env> {
   async page(): Promise<Record<string, unknown>> {
     return guarded(() => this.store.pageData());
   }
+  /** A write by the signed-in owner from the page (see Store.ownerWrite). */
+  async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.ownerWrite(OWNER_ACTOR, args, newBacklogId));
+  }
+}
+
+/** The name the owner's own writes carry on the board. The colon keeps it apart
+ * from every writer key and OAuth client: their names match ^[a-z0-9-]{1,32}$
+ * (rules.ts validActor), so none of them can be this one. */
+const OWNER_ACTOR = "page:owner";
+
+/** `backlog/<YYYYMMDD>-<8 hex>`: made by the board, so the page never names an item. */
+function newBacklogId(): string {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const random = [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `backlog/${day}-${random}`;
+}
+
+/** HTTP status of a refused owner write. */
+function ownerWriteStatus(code: unknown): number {
+  switch (code) {
+    case "NOT_FOUND":
+    case "PARENT_NOT_FOUND":
+      return 404;
+    case "FORBIDDEN":
+      return 403;
+    case "REVISION_CONFLICT":
+    case "BOARD_ITEM_LIMIT":
+    case "BOARD_EVENT_LIMIT":
+      return 409;
+    case "STORAGE":
+      return 503;
+    default:
+      return 400;
+  }
 }
 
 const SECURITY_HEADERS: Record<string, string> = {
@@ -174,6 +209,23 @@ const siteHandler = {
       if (!who.ok) return accessFailure(who);
       const data = await boardStub(env).page();
       return data.ok === false ? failure(503, "STORAGE", "Board unavailable") : json(200, data);
+    }
+
+    // The owner's own writes from the page. Cloudflare Access proves who it is;
+    // the Origin header must be this site's (a browser always sends it on a POST),
+    // so another site cannot make the owner's browser write.
+    if (path === "/api/board/item" && method === "POST") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      if (request.headers.get("origin") !== url.origin) return failure(403, "ORIGIN", "Requests from other sites are refused");
+      const body = await readBody(request);
+      if (body instanceof Response) return body;
+      const result = await boardStub(env).ownerWrite(body.value);
+      if (result.ok === false) {
+        const error = (result.error ?? {}) as { code?: unknown; detail?: unknown };
+        return failure(ownerWriteStatus(error.code), String(error.code ?? "STORAGE"), String(error.detail ?? "Board unavailable"));
+      }
+      return json(200, result);
     }
 
     return failure(404, "NOT_FOUND", "Not found");

@@ -328,6 +328,48 @@ async function main() {
   check("an unknown client gets no consent page",
     (await fetch(authorizeUrl("s4").replace(encodeURIComponent(client.client_id), "unknown-client"), { headers: asOwner() })).status === 400);
 
+  // --- the owner's own writes from the page
+  const ownerPost = (body, headers = { ...jar, origin: base }, type = "application/json") =>
+    fetch(`${base}/api/board/item`, { method: "POST", headers: { "content-type": type, ...headers }, body: typeof body === "string" ? body : JSON.stringify(body) });
+  const ownerCode = async (body, headers) => { const a = await ownerPost(body, headers); return `${a.status} ${(await a.json()).code ?? "OK"}`; };
+  page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
+  check("the page data says the owner may write", page.can_write === true);
+  const addBody = { op: "add", project: "demo", title: "積んだ仕事" };
+  check("an owner write without Access is refused", (await ownerPost(addBody, { origin: base })).status === 401);
+  check("a writer key cannot use the owner's write", (await ownerPost(addBody, { origin: base, authorization: `Bearer ${K.alpha}` })).status === 401);
+  check("another email cannot write", (await ownerPost(addBody, { ...asOwner(jwt({ email: "someone@example.com" })), origin: base })).status === 403);
+  check("an owner write from another site is refused", (await ownerCode(addBody, { ...jar, origin: "https://evil.example" })) === "403 ORIGIN");
+  check("an owner write without an Origin is refused", (await ownerCode(addBody, { ...jar })) === "403 ORIGIN");
+  check("an owner write needs JSON content", (await ownerPost(JSON.stringify(addBody), { ...jar, origin: base }, "text/plain")).status === 415);
+  check("an owner write cannot be read with GET", (await fetch(`${base}/api/board/item`, { headers: jar })).status === 404);
+  check("an unknown operation is refused", (await ownerCode({ op: "delete", item_id: "p1" })) === "400 INVALID");
+  check("the owner cannot choose the kind or the state", (await ownerCode({ ...addBody, kind: "plan" })) === "400 INVALID" &&
+    (await ownerCode({ ...addBody, state: "done" })) === "400 INVALID");
+  check("the owner cannot start a project by a typing slip", (await ownerCode({ ...addBody, project: "demoo" })) === "404 NOT_FOUND");
+  check("a blank title is refused", (await ownerCode({ ...addBody, title: "   " })) === "400 INVALID");
+  check("a missing parent is refused", (await ownerCode({ ...addBody, parent_id: "nope" })) === "404 PARENT_NOT_FOUND");
+  const itemsBefore = (await call(K.alpha, "board_list", {})).counts.items;
+  r = await ownerPost({ ...addBody, parent_id: "c1" });
+  out = await r.json();
+  const piled = out.item ?? {};
+  check("the owner piles up a piece of work", r.status === 200 && out.ok === true && piled.kind === "task" && piled.state === "planned" &&
+    piled.parent_id === "c1" && piled.updated_by === "page:owner" && /^backlog\/\d{8}-[0-9a-f]{8}$/.test(piled.item_id ?? ""), JSON.stringify(out));
+  check("refused owner writes left nothing", (await call(K.alpha, "board_list", {})).counts.items === itemsBefore + 1);
+  check("attach needs the revision", (await ownerCode({ op: "attach", item_id: piled.item_id, parent_id: "p1" })) === "400 INVALID");
+  check("attach needs a parent or null", (await ownerCode({ op: "attach", item_id: piled.item_id, expected_revision: 1 })) === "400 INVALID");
+  check("a stale revision is refused", (await ownerCode({ op: "attach", item_id: piled.item_id, parent_id: "p1", expected_revision: 7 })) === "409 REVISION_CONFLICT");
+  r = await ownerPost({ op: "attach", item_id: piled.item_id, parent_id: "p1", expected_revision: 1 });
+  out = await r.json();
+  check("the owner moves work under another item", r.status === 200 && out.item?.parent_id === "p1" && out.item?.revision === 2 && out.item?.title === "積んだ仕事");
+  r = await ownerPost({ op: "attach", item_id: piled.item_id, parent_id: null, expected_revision: 2 });
+  out = await r.json();
+  check("the owner takes work out from under its parent", r.status === 200 && out.item?.parent_id === null);
+  check("the owner cannot move a plan", (await ownerCode({ op: "attach", item_id: "c1", parent_id: null, expected_revision: 1 })) === "403 FORBIDDEN");
+  check("the owner cannot make a cycle", (await ownerCode({ op: "attach", item_id: "d3", parent_id: "d6", expected_revision: 1 })) === "400 CYCLE");
+  check("the owner cannot move work across projects", (await ownerCode({ op: "attach", item_id: piled.item_id, parent_id: "o1", expected_revision: 3 })) === "400 PROJECT_MISMATCH");
+  check("an unknown item is not found", (await ownerCode({ op: "attach", item_id: "nope", parent_id: null, expected_revision: 1 })) === "404 NOT_FOUND");
+  check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
+
   // --- the item limit (12 in this run)
   let lastCode = "OK";
   for (let n = 0; n < 12 && lastCode === "OK"; n++) {

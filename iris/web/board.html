@@ -13,7 +13,7 @@
   <a class="skip" href="#board-main">看板へ移動</a>
   <header class="masthead">
     <div><p class="eyebrow">Many Iris</p><h1>案件の看板</h1></div>
-    <div class="mode"><span class="mode-dot" aria-hidden="true"></span><strong>読み取り専用</strong><span>この画面から書き込むことはできません</span></div>
+    <div class="mode"><span class="mode-dot" aria-hidden="true"></span><strong id="board-mode">読み取り専用</strong><span id="board-mode-note">この画面から書き込むことはできません</span></div>
   </header>
   <section class="connection-bar" aria-label="接続と情報の鮮度">
     <p id="board-status">看板を読み込んでいます…</p>
@@ -27,6 +27,6 @@
       <ol id="board-events" class="board-events"></ol>
     </section>
   </main>
-  <footer><span>Many Iris / 看板（読み取り専用）</span><span>書き込みは鍵を持つ担当だけが行います。この画面は鍵を扱いません。</span></footer>
+  <footer><span id="board-foot">Many Iris / 看板（読み取り専用）</span><span>AI の書き込みは鍵を持つ担当だけが行います。この画面は鍵を扱いません。</span></footer>
 </body>
 </html>

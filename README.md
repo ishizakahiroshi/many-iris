@@ -15,12 +15,24 @@
 
 案件・計画・Issue・PR・作業を項目として並べ、それぞれに「始めた」「終わった」「メモ」などの出来事を書き足していく看板です。
 
+項目の基本は次のとおりです。
+
+- 項目には種類が 6 つあります：案件（`project`）・計画（`plan`）・文脈（`context`）・Issue（`issue`）・PR（`pr`）・作業（`task`）。
+- 項目は、どれか 1 つの案件（`project` に書く名前）に属します。画面は案件ごとに分けて表示します。
+- 項目には親を 1 つ付けられます（同じ案件の項目だけ。6 段まで）。たとえば、案件の下に計画、計画の下に作業を置きます。親を付けていない項目は、木のいちばん上に並びます。
+- 状態は 5 つです：予定（`planned`）・進行中（`in_progress`）・待ち（`waiting`）・完了（`done`）・停止（`stopped`）。
+- 項目は 5,000 件、出来事は 50,000 件まで。項目や出来事を消す道具はありません。
+- 使える文字や長さなどの細かい決まりは、Rust 版の看板と同じです。全部の決まりは [`iris/README.md`](iris/README.md) の「看板（board）」にあります。
+
+読み方と書き方は次のとおりです。
+
 - 人は、ブラウザで `/board` を開いて読みます。入口は Cloudflare Access で、許可したメールアドレスの人だけが入れます。Worker も Access の署名を自分で確かめます。
+- 看板の持ち主は、同じ画面から 2 つのことができます。「仕事を積む」（題名を書いて、予定の作業を 1 つ足す）と、「入れる先を変える」（作業を、別の項目の下へ付け替える・どこにも入れない状態に戻す）です。題名や状態を直すこと、計画を動かすこと、消すことは、画面からはできません。画面から書いたものは、書いた人が `page:owner` と記録されます。
 - AI や道具は、`/board/mcp`（MCP）へ書きます。道具は `board_upsert_item`（項目の作成と更新）・`board_add_event`（出来事の追加）・`board_list`（読み取り）の 3 つです。
-- 書く側の本人確認は 2 通りです。手元の道具は、書き込み用の鍵を Bearer で送ります。ChatGPT のように鍵を送れない MCP の client は、OAuth で接続します。OAuth の許可の画面（`/authorize`）は、Access でログインした看板の持ち主だけが開けます。OAuth の部分は Cloudflare の [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) を使っています。
-- 書いた人は、鍵か、許可した client から決まります。本文で名乗ることはできません。項目や出来事を消す道具はありません。
-- 作業（種類 `task`）のうち親の無いものは、画面では案件ごとの「まだ結ばれていない作業」にまとまります。既にある項目の親は、後から付けられます（`board_upsert_item` に `item_id` と `parent_id` だけを送る）。先に作業を記録し、あとで計画の下へ付け替える使い方ができます。
-- 項目と出来事の決まり（使える文字・長さ・状態の種類・親子）は、Rust 版の看板と同じです。[`iris/README.md`](iris/README.md) の「看板（board）」を見てください。
+- AI や道具の本人確認は、使う場面で 2 通りに分かれます。手元のスクリプトや CLI から書くときは、書き込み用の鍵を `Authorization: Bearer <鍵>` で送ります。ChatGPT のように鍵を送れない MCP の client は、OAuth で接続します。OAuth の許可の画面（`/authorize`）は、Access でログインした看板の持ち主だけが開けます。OAuth の部分は Cloudflare の [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) を使っています。
+- 書いた人は、鍵か、許可した client から決まります。本文で名乗ることはできません。
+- 作業（種類 `task`）のうち親の無いものは、画面では案件ごとの「まだ結ばれていない作業」にまとまります。既にある項目の親は、後から付けられます（AI からは `board_upsert_item` に `item_id` と `parent_id` だけを送る。持ち主は画面の「入れる先を変える」）。先に作業を記録し、あとで計画の下へ付け替える使い方ができます。
+- 作業には、画面でもう 1 つ札が付きます。予定のままの作業は「積んである」、それ以外は「記録だけ」です。
 
 ### 自分の Cloudflare に置く
 
@@ -48,7 +60,7 @@ Cloudflare のアカウントと、Cloudflare で管理しているドメイン�
 
 ### 試験
 
-`board-worker/` で `node test/board.test.mjs` を実行します。`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・OAuth の一周（発見・client の登録・許可の画面・PKCE・token・使い回した code の取り消し）・項目と出来事の規則・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
+`board-worker/` で `node test/board.test.mjs` を実行します。`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・OAuth の一周（発見・client の登録・許可の画面・PKCE・token・使い回した code の取り消し）・項目と出来事の規則・持ち主が画面から書く操作（ほかのサイトからの要求の拒否を含む）・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
 
 ## 本体（iris）
 

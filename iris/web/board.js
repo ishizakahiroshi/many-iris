@@ -6,7 +6,25 @@
   const states = { planned: '予定', in_progress: '進行中', waiting: '待ち', done: '完了', stopped: '停止' };
   const kinds = { project: '案件', plan: '計画', context: '文脈', issue: 'Issue', pr: 'PR', task: '作業' };
   const eventKinds = { session_start: '作業開始', session_end: '作業終了', note: 'メモ', state_change: '状態の変更' };
+  // Work (kind task) carries one more mark: on the pile and not started, or a
+  // record of work that was done. Work handed out by Iris will get a third mark
+  // when Iris keeps such requests; the board holds none yet.
+  const workMark = (item) => (item.state === 'planned' ? '積んである' : '記録だけ');
+  const writeErrors = {
+    REVISION_CONFLICT: 'ほかの書き込みで変わっていました。読み直してから、もう一度お試しください。',
+    CYCLE: 'その仕事の下にある仕事の下へは入れられません。',
+    DEPTH: '段が深くなりすぎます（6 段まで）。',
+    PARENT_NOT_FOUND: '入れる先が見つかりません。読み直してください。',
+    NOT_FOUND: '相手が見つかりません。読み直してください。',
+    PROJECT_MISMATCH: '別の案件の下へは入れられません。',
+    INVALID: '入力を確かめてください（題名は 1〜200 字）。',
+    BOARD_ITEM_LIMIT: '看板の項目が上限に達しています。',
+    AUTH: 'ログインが切れています。このページを開き直してください。',
+    FORBIDDEN: 'この操作はできません。',
+  };
   let loading = false;
+  // True when the board says it takes the owner's writes from this page.
+  let canWrite = false;
 
   function el(tag, className, content) {
     const node = document.createElement(tag);
@@ -48,12 +66,109 @@
     node.append(el('time', null, when(event.at)));
     return node;
   }
-  function card(item) {
+  async function write(body, status, button) {
+    button.disabled = true;
+    status.textContent = '書き込んでいます…';
+    try {
+      const response = await fetch('/api/board/item', {
+        method: 'POST', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify(body),
+      });
+      let answer = null;
+      try { answer = await response.json(); } catch { answer = null; }
+      if (response.ok && answer && answer.ok === true) return true;
+      status.textContent = writeErrors[answer && answer.code] || '書き込めませんでした。読み直してから、もう一度お試しください。';
+      return false;
+    } catch {
+      status.textContent = '接続できません。通信を確かめてから、もう一度お試しください。';
+      return false;
+    } finally { button.disabled = false; }
+  }
+  function option(value, label) {
+    const node = el('option', null, label);
+    node.value = value;
+    return node;
+  }
+  const short = (text) => { const chars = [...String(text)]; return chars.length > 48 ? chars.slice(0, 47).join('') + '…' : String(text); };
+  // The items a piece of work may go under: every item of its project, except
+  // itself and whatever is already under it.
+  function parentChoices(select, peers, self) {
+    const below = new Set();
+    if (self) {
+      below.add(self.item_id);
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const p of peers) if (p.parent_id && below.has(p.parent_id) && !below.has(p.item_id)) { below.add(p.item_id); grew = true; }
+      }
+    }
+    select.append(option('', '（どこにも入れない）'));
+    for (const p of peers) if (!below.has(p.item_id)) select.append(option(p.item_id, (kinds[p.kind] || p.kind) + '：' + short(p.title)));
+  }
+  function moveControl(item, peers) {
+    const box = el('details', 'board-write');
+    box.append(el('summary', null, '入れる先を変える'));
+    const row = el('div', 'board-write-row');
+    const select = el('select');
+    select.setAttribute('aria-label', 'この作業を入れる先');
+    parentChoices(select, peers, item);
+    select.value = item.parent_id && [...select.options].some((o) => o.value === item.parent_id) ? item.parent_id : '';
+    const button = el('button', 'quiet', '付け替える');
+    button.type = 'button';
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    button.addEventListener('click', async () => {
+      const done = await write({ op: 'attach', item_id: item.item_id, parent_id: select.value || null, expected_revision: item.revision }, status, button);
+      if (done) load(true);
+    });
+    row.append(select, button, status);
+    box.append(row);
+    return box;
+  }
+  function addControl(project, peers) {
+    const box = el('div', 'board-add');
+    box.append(el('h3', null, '仕事を積む'));
+    const row = el('div', 'board-write-row');
+    const title = el('input');
+    title.type = 'text';
+    title.maxLength = 200;
+    title.placeholder = 'やること（1〜200 字）';
+    title.setAttribute('aria-label', '積む仕事の題名');
+    const select = el('select');
+    select.setAttribute('aria-label', '入れる先');
+    parentChoices(select, peers, null);
+    const button = el('button', 'quiet', '積む');
+    button.type = 'button';
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    const send = async () => {
+      const text = title.value.trim();
+      if (!text) { status.textContent = '題名を入れてください。'; return; }
+      const body = { op: 'add', project, title: text };
+      if (select.value) body.parent_id = select.value;
+      const done = await write(body, status, button);
+      if (done) { title.value = ''; load(true); }
+    };
+    button.addEventListener('click', send);
+    title.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) send(); });
+    row.append(title, select, button, status);
+    box.append(row);
+    return box;
+  }
+  // Someone is in the middle of typing or choosing: a timed reload would wipe it.
+  function editing() {
+    const host = $('board-projects');
+    if (host.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return true;
+    if (host.querySelector('details.board-write[open]')) return true;
+    return [...host.querySelectorAll('.board-add input')].some((input) => input.value !== '');
+  }
+  function card(item, peers) {
     const box = el('div', 'board-card');
     const head = el('div', 'board-card-head');
     head.append(el('p', 'board-title', item.title));
     const badges = el('div', 'board-badges');
     badges.append(el('span', 'badge', kinds[item.kind] || item.kind), stateBadge(item.state));
+    if (item.kind === 'task') badges.append(el('span', 'badge mark', workMark(item)));
     head.append(badges);
     box.append(head);
     if (item.state === 'waiting' && item.waiting_reason) box.append(el('p', 'board-wait', '待っていること：' + item.waiting_reason));
@@ -67,6 +182,7 @@
       last.append(eventLine(item.last_event, false));
       box.append(last);
     }
+    if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;
   }
   // One project's items as two lists: the tree, and the work (kind task) that
@@ -90,7 +206,7 @@
         if (seen.has(item.item_id) || depth > 8) continue;
         seen.add(item.item_id);
         const li = el('li', 'board-node');
-        li.append(card(item));
+        li.append(card(item, items));
         const kids = children.get(item.item_id);
         if (kids) li.append(list(kids, depth + 1));
         ul.append(li);
@@ -102,6 +218,10 @@
   function render(data) {
     const items = Array.isArray(data.items) ? data.items : [];
     const events = Array.isArray(data.events) ? data.events : [];
+    canWrite = data.can_write === true;
+    $('board-mode').textContent = canWrite ? '積む・付け替えができます' : '読み取り専用';
+    $('board-mode-note').textContent = canWrite ? '題名や状態は、書いた担当だけが直せます' : 'この画面から書き込むことはできません';
+    $('board-foot').textContent = canWrite ? 'Many Iris / 看板' : 'Many Iris / 看板（読み取り専用）';
     const host = $('board-projects');
     host.replaceChildren();
     if (!items.length) host.append(el('p', 'empty', 'まだ項目がありません。'));
@@ -114,13 +234,16 @@
       const section = el('section', 'board-project');
       const { tree, unlinked, unlinkedCount } = forest(list);
       section.append(el('h2', null, project));
+      if (canWrite) section.append(addControl(project, list));
       section.append(tree);
       const loose = el('div', 'board-unlinked');
       const heading = el('h3', null, 'まだ結ばれていない作業');
       heading.append(el('span', 'count', unlinkedCount + ' 件'));
       loose.append(heading);
       if (unlinkedCount) {
-        loose.append(el('p', 'board-hint', 'どの計画の分か、まだ分かっていない作業です。鍵を持つ AI に頼むと、計画の下へ付け替えられます。'));
+        loose.append(el('p', 'board-hint', canWrite
+          ? 'どの計画の分か、まだ分かっていない作業です。各作業の「入れる先を変える」から、計画の下へ付け替えられます。'
+          : 'どの計画の分か、まだ分かっていない作業です。鍵を持つ AI に頼むと、計画の下へ付け替えられます。'));
         loose.append(unlinked);
       }
       section.append(loose);
@@ -138,8 +261,10 @@
     $('board-status').textContent = '項目 ' + items.length + ' 件 / 出来事の合計 ' + (data.counts?.events ?? '未確認') + ' 件';
     $('board-observed').textContent = '確認時点：' + when(data.generated_at);
   }
-  async function load() {
+  // `force` is a reload the person asked for, or one that follows their own write.
+  async function load(force) {
     if (loading) return;
+    if (force !== true && editing()) return;
     loading = true;
     try {
       const response = await fetch('/api/board', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
@@ -150,8 +275,8 @@
       $('board-status').textContent = '接続できません。Many Irisが起動しているか確認してください。';
     } finally { loading = false; }
   }
-  $('board-refresh').addEventListener('click', load);
+  $('board-refresh').addEventListener('click', () => load(true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
   setInterval(() => { if (!document.hidden) load(); }, 60000);
-  load();
+  load(true);
 })();

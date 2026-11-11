@@ -21,4 +21,15 @@
 .board-event{border-left:2px solid var(--line);padding:2px 0 5px 13px;font-size:.82rem;overflow-wrap:anywhere}
 .board-event .who{color:var(--soft);font-size:.74rem}
 .board-text{white-space:pre-wrap}
+.badge.mark{border-style:dashed}
+.board-add{margin:0 0 14px;padding:10px 14px;border:1px dashed var(--line);border-radius:10px}
+.board-add>h3{font-size:.9rem;margin:0 0 6px}
+.board-write{margin-top:8px;font-size:.8rem}
+.board-write>summary{cursor:pointer;color:var(--soft)}
+.board-write-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px}
+.board-write-row input,.board-write-row select{font:inherit;font-size:.85rem;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);min-width:0;max-width:100%}
+.board-write-row input{flex:1 1 260px}
+.board-write-row select{flex:0 1 300px}
+.board-write-status{font-size:.78rem;color:var(--warn);flex-basis:100%}
+.board-write-status:empty{display:none}
 @media(max-width:700px){.connection-bar,footer{width:calc(100% - 38px)}.board-main{padding:20px 19px 35px}.board-tree ul{margin-left:10px;padding-left:9px}}

@@ -218,9 +218,46 @@ export class Store {
     return this.list(project, since, LIST_EVENT_LIMIT, false);
   }
 
-  /** The data of the read-only page. */
+  /** The data of the page. `can_write` tells the page that this board takes
+   * the owner's own writes (`ownerWrite`); the Rust board does not send it. */
   pageData(): Record<string, unknown> {
-    return { ...this.list(null, 0, PAGE_EVENT_LIMIT, true), generated_at: Date.now() };
+    return { ...this.list(null, 0, PAGE_EVENT_LIMIT, true), generated_at: Date.now(), can_write: true };
+  }
+
+  /**
+   * What the signed-in owner may do from the page, and nothing else:
+   *   {op:"add", project, title, parent_id?}   put a piece of work on the pile
+   *     (kind task, state planned; the board makes the id);
+   *   {op:"attach", item_id, parent_id, expected_revision}   put a piece of
+   *     work under another item, or under nothing (parent_id null).
+   * Titles, states and plans stay with the writers that own them.
+   */
+  ownerWrite(actor: string, input: unknown, newId: () => string): Record<string, unknown> {
+    const obj = asObject(input);
+    const op = requiredStr(obj, "op");
+    if (op === "add") {
+      onlyKeys(obj, ["op", "project", "title", "parent_id"]);
+      const project = requiredStr(obj, "project");
+      const title = requiredStr(obj, "title");
+      const parentId = optionalStr(obj, "parent_id");
+      // A project is made by a writer; a typing slip here must not start a new one.
+      const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
+      if (known === 0) throw new BoardError("NOT_FOUND", "No such project");
+      const args: Record<string, unknown> = { item_id: newId(), project, kind: "task", title, state: "planned", expected_revision: 0 };
+      if (parentId !== null) args.parent_id = parentId;
+      return this.upsertItem(actor, args);
+    }
+    if (op === "attach") {
+      onlyKeys(obj, ["op", "item_id", "parent_id", "expected_revision"]);
+      const itemId = requiredStr(obj, "item_id");
+      if (!has(obj, "parent_id")) throw invalid("parent_id is required (null takes the work out from under its parent)");
+      if (!has(obj, "expected_revision")) throw invalid("expected_revision is required");
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) can be moved from the page");
+      return this.upsertItem(actor, { item_id: itemId, parent_id: obj.parent_id, expected_revision: obj.expected_revision });
+    }
+    throw invalid("op must be add or attach");
   }
 
   /** All items of the project (or of every project), each with its latest
