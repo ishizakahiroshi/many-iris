@@ -9,9 +9,14 @@
   // Work (kind task) carries one more mark: on the pile and not started, or a
   // record of work that was done. Work handed out by Iris will get a third mark
   // when Iris keeps such requests; the board holds none yet.
-  const workMark = (item) => (item.state === 'planned' ? '積んである' : '記録だけ');
+  const workMark = (item) => {
+    if (item.handoff && item.handoff.state === 'requested') return '任せた・まだ受けていない';
+    if (item.handoff && item.handoff.state === 'accepted') return '任せた・受けた';
+    return item.state === 'planned' ? '積んである' : '記録だけ';
+  };
   const writeErrors = {
     REVISION_CONFLICT: 'ほかの書き込みで変わっていました。読み直してから、もう一度お試しください。',
+    HANDOFF_CONFLICT: '任せた状態が変わっていました。読み直してから、もう一度お試しください。',
     CYCLE: 'その仕事の下にある仕事の下へは入れられません。',
     DEPTH: '段が深くなりすぎます（6 段まで）。',
     PARENT_NOT_FOUND: '入れる先が見つかりません。読み直してください。',
@@ -143,6 +148,27 @@
     row.append(status);
     return row;
   }
+  // Handing a piece of work on the pile to an AI, and taking that back while
+  // nobody has taken it.
+  function handControl(item) {
+    const row = el('div', 'board-order');
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    const asked = item.handoff && item.handoff.state === 'requested';
+    const button = el('button', 'quiet', asked ? '取り下げる' : '任せる');
+    button.type = 'button';
+    button.setAttribute('aria-label', '「' + short(item.title) + '」を' + (asked ? '任せるのを取り下げる' : 'AI へ任せる'));
+    button.addEventListener('click', async () => {
+      const day = new Date();
+      const local = String(day.getFullYear()) + String(day.getMonth() + 1).padStart(2, '0') + String(day.getDate()).padStart(2, '0');
+      const done = await write(asked ? { op: 'take_back', item_id: item.item_id } : { op: 'hand', item_id: item.item_id, day: local }, status, button);
+      if (done) load(true);
+    });
+    row.append(button);
+    if (asked) row.append(el('span', 'board-write-note', '依頼の番号：' + item.handoff.request_id + '（' + when(item.handoff.requested_at) + '）'));
+    row.append(status);
+    return row;
+  }
   function addControl(project, peers) {
     const box = el('div', 'board-add');
     box.append(el('h3', null, '仕事を積む'));
@@ -204,6 +230,9 @@
       box.append(last);
     }
     if (canWrite && item.kind === 'task' && item.state === 'planned') box.append(orderControl(item));
+    if (item.handoff && item.handoff.state === 'accepted')
+      box.append(el('p', 'board-wait', '受けた担当：' + item.handoff.accepted_by + '（' + when(item.handoff.accepted_at) + '、依頼の番号 ' + item.handoff.request_id + '）'));
+    if (canWrite && item.kind === 'task' && (item.handoff ? item.handoff.state === 'requested' : item.state === 'planned')) box.append(handControl(item));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;
   }

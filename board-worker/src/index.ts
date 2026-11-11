@@ -68,6 +68,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.addEvent(actor, args);
         case "board_list":
           return this.store.listForTool(args);
+        case "board_accept_handoff":
+          return this.store.acceptHandoff(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
@@ -93,11 +95,11 @@ const OWNER_ACTOR = "page:owner";
  * when it is the board's own (UTC) day or the day before or after it, which is
  * as far as any time zone can be; otherwise the UTC day.
  */
-function newBacklogId(pageDay: string | null): string {
+function newBacklogId(pageDay: string | null, prefix = "backlog/"): string {
   const utcDay = (shift: number) => new Date(Date.now() + shift * 86400000).toISOString().slice(0, 10).replace(/-/g, "");
   const day = pageDay !== null && [utcDay(-1), utcDay(0), utcDay(1)].includes(pageDay) ? pageDay : utcDay(0);
   const random = [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `backlog/${day}-${random}`;
+  return `${prefix}${day}-${random}`;
 }
 
 /** HTTP status of a refused owner write. */
@@ -109,6 +111,7 @@ function ownerWriteStatus(code: unknown): number {
     case "FORBIDDEN":
       return 403;
     case "REVISION_CONFLICT":
+    case "HANDOFF_CONFLICT":
     case "BOARD_ITEM_LIMIT":
     case "BOARD_EVENT_LIMIT":
       return 409;

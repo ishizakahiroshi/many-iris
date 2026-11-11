@@ -55,6 +55,15 @@ export const TOOLS: Json[] = [
     },
     [],
   ),
+  tool(
+    "board_accept_handoff",
+    "Take a piece of work the board's owner asked to have done (an item whose handoff.state is \"requested\" in board_list). Send the item's handoff.request_id. Only the first writer gets it; the item then becomes in progress under that writer.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+    },
+    ["item_id", "request_id"],
+  ),
 ];
 
 const validId = (v: unknown) => typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));

@@ -34,4 +34,5 @@
 .board-write-status:empty{display:none}
 .board-order{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
 .board-order button{font-size:.78rem;padding:4px 12px}
+.board-write-note{font-size:.78rem;color:var(--muted)}
 @media(max-width:700px){.connection-bar,footer{width:calc(100% - 38px)}.board-main{padding:20px 19px 35px}.board-tree ul{margin-left:10px;padding-left:9px}}

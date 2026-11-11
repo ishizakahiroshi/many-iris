@@ -160,7 +160,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list",
+  check("three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_accept_handoff",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -394,6 +394,34 @@ async function main() {
   out = await r.json();
   check("a day that no time zone can have falls back to the board's day", r.status === 200 && out.item?.item_id?.startsWith(`backlog/${dayOf(0)}-`), JSON.stringify(out));
   check("a day that is not a string is refused", (await ownerCode({ ...addBody, day: 20261112 })) === "400 INVALID");
+  // --- handing a piece of work on the pile to an AI
+  const handoffOf = async (id) => (await call(K.alpha, "board_list", { since_seq: 999999 })).items.find((i) => i.item_id === id)?.handoff;
+  check("work that was not handed over says so", (await handoffOf(piled.item_id)) === null);
+  check("only work on the pile can be handed over", (await ownerCode({ op: "hand", item_id: "c1" })) === "403 FORBIDDEN");
+  check("handing over an unknown item is not found", (await ownerCode({ op: "hand", item_id: "nope" })) === "404 NOT_FOUND");
+  check("nothing to take back before it is handed over", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
+  r = await ownerPost({ op: "hand", item_id: piled.item_id });
+  out = await r.json();
+  const firstRequest = out.handoff?.request_id ?? "";
+  check("the owner hands work over", r.status === 200 && out.handoff?.state === "requested" && new RegExp(`^REQ-${dayOf(0)}-[0-9a-f]{8}$`).test(firstRequest) &&
+    out.handoff?.accepted_by === null, JSON.stringify(out));
+  check("the same work cannot be handed over twice", (await ownerCode({ op: "hand", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
+  check("a writer sees the request", (await handoffOf(piled.item_id))?.request_id === firstRequest);
+  check("the owner takes the request back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "200 OK" && (await handoffOf(piled.item_id)) === null);
+  check("a request that was taken back cannot be accepted", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: firstRequest })) === "HANDOFF_CONFLICT");
+  out = await (await ownerPost({ op: "hand", item_id: piled.item_id })).json();
+  const request = out.handoff?.request_id ?? "";
+  check("a new request gets a new id", request !== "" && request !== firstRequest);
+  check("accepting needs the id of the open request", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: firstRequest })) === "HANDOFF_CONFLICT");
+  check("accepting an unknown item is not found", code(await call(K.alpha, "board_accept_handoff", { item_id: "nope", request_id: request })) === "NOT_FOUND");
+  check("no key, no accepting", (await mcpRaw(null, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_accept_handoff", arguments: { item_id: piled.item_id, request_id: request } } })).status === 401);
+  const accepted = await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request });
+  check("a writer accepts the request", accepted.handoff?.state === "accepted" && accepted.handoff?.accepted_by === "alpha" &&
+    accepted.item?.state === "in_progress" && accepted.item?.updated_by === "alpha", JSON.stringify(accepted));
+  check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
+  check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
+  check("the page data carries the hand-off", (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
+    .find((i) => i.item_id === piled.item_id)?.handoff?.state === "accepted");
   check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
 
   // --- the item limit (12 in this run)

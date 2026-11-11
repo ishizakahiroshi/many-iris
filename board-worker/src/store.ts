@@ -84,11 +84,42 @@ export class Store {
     // The owner's order of the pile. Added after the first boards were made, so
     // an existing table gets the column here (NULL = not ordered yet). It is not
     // one of the writers' fields: the Rust board does not have it.
+    this.addColumn("pile_rank", "INTEGER");
+    // Handing a piece of work to an AI: the owner asks (requested), one writer
+    // takes it (accepted). Kept beside the item so that taking it is one
+    // atomic step and no second writer can take the same request.
+    this.addColumn("handoff_state", "TEXT");
+    this.addColumn("handoff_request", "TEXT");
+    this.addColumn("handoff_at", "INTEGER");
+    this.addColumn("handoff_actor", "TEXT");
+    this.addColumn("handoff_accepted_at", "INTEGER");
+  }
+  /** Adds a column to `board_items` when an older board does not have it yet. */
+  private addColumn(name: string, type: "INTEGER" | "TEXT"): void {
     try {
-      this.sql.exec("SELECT pile_rank FROM board_items LIMIT 0");
+      this.sql.exec(`SELECT ${name} FROM board_items LIMIT 0`);
     } catch {
-      this.sql.exec("ALTER TABLE board_items ADD COLUMN pile_rank INTEGER");
+      this.sql.exec(`ALTER TABLE board_items ADD COLUMN ${name} ${type}`);
     }
+  }
+  /** The hand-off columns of one item, or `null` when the work was not handed to anyone. */
+  private handoffOf(r: Row, prefix = ""): Record<string, unknown> | null {
+    const state = r[prefix + "handoff_state"] ?? null;
+    if (state === null) return null;
+    const at = r[prefix + "handoff_at"] ?? null;
+    const acceptedAt = r[prefix + "handoff_accepted_at"] ?? null;
+    return {
+      state: str(state), request_id: strOrNull(r[prefix + "handoff_request"] ?? null),
+      requested_at: at === null ? null : num(at),
+      accepted_by: strOrNull(r[prefix + "handoff_actor"] ?? null),
+      accepted_at: acceptedAt === null ? null : num(acceptedAt),
+    };
+  }
+  private loadHandoff(id: string): Record<string, unknown> | null {
+    const rows = this.sql.exec(
+      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at FROM board_items WHERE item_id=?", id,
+    ).toArray() as Row[];
+    return rows.length ? this.handoffOf(rows[0]) : null;
   }
 
   private loadItem(id: string): Item | null {
@@ -213,6 +244,34 @@ export class Store {
     });
   }
 
+  /**
+   * The `board_accept_handoff` tool: a writer takes the request the owner made
+   * for `item_id`. The request id must be the one on the item, and only the
+   * first writer gets it; the item then becomes in progress under that writer.
+   */
+  acceptHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id"]);
+    const itemId = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    const now = Date.now();
+    this.tx(() => {
+      if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+      const handoff = this.loadHandoff(itemId);
+      if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request)
+        throw new BoardError("HANDOFF_CONFLICT", "This request is not open: it was taken, taken back, or the id is another one");
+      this.sql.exec(
+        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=? WHERE item_id=?",
+        actor, now, itemId,
+      );
+      this.insertEvent(itemId, now, actor, "note", `accepted ${request}`, null);
+    });
+    // The request is this writer's now; the state follows as an ordinary write.
+    const item = this.loadItem(itemId);
+    const written = item !== null && item.state === "planned" ? this.upsertItem(actor, { item_id: itemId, state: "in_progress" }) : { item };
+    return { ok: true, changed: true, item: written.item, handoff: this.loadHandoff(itemId) };
+  }
+
   /** The `board_list` tool: arguments `project` and `since_seq`. */
   listForTool(input: unknown): Record<string, unknown> {
     const obj = asObject(input);
@@ -242,11 +301,46 @@ export class Store {
    *   {op:"move", item_id, direction:"up"|"down"}   change the order of the
    *     pile (planned work of one project under one parent). The order is the
    *     owner's: it does not touch an item's revision or `updated_by`.
+   *   {op:"hand", item_id, day?}   ask for a piece of work on the pile to be
+   *     done: it gets a request id and waits for one writer to take it
+   *     (`acceptHandoff`); {op:"take_back", item_id} withdraws a request that
+   *     nobody has taken yet.
    * Titles, states and plans stay with the writers that own them.
    */
-  ownerWrite(actor: string, input: unknown, newId: (day: string | null) => string): Record<string, unknown> {
+  ownerWrite(actor: string, input: unknown, newId: (day: string | null, prefix?: string) => string): Record<string, unknown> {
     const obj = asObject(input);
     const op = requiredStr(obj, "op");
+    if (op === "hand" || op === "take_back") {
+      onlyKeys(obj, op === "hand" ? ["op", "item_id", "day"] : ["op", "item_id"]);
+      const itemId = requiredStr(obj, "item_id");
+      const day = op === "hand" ? optionalStr(obj, "day") : null;
+      return this.tx(() => {
+        const item = this.loadItem(itemId);
+        if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+        const handoff = this.loadHandoff(itemId);
+        const now = Date.now();
+        if (op === "hand") {
+          if (item.kind !== "task" || item.state !== "planned")
+            throw new BoardError("FORBIDDEN", "Only work on the pile (kind task, state planned) can be handed over");
+          if (handoff !== null) throw new BoardError("HANDOFF_CONFLICT", "This work is handed over already");
+          const request = newId(day, "REQ-");
+          this.sql.exec(
+            "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL WHERE item_id=?",
+            request, now, itemId,
+          );
+          this.insertEvent(itemId, now, actor, "note", `handed over ${request}`, null);
+        } else {
+          if (handoff === null || handoff.state !== "requested")
+            throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");
+          this.sql.exec(
+            "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL WHERE item_id=?",
+            itemId,
+          );
+          this.insertEvent(itemId, now, actor, "note", `taken back ${String(handoff.request_id)}`, null);
+        }
+        return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
+      });
+    }
     if (op === "add") {
       onlyKeys(obj, ["op", "project", "title", "parent_id", "day"]);
       const project = requiredStr(obj, "project");
@@ -295,7 +389,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach or move");
+    throw invalid("op must be add, attach, move, hand or take_back");
   }
 
   /** All items of the project (or of every project), each with its latest
@@ -304,7 +398,8 @@ export class Store {
   list(project: string | null, sinceSeq: number, eventLimit: number, newestFirst: boolean): Record<string, unknown> {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
-      `SELECT ${itemCols},i.pile_rank AS i_pile_rank,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+      `SELECT ${itemCols},i.pile_rank AS i_pile_rank,i.handoff_state AS i_handoff_state,i.handoff_request AS i_handoff_request,
+              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
        WHERE (? IS NULL OR i.project=?) ORDER BY i.project,
@@ -316,6 +411,7 @@ export class Store {
     const items = itemRows.map((r) => ({
       ...rowItem(r, "i_"),
       rank: r.i_pile_rank === null ? null : num(r.i_pile_rank),
+      handoff: this.handoffOf(r, "i_"),
       last_event: r.e_seq === null
         ? null
         : { seq: num(r.e_seq), at: num(r.e_at), actor: str(r.e_actor), kind: str(r.e_kind), text: str(r.e_text), ref: strOrNull(r.e_ref) },
