@@ -418,6 +418,8 @@ async function main() {
   const accepted = await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request });
   check("a writer accepts the request", accepted.handoff?.state === "accepted" && accepted.handoff?.accepted_by === "alpha" &&
     accepted.item?.state === "in_progress" && accepted.item?.updated_by === "alpha", JSON.stringify(accepted));
+  check("a writer cannot write the hand-off itself", code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff: { state: "requested" } })) === -32602 &&
+    code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff_state: null })) === -32602);
   check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
   check("the page data carries the hand-off", (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
