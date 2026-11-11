@@ -87,9 +87,15 @@ export class BoardStore extends DurableObject<Env> {
  * (rules.ts validActor), so none of them can be this one. */
 const OWNER_ACTOR = "page:owner";
 
-/** `backlog/<YYYYMMDD>-<8 hex>`: made by the board, so the page never names an item. */
-function newBacklogId(): string {
-  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+/**
+ * `backlog/<YYYYMMDD>-<8 hex>`: made by the board, so the page never names an
+ * item. The day is the owner's calendar day as the page reports it, taken only
+ * when it is the board's own (UTC) day or the day before or after it, which is
+ * as far as any time zone can be; otherwise the UTC day.
+ */
+function newBacklogId(pageDay: string | null): string {
+  const utcDay = (shift: number) => new Date(Date.now() + shift * 86400000).toISOString().slice(0, 10).replace(/-/g, "");
+  const day = pageDay !== null && [utcDay(-1), utcDay(0), utcDay(1)].includes(pageDay) ? pageDay : utcDay(0);
   const random = [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, "0")).join("");
   return `backlog/${day}-${random}`;
 }

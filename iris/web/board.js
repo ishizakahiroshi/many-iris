@@ -162,7 +162,10 @@
     const send = async () => {
       const text = title.value.trim();
       if (!text) { status.textContent = '題名を入れてください。'; return; }
-      const body = { op: 'add', project, title: text };
+      const now = new Date();
+      // This device's calendar day, for the new item's id.
+      const day = String(now.getFullYear()) + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0');
+      const body = { op: 'add', project, title: text, day };
       if (select.value) body.parent_id = select.value;
       const done = await write(body, status, button);
       if (done) { title.value = ''; load(true); }

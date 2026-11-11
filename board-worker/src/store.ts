@@ -234,8 +234,9 @@ export class Store {
 
   /**
    * What the signed-in owner may do from the page, and nothing else:
-   *   {op:"add", project, title, parent_id?}   put a piece of work on the pile
-   *     (kind task, state planned; the board makes the id);
+   *   {op:"add", project, title, parent_id?, day?}   put a piece of work on the
+   *     pile (kind task, state planned; the board makes the id, `day` is the
+   *     page's calendar day for that id);
    *   {op:"attach", item_id, parent_id, expected_revision}   put a piece of
    *     work under another item, or under nothing (parent_id null);
    *   {op:"move", item_id, direction:"up"|"down"}   change the order of the
@@ -243,18 +244,20 @@ export class Store {
    *     owner's: it does not touch an item's revision or `updated_by`.
    * Titles, states and plans stay with the writers that own them.
    */
-  ownerWrite(actor: string, input: unknown, newId: () => string): Record<string, unknown> {
+  ownerWrite(actor: string, input: unknown, newId: (day: string | null) => string): Record<string, unknown> {
     const obj = asObject(input);
     const op = requiredStr(obj, "op");
     if (op === "add") {
-      onlyKeys(obj, ["op", "project", "title", "parent_id"]);
+      onlyKeys(obj, ["op", "project", "title", "parent_id", "day"]);
       const project = requiredStr(obj, "project");
       const title = requiredStr(obj, "title");
       const parentId = optionalStr(obj, "parent_id");
       // A project is made by a writer; a typing slip here must not start a new one.
       const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
       if (known === 0) throw new BoardError("NOT_FOUND", "No such project");
-      const args: Record<string, unknown> = { item_id: newId(), project, kind: "task", title, state: "planned", expected_revision: 0 };
+      // The page's own calendar day, for the id only (see newBacklogId).
+      const day = optionalStr(obj, "day");
+      const args: Record<string, unknown> = { item_id: newId(day), project, kind: "task", title, state: "planned", expected_revision: 0 };
       if (parentId !== null) args.parent_id = parentId;
       return this.upsertItem(actor, args);
     }

@@ -354,6 +354,8 @@ async function main() {
   const piled = out.item ?? {};
   check("the owner piles up a piece of work", r.status === 200 && out.ok === true && piled.kind === "task" && piled.state === "planned" &&
     piled.parent_id === "c1" && piled.updated_by === "page:owner" && /^backlog\/\d{8}-[0-9a-f]{8}$/.test(piled.item_id ?? ""), JSON.stringify(out));
+  const dayOf = (shift) => new Date(Date.now() + shift * 86400000).toISOString().slice(0, 10).replace(/-/g, "");
+  check("without a day from the page, the id carries the board's day", piled.item_id?.startsWith(`backlog/${dayOf(0)}-`));
   check("refused owner writes left nothing", (await call(K.alpha, "board_list", {})).counts.items === itemsBefore + 1);
   check("attach needs the revision", (await ownerCode({ op: "attach", item_id: piled.item_id, parent_id: "p1" })) === "400 INVALID");
   check("attach needs a parent or null", (await ownerCode({ op: "attach", item_id: piled.item_id, expected_revision: 1 })) === "400 INVALID");
@@ -385,6 +387,13 @@ async function main() {
   check("a direction other than up or down is refused", (await ownerCode({ op: "move", item_id: "late1", direction: "top" })) === "400 INVALID");
   check("moving an unknown item is not found", (await ownerCode({ op: "move", item_id: "nope", direction: "up" })) === "404 NOT_FOUND");
   check("a writer cannot set the order", code(await call(K.alpha, "board_upsert_item", { item_id: "late1", rank: 5 })) === -32602);
+  r = await ownerPost({ ...addBody, title: "tomorrow here", day: dayOf(1) });
+  out = await r.json();
+  check("the id carries the page's day when it is a day next to the board's", r.status === 200 && out.item?.item_id?.startsWith(`backlog/${dayOf(1)}-`), JSON.stringify(out));
+  r = await ownerPost({ ...addBody, title: "far away", day: "19990101" });
+  out = await r.json();
+  check("a day that no time zone can have falls back to the board's day", r.status === 200 && out.item?.item_id?.startsWith(`backlog/${dayOf(0)}-`), JSON.stringify(out));
+  check("a day that is not a string is refused", (await ownerCode({ ...addBody, day: 20261112 })) === "400 INVALID");
   check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
 
   // --- the item limit (12 in this run)
