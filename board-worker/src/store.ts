@@ -81,6 +81,14 @@ export class Store {
 
   init(): void {
     for (const statement of SCHEMA) this.sql.exec(statement);
+    // The owner's order of the pile. Added after the first boards were made, so
+    // an existing table gets the column here (NULL = not ordered yet). It is not
+    // one of the writers' fields: the Rust board does not have it.
+    try {
+      this.sql.exec("SELECT pile_rank FROM board_items LIMIT 0");
+    } catch {
+      this.sql.exec("ALTER TABLE board_items ADD COLUMN pile_rank INTEGER");
+    }
   }
 
   private loadItem(id: string): Item | null {
@@ -229,7 +237,10 @@ export class Store {
    *   {op:"add", project, title, parent_id?}   put a piece of work on the pile
    *     (kind task, state planned; the board makes the id);
    *   {op:"attach", item_id, parent_id, expected_revision}   put a piece of
-   *     work under another item, or under nothing (parent_id null).
+   *     work under another item, or under nothing (parent_id null);
+   *   {op:"move", item_id, direction:"up"|"down"}   change the order of the
+   *     pile (planned work of one project under one parent). The order is the
+   *     owner's: it does not touch an item's revision or `updated_by`.
    * Titles, states and plans stay with the writers that own them.
    */
   ownerWrite(actor: string, input: unknown, newId: () => string): Record<string, unknown> {
@@ -257,7 +268,31 @@ export class Store {
       if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) can be moved from the page");
       return this.upsertItem(actor, { item_id: itemId, parent_id: obj.parent_id, expected_revision: obj.expected_revision });
     }
-    throw invalid("op must be add or attach");
+    if (op === "move") {
+      onlyKeys(obj, ["op", "item_id", "direction"]);
+      const itemId = requiredStr(obj, "item_id");
+      const direction = requiredStr(obj, "direction");
+      if (direction !== "up" && direction !== "down") throw invalid("direction must be up or down");
+      return this.tx(() => {
+        const item = this.loadItem(itemId);
+        if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+        if (item.kind !== "task" || item.state !== "planned")
+          throw new BoardError("FORBIDDEN", "Only work on the pile (kind task, state planned) can be reordered");
+        // The pile this work is in: planned work of the same project under the same parent.
+        const pile = (this.sql.exec(
+          `SELECT item_id FROM board_items WHERE project=? AND kind='task' AND state='planned' AND parent_id IS ?
+           ORDER BY (pile_rank IS NULL),pile_rank,created_at,item_id`,
+          item.project, item.parent_id,
+        ).toArray() as Row[]).map((r) => str(r.item_id));
+        const at = pile.indexOf(itemId);
+        const to = direction === "up" ? at - 1 : at + 1;
+        if (to < 0 || to >= pile.length) return { ok: true, changed: false, order: pile };
+        [pile[at], pile[to]] = [pile[to], pile[at]];
+        pile.forEach((id, index) => this.sql.exec("UPDATE board_items SET pile_rank=? WHERE item_id=?", index + 1, id));
+        return { ok: true, changed: true, order: pile };
+      });
+    }
+    throw invalid("op must be add, attach or move");
   }
 
   /** All items of the project (or of every project), each with its latest
@@ -266,14 +301,18 @@ export class Store {
   list(project: string | null, sinceSeq: number, eventLimit: number, newestFirst: boolean): Record<string, unknown> {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
-      `SELECT ${itemCols},e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+      `SELECT ${itemCols},i.pile_rank AS i_pile_rank,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
-       WHERE (? IS NULL OR i.project=?) ORDER BY i.project,i.created_at,i.item_id`,
+       WHERE (? IS NULL OR i.project=?) ORDER BY i.project,
+         (CASE WHEN i.kind='task' AND i.state='planned' THEN i.pile_rank END) IS NULL,
+         (CASE WHEN i.kind='task' AND i.state='planned' THEN i.pile_rank END),
+         i.created_at,i.item_id`,
       project, project,
     ).toArray() as Row[];
     const items = itemRows.map((r) => ({
       ...rowItem(r, "i_"),
+      rank: r.i_pile_rank === null ? null : num(r.i_pile_rank),
       last_event: r.e_seq === null
         ? null
         : { seq: num(r.e_seq), at: num(r.e_at), actor: str(r.e_actor), kind: str(r.e_kind), text: str(r.e_text), ref: strOrNull(r.e_ref) },

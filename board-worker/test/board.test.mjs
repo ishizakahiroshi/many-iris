@@ -368,6 +368,23 @@ async function main() {
   check("the owner cannot make a cycle", (await ownerCode({ op: "attach", item_id: "d3", parent_id: "d6", expected_revision: 1 })) === "400 CYCLE");
   check("the owner cannot move work across projects", (await ownerCode({ op: "attach", item_id: piled.item_id, parent_id: "o1", expected_revision: 3 })) === "400 PROJECT_MISMATCH");
   check("an unknown item is not found", (await ownerCode({ op: "attach", item_id: "nope", parent_id: null, expected_revision: 1 })) === "404 NOT_FOUND");
+  // The pile under c1 is d3 then late1 (the order they were made in).
+  const pileOrder = async () => (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
+    .filter((i) => i.parent_id === "c1" && i.kind === "task" && i.state === "planned").map((i) => i.item_id).join(",");
+  check("the pile starts in the order it was made", (await pileOrder()) === "d3,late1", await pileOrder());
+  const lateBefore = (await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === "late1");
+  r = await ownerPost({ op: "move", item_id: "late1", direction: "up" });
+  out = await r.json();
+  check("the owner moves work up the pile", r.status === 200 && out.changed === true && out.order?.join(",") === "late1,d3" && (await pileOrder()) === "late1,d3", JSON.stringify(out));
+  r = await ownerPost({ op: "move", item_id: "late1", direction: "up" });
+  out = await r.json();
+  check("the top of the pile stays where it is", r.status === 200 && out.changed === false && (await pileOrder()) === "late1,d3");
+  const lateAfter = (await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === "late1");
+  check("the order does not touch the writer's fields", lateAfter.revision === lateBefore.revision && lateAfter.updated_by === "alpha" && lateAfter.rank === 1);
+  check("only work on the pile can be reordered", (await ownerCode({ op: "move", item_id: "c1", direction: "up" })) === "403 FORBIDDEN");
+  check("a direction other than up or down is refused", (await ownerCode({ op: "move", item_id: "late1", direction: "top" })) === "400 INVALID");
+  check("moving an unknown item is not found", (await ownerCode({ op: "move", item_id: "nope", direction: "up" })) === "404 NOT_FOUND");
+  check("a writer cannot set the order", code(await call(K.alpha, "board_upsert_item", { item_id: "late1", rank: 5 })) === -32602);
   check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
 
   // --- the item limit (12 in this run)
@@ -391,6 +408,8 @@ async function main() {
   list = await call(K.alpha, "board_list", {});
   check("data survives a restart", list.counts.items === before.items && list.counts.events === before.events,
     `${JSON.stringify(before)} -> ${JSON.stringify(list.counts)}`);
+  const afterRestart = list.items.map((i) => i.item_id);
+  check("the order of the pile survives a restart", afterRestart.indexOf("late1") < afterRestart.indexOf("d3"));
 }
 
 let crashed = null;

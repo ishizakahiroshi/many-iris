@@ -125,6 +125,24 @@
     box.append(row);
     return box;
   }
+  // Up and down within the pile: the planned work next to this one.
+  function orderControl(item) {
+    const row = el('div', 'board-order');
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    for (const [direction, label] of [['up', '上へ'], ['down', '下へ']]) {
+      const button = el('button', 'quiet', label);
+      button.type = 'button';
+      button.setAttribute('aria-label', '「' + short(item.title) + '」を' + label);
+      button.addEventListener('click', async () => {
+        const done = await write({ op: 'move', item_id: item.item_id, direction }, status, button);
+        if (done) load(true);
+      });
+      row.append(button);
+    }
+    row.append(status);
+    return row;
+  }
   function addControl(project, peers) {
     const box = el('div', 'board-add');
     box.append(el('h3', null, '仕事を積む'));
@@ -182,6 +200,7 @@
       last.append(eventLine(item.last_event, false));
       box.append(last);
     }
+    if (canWrite && item.kind === 'task' && item.state === 'planned') box.append(orderControl(item));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;
   }
