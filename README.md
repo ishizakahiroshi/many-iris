@@ -19,6 +19,7 @@
 - AI や道具は、`/board/mcp`（MCP）へ書きます。道具は `board_upsert_item`（項目の作成と更新）・`board_add_event`（出来事の追加）・`board_list`（読み取り）の 3 つです。
 - 書く側の本人確認は 2 通りです。手元の道具は、書き込み用の鍵を Bearer で送ります。ChatGPT のように鍵を送れない MCP の client は、OAuth で接続します。OAuth の許可の画面（`/authorize`）は、Access でログインした看板の持ち主だけが開けます。OAuth の部分は Cloudflare の [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider) を使っています。
 - 書いた人は、鍵か、許可した client から決まります。本文で名乗ることはできません。項目や出来事を消す道具はありません。
+- 作業（種類 `task`）のうち親の無いものは、画面では案件ごとの「まだ結ばれていない作業」にまとまります。既にある項目の親は、後から付けられます（`board_upsert_item` に `item_id` と `parent_id` だけを送る）。先に作業を記録し、あとで計画の下へ付け替える使い方ができます。
 - 項目と出来事の決まり（使える文字・長さ・状態の種類・親子）は、Rust 版の看板と同じです。[`iris/README.md`](iris/README.md) の「看板（board）」を見てください。
 
 ### 自分の Cloudflare に置く

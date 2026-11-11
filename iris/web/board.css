@@ -5,6 +5,9 @@
 .board-tree,.board-tree ul{list-style:none;margin:0;padding:0}
 .board-tree ul{margin-left:22px;border-left:2px solid var(--line);padding-left:14px}
 .board-node{margin:0 0 10px}
+.board-unlinked{margin-top:16px;padding-top:12px;border-top:2px dashed var(--line)}
+.board-unlinked>h3{display:flex;gap:10px;align-items:center;font-size:1rem;margin:0 0 8px}
+.board-hint{font-size:.8rem;color:var(--soft);margin:0 0 10px}
 .board-card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:12px 15px;overflow-wrap:anywhere}
 .board-card-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
 .board-title{font-size:.95rem;font-weight:650;margin:0}

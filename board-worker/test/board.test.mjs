@@ -210,6 +210,12 @@ async function main() {
   check("six levels are allowed", out.ok === true);
   check("a seventh level is refused", code(await call(K.alpha, "board_upsert_item", { item_id: "d7", project: "demo", kind: "task", title: "d7", state: "planned", parent_id: "d6" })) === "DEPTH");
   check("a refused write leaves nothing", (await call(K.alpha, "board_list", { project: "demo" })).items.every((i) => i.item_id !== "d7"));
+  // Work is often recorded first and tied to its plan afterwards.
+  await call(K.alpha, "board_upsert_item", { item_id: "late1", project: "demo", kind: "task", title: "late", state: "planned" });
+  out = await call(K.alpha, "board_upsert_item", { item_id: "late1", parent_id: "p1" });
+  check("an existing item can be put under a parent later", out.ok === true && out.item.parent_id === "p1" && out.item.title === "late");
+  out = await call(K.alpha, "board_upsert_item", { item_id: "late1", parent_id: "c1" });
+  check("an existing item can be moved to another parent", out.ok === true && out.item.parent_id === "c1");
 
   // --- events
   out = await call(K.alpha, "board_add_event", { item_id: "c1", kind: "note", text: "line 1\nline 2", ref: "https://github.com/example/repo/pull/1" });

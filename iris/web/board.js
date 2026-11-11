@@ -69,15 +69,19 @@
     }
     return box;
   }
-  function tree(items) {
+  // One project's items as two lists: the tree, and the work (kind task) that
+  // nobody has put under a plan yet, so it is not lost among the roots.
+  function forest(items) {
     const ids = new Set(items.map((i) => i.item_id));
     const children = new Map();
     const roots = [];
+    const unlinked = [];
     for (const item of items) {
       if (item.parent_id && ids.has(item.parent_id)) {
         if (!children.has(item.parent_id)) children.set(item.parent_id, []);
         children.get(item.parent_id).push(item);
-      } else roots.push(item);
+      } else if (item.kind === 'task') unlinked.push(item);
+      else roots.push(item);
     }
     const seen = new Set();
     const list = (nodes, depth) => {
@@ -93,7 +97,7 @@
       }
       return ul;
     };
-    return list(roots, 0);
+    return { tree: list(roots, 0), unlinked: list(unlinked, 0), unlinkedCount: unlinked.length };
   }
   function render(data) {
     const items = Array.isArray(data.items) ? data.items : [];
@@ -108,8 +112,18 @@
     }
     for (const [project, list] of byProject) {
       const section = el('section', 'board-project');
+      const { tree, unlinked, unlinkedCount } = forest(list);
       section.append(el('h2', null, project));
-      section.append(tree(list));
+      section.append(tree);
+      const loose = el('div', 'board-unlinked');
+      const heading = el('h3', null, 'まだ結ばれていない作業');
+      heading.append(el('span', 'count', unlinkedCount + ' 件'));
+      loose.append(heading);
+      if (unlinkedCount) {
+        loose.append(el('p', 'board-hint', 'どの計画の分か、まだ分かっていない作業です。鍵を持つ AI に頼むと、計画の下へ付け替えられます。'));
+        loose.append(unlinked);
+      }
+      section.append(loose);
       host.append(section);
     }
     const eventList = $('board-events');
