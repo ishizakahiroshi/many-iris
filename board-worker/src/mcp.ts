@@ -74,6 +74,15 @@ export const TOOLS: Json[] = [
     },
     ["item_id", "request_id"],
   ),
+  tool(
+    "board_route_handoff",
+    "Change the destination (handoff.to) of handed-over work that nobody has taken yet — the writer-side form of the page's \"行き先を変える\". Use it to give work on hold or on the owner a writer, or to send it elsewhere. The event records who changed it.",
+    {
+      item_id: text("The item that was handed over"),
+      to: { type: ["string", "null"], enum: [...HANDOFF_TARGETS, null], description: "The new destination, or null to let the board choose" },
+    },
+    ["item_id", "to"],
+  ),
 ];
 
 const validId = (v: unknown) => typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));

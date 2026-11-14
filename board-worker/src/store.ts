@@ -406,6 +406,37 @@ export class Store {
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
   }
 
+  /** Changes the destination of an open request; false when it already had that one. Runs inside a transaction. */
+  private reroute(actor: string, itemId: string, handoff: Record<string, unknown> | null, to: string | null, now: number): boolean {
+    if (handoff === null || handoff.state !== "requested")
+      throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be routed");
+    if (handoff.to === to) return false;
+    this.sql.exec("UPDATE board_items SET handoff_to=? WHERE item_id=?", to, itemId);
+    this.insertEvent(itemId, now, actor, "note", `routed ${String(handoff.request_id)} to ${to ?? "the board's choice"}`, null);
+    return true;
+  }
+
+  /**
+   * The `board_route_handoff` tool: a writer changes the destination of a
+   * request that nobody has taken yet — the writer-side form of the page's
+   * "route" (owner decision 2026-11-14: re-routing should not need the page).
+   * Any writer may do it, including to itself; the event names who did.
+   */
+  routeForTool(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "to"]);
+    const itemId = requiredStr(obj, "item_id");
+    if (!has(obj, "to")) throw invalid("to is required (null lets the board choose)");
+    const to = handoffTarget(obj);
+    return this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      const handoff = this.loadHandoff(itemId);
+      const changed = this.reroute(actor, itemId, handoff, to, Date.now());
+      return { ok: true, changed, item, handoff: this.loadHandoff(itemId) };
+    });
+  }
+
   /** The `board_list` tool: arguments `project` and `since_seq`. */
   listForTool(input: unknown): Record<string, unknown> {
     const obj = asObject(input);
@@ -461,11 +492,7 @@ export class Store {
         if (op === "hand") {
           this.handOver(actor, item, day, to, newId);
         } else if (op === "route") {
-          if (handoff === null || handoff.state !== "requested")
-            throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be routed");
-          if (handoff.to === to) return { ok: true, changed: false, item, handoff };
-          this.sql.exec("UPDATE board_items SET handoff_to=? WHERE item_id=?", to, itemId);
-          this.insertEvent(itemId, now, actor, "note", `routed ${String(handoff.request_id)} to ${to ?? "the board's choice"}`, null);
+          if (!this.reroute(actor, itemId, handoff, to, now)) return { ok: true, changed: false, item, handoff };
         } else {
           if (handoff === null || handoff.state !== "requested")
             throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");

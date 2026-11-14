@@ -161,7 +161,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("five tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff",
+  check("six tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff,board_route_handoff",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -456,6 +456,12 @@ async function main() {
   check("nobody takes a request on hold", code(await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN" &&
     code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
   check("routing needs a destination", (await ownerCode({ op: "route", item_id: "pile3" })) === "400 INVALID");
+  check("a writer cannot route to a destination outside the list", code(await call(K.alpha, "board_route_handoff", { item_id: "pile3", to: "someone" })) === "INVALID");
+  check("a writer must name the destination", code(await call(K.alpha, "board_route_handoff", { item_id: "pile3" })) === -32602);
+  const writerRouted = await call(K.muse, "board_route_handoff", { item_id: "pile3", to: "devin" });
+  check("a writer routes a request on hold", writerRouted.changed === true && writerRouted.handoff?.to === "devin" && (await handoffOf("pile3"))?.to === "devin", JSON.stringify(writerRouted));
+  check("routing by a writer names the writer", (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === "pile3" && e.actor === "muse" && e.text === `routed ${museRequest} to devin`));
+  check("routing to the same destination changes nothing", (await call(K.alpha, "board_route_handoff", { item_id: "pile3", to: "devin" })).changed === false);
   r = await ownerPost({ op: "route", item_id: "pile3", to: "muse" });
   out = await r.json();
   check("the owner routes a request on hold to a writer", r.status === 200 && out.changed === true && out.handoff?.to === "muse" && out.handoff?.request_id === museRequest, JSON.stringify(out));
@@ -466,6 +472,7 @@ async function main() {
   const museTook = await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest });
   check("the writer of the destination takes the request", museTook.handoff?.state === "accepted" && museTook.handoff?.accepted_by === "muse", JSON.stringify(museTook));
   check("an accepted request cannot be routed", (await ownerCode({ op: "route", item_id: "pile3", to: "devin" })) === "409 HANDOFF_CONFLICT");
+  check("an accepted request cannot be routed by a writer", code(await call(K.alpha, "board_route_handoff", { item_id: "pile3", to: "devin" })) === "HANDOFF_CONFLICT");
 
   // --- the cron gives a destination to work handed over without one (Clef, or hold
   // when the router cannot answer). The test has no Devin key, so nobody is started.
