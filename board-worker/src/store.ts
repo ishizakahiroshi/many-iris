@@ -50,11 +50,12 @@ const SCHEMA = [
    BEGIN SELECT RAISE(ABORT, 'board events are append-only'); END`,
   `CREATE TRIGGER IF NOT EXISTS board_items_no_delete BEFORE DELETE ON board_items
    BEGIN SELECT RAISE(ABORT, 'board items are never deleted'); END`,
-  // The dispatcher's memory of which handoff requests were already sent to a
-  // session, so a request that is still 'requested' between spawn and accept
-  // is not dispatched twice.
-  `CREATE TABLE IF NOT EXISTS dispatches(
-    request_id TEXT PRIMARY KEY NOT NULL,
+  // The dispatcher's memory of every session it started, one row per start:
+  // it keeps a request that is still 'requested' between spawn and accept from
+  // being sent twice, and caps retries and the number of starts per day.
+  `CREATE TABLE IF NOT EXISTS dispatch_log(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
     at INTEGER NOT NULL
   )`,
 ];
@@ -121,18 +122,18 @@ export class Store {
     return { ok: true, items };
   }
 
-  /** When a request was last dispatched to a session (null = never). */
-  dispatchAge(request: string): Record<string, unknown> {
-    const rows = this.sql.exec("SELECT at FROM dispatches WHERE request_id=?", request).toArray() as Row[];
-    return { ok: true, at: rows.length ? num(rows[0].at) : null };
+  /** What the dispatcher already did for a request: when it last started a session, how many times, and how many starts happened since `since` in total. */
+  dispatchState(request: string, since: number): Record<string, unknown> {
+    const mine = this.sql.exec("SELECT MAX(at) AS at, COUNT(*) AS n FROM dispatch_log WHERE request_id=?", request).toArray() as Row[];
+    const all = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", since).toArray() as Row[];
+    return { ok: true, at: mine[0]?.at == null ? null : num(mine[0].at), count: num(mine[0]?.n ?? 0), total_since: num(all[0]?.n ?? 0) };
   }
 
-  /** Record that a request was dispatched at `at`. */
+  /** Record that a session was started for a request at `at`. */
   recordDispatch(request: string, at: number): Record<string, unknown> {
-    this.sql.exec("INSERT OR REPLACE INTO dispatches(request_id,at) VALUES(?,?)", request, at);
+    this.sql.exec("INSERT INTO dispatch_log(request_id,at) VALUES(?,?)", request, at);
     return { ok: true, changed: true };
   }
-
   /** The hand-off columns of one item, or `null` when the work was not handed to anyone. */
   private handoffOf(r: Row, prefix = ""): Record<string, unknown> | null {
     const state = r[prefix + "handoff_state"] ?? null;
