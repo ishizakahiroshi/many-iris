@@ -40,7 +40,9 @@ export interface Env {
   BOARD_LIMIT_EVENTS?: string;
   /** Devin API key for the scheduled dispatcher (wrangler secret put DEVIN_API_KEY). */
   DEVIN_API_KEY?: string;
-  /** Override of the sessions endpoint (defaults to https://api.devin.ai/v3/sessions). */
+  /** Override of the sessions endpoint (defaults to https://api.devin.ai/v1/sessions).
+   * A service-user key targets the org-scoped v3 endpoint instead:
+   *   https://api.devin.ai/v3/organizations/<org>/sessions */
   DEVIN_SESSIONS_URL?: string;
 }
 
@@ -317,7 +319,7 @@ function providerFor(origin: string): OAuthProvider<Env> {
 // spawn and accept cannot fire the same work twice.
 const DISPATCH_DEDUPE_MS = 15 * 60 * 1000;
 const DISPATCH_MAX_PER_TICK = 3;
-const DEVIN_SESSIONS_URL = "https://api.devin.ai/v3/sessions";
+const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
 const DISPATCH_ACTOR = "dispatcher";
 
 function dispatchPrompt(item: Record<string, unknown>): string {
