@@ -58,6 +58,8 @@ Cloudflare のアカウントと、Cloudflare で管理しているドメイン�
 
 鍵のファイルと `<keys.json>` は、リポジトリの外に置いてください。
 
+あとから書く人を足すときは、手順 4 を同じ一覧に対して繰り返し、一覧を wrangler secret put BOARD_WRITERS で上げ直します。一覧のファイルを変えただけでは、看板に効きません。
+
 ### 試験
 
 `board-worker/` で `node test/board.test.mjs` を実行します。`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・OAuth の一周（発見・client の登録・許可の画面・PKCE・token・使い回した code の取り消し）・項目と出来事の規則・持ち主が画面から書く操作（ほかのサイトからの要求の拒否を含む）・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
