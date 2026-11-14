@@ -19,10 +19,11 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
+  { actor: "muse", token_sha256: sha(K.muse), enabled: true },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -113,7 +114,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=12\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=13\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -436,6 +437,35 @@ async function main() {
   check("a re-request gets a new id", writerRequest2 !== "" && writerRequest2 !== writerRequest);
   const writerAccepted = await call(K.alpha, "board_accept_handoff", { item_id: "pile2", request_id: writerRequest2 });
   check("a writer accepts its own request", writerAccepted.handoff?.state === "accepted" && writerAccepted.item?.state === "in_progress", JSON.stringify(writerAccepted));
+  check("a request without a destination says so", writerAccepted.handoff?.to === null, JSON.stringify(writerAccepted.handoff));
+
+  // --- the destination of a request (handoff.to)
+  await call(K.alpha, "board_upsert_item", { item_id: "pile3", project: "demo", kind: "task", title: "work for one writer", state: "planned" });
+  const badTo = code(await call(K.alpha, "board_request_handoff", { item_id: "pile3", to: "someone" }));
+  check("a destination outside the list is refused", badTo === "INVALID", String(badTo));
+  check("the page refuses a destination outside the list", (await ownerCode({ op: "hand", item_id: "pile3", to: "someone" })) === "400 INVALID");
+  r = await ownerPost({ op: "hand", item_id: "pile3", to: "hold" });
+  out = await r.json();
+  check("the owner hands work over with a destination", r.status === 200 && out.handoff?.to === "hold" && (await handoffOf("pile3"))?.to === "hold", JSON.stringify(out));
+  check("taking a request back clears its destination", (await ownerCode({ op: "take_back", item_id: "pile3" })) === "200 OK" && (await handoffOf("pile3")) === null);
+  const toMuse = await call(K.alpha, "board_request_handoff", { item_id: "pile3", to: "muse" });
+  const museRequest = toMuse.handoff?.request_id ?? "";
+  check("a writer hands work to a destination", toMuse.handoff?.to === "muse" && (await handoffOf("pile3"))?.to === "muse", JSON.stringify(toMuse));
+  check("a request for muse cannot be taken by another writer", code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
+  check("the owner routes the request to hold", (await ownerCode({ op: "route", item_id: "pile3", to: "hold" })) === "200 OK" && (await handoffOf("pile3"))?.to === "hold");
+  check("nobody takes a request on hold", code(await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN" &&
+    code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
+  check("routing needs a destination", (await ownerCode({ op: "route", item_id: "pile3" })) === "400 INVALID");
+  r = await ownerPost({ op: "route", item_id: "pile3", to: "muse" });
+  out = await r.json();
+  check("the owner routes a request on hold to a writer", r.status === 200 && out.changed === true && out.handoff?.to === "muse" && out.handoff?.request_id === museRequest, JSON.stringify(out));
+  const page3 = (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items.find((i) => i.item_id === "pile3");
+  check("the page data carries the destination", page3?.handoff?.to === "muse");
+  const routedEvent = (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === "pile3" && e.text === `routed ${museRequest} to muse`);
+  check("routing leaves an event", routedEvent);
+  const museTook = await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest });
+  check("the writer of the destination takes the request", museTook.handoff?.state === "accepted" && museTook.handoff?.accepted_by === "muse", JSON.stringify(museTook));
+  check("an accepted request cannot be routed", (await ownerCode({ op: "route", item_id: "pile3", to: "devin" })) === "409 HANDOFF_CONFLICT");
 
   check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
@@ -443,14 +473,14 @@ async function main() {
     .find((i) => i.item_id === piled.item_id)?.handoff?.state === "accepted");
   check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
 
-  // --- the item limit (12 in this run)
+  // --- the item limit (13 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 12 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 13 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 12, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 13, String(list.counts.items));
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();

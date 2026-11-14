@@ -1,7 +1,7 @@
 // MCP over plain HTTP POST (JSON responses, no sessions, no streaming).
 // Accepts the usual `initialize` handshake used by today's clients and the
 // per-request `_meta` form the Rust board speaks; the tools are the same.
-import { KINDS, STATES, WRITER_EVENT_KINDS } from "./rules";
+import { HANDOFF_TARGETS, KINDS, STATES, WRITER_EVENT_KINDS } from "./rules";
 
 /** Newest first. */
 export const PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
@@ -57,16 +57,17 @@ export const TOOLS: Json[] = [
   ),
   tool(
     "board_request_handoff",
-    "Mark work on the pile (kind task, state planned) as handed over — the writer-side form of the page's \"hand\", so delegating work does not need the owner to open the board. Returns the item with its new handoff.request_id; whoever takes the work sends that id to board_accept_handoff.",
+    "Mark work on the pile (kind task, state planned) as handed over — the writer-side form of the page's \"hand\", so delegating work does not need the owner to open the board. Returns the item with its new handoff.request_id; whoever takes the work sends that id to board_accept_handoff. With `to`, only that writer can take it (owner and hold: nobody, until the owner routes it); without `to`, the board chooses.",
     {
       item_id: text("The item to hand over"),
       day: text("Optional calendar day YYYYMMDD for the request id (board day or the day before/after it)"),
+      to: { type: "string", enum: [...HANDOFF_TARGETS], description: "Optional destination. Leave it out to let the board choose" },
     },
     ["item_id"],
   ),
   tool(
     "board_accept_handoff",
-    "Take a piece of work the board's owner asked to have done (an item whose handoff.state is \"requested\" in board_list). Send the item's handoff.request_id. Only the first writer gets it; the item then becomes in progress under that writer.",
+    "Take a piece of work the board's owner asked to have done (an item whose handoff.state is \"requested\" in board_list). Send the item's handoff.request_id. When handoff.to is set, only the writer of that name can take it. Only the first writer gets it; the item then becomes in progress under that writer.",
     {
       item_id: text("The item that was handed over"),
       request_id: text("handoff.request_id of that item"),

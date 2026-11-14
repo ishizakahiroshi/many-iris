@@ -15,6 +15,8 @@ export const LIST_EVENT_LIMIT = 500;
 /** Recent events shown on the page. */
 export const PAGE_EVENT_LIMIT = 100;
 export const MAX_KEYS = 64;
+/** Where a handed-over piece of work should go (the item's handoff.to). */
+export const HANDOFF_TARGETS = ["devin", "vps-claude", "local-claude", "muse", "grokbot", "owner", "hold"] as const;
 
 export class BoardError extends Error {
   constructor(

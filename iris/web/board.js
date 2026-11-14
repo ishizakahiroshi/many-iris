@@ -10,6 +10,7 @@
   // record of work that was done. Work handed out by Iris will get a third mark
   // when Iris keeps such requests; the board holds none yet.
   const workMark = (item) => {
+    if (item.handoff && item.handoff.state === 'requested' && item.handoff.to === 'hold') return '任せた・保留中';
     if (item.handoff && item.handoff.state === 'requested') return '任せた・まだ受けていない';
     if (item.handoff && item.handoff.state === 'accepted') return '任せた・受けた';
     return item.state === 'planned' ? '積んである' : '記録だけ';
@@ -148,24 +149,52 @@
     row.append(status);
     return row;
   }
-  // Handing a piece of work on the pile to an AI, and taking that back while
-  // nobody has taken it.
+  // Where handed-over work goes (handoff.to). '' = the board chooses.
+  const targets = [
+    ['', 'おまかせ'], ['devin', 'Devin'], ['vps-claude', 'VPS の claude -p'], ['local-claude', '手元 PC の claude -p'],
+    ['muse', 'Muse'], ['grokbot', 'GrokBot'], ['owner', '自分'], ['hold', '保留'],
+  ];
+  const targetLabel = (to) => (targets.find(([value]) => value === (to || '')) || [null, to])[1];
+  function targetSelect(item, current) {
+    const select = el('select');
+    select.setAttribute('aria-label', '「' + short(item.title) + '」の行き先');
+    for (const [value, label] of targets) select.append(option(value, label));
+    select.value = current || '';
+    return select;
+  }
+  // Handing a piece of work on the pile to an AI, choosing or changing where it
+  // goes while nobody has taken it, and taking it back.
   function handControl(item) {
     const row = el('div', 'board-order');
     const status = el('span', 'board-write-status');
     status.setAttribute('role', 'status');
     const asked = item.handoff && item.handoff.state === 'requested';
+    const select = targetSelect(item, asked ? item.handoff.to : '');
     const button = el('button', 'quiet', asked ? '取り下げる' : '任せる');
     button.type = 'button';
-    button.setAttribute('aria-label', '「' + short(item.title) + '」を' + (asked ? '任せるのを取り下げる' : 'AI へ任せる'));
+    button.setAttribute('aria-label', '「' + short(item.title) + '」を' + (asked ? '任せるのを取り下げる' : '選んだ行き先へ任せる'));
     button.addEventListener('click', async () => {
       const day = new Date();
       const local = String(day.getFullYear()) + String(day.getMonth() + 1).padStart(2, '0') + String(day.getDate()).padStart(2, '0');
-      const done = await write(asked ? { op: 'take_back', item_id: item.item_id } : { op: 'hand', item_id: item.item_id, day: local }, status, button);
+      const body = asked ? { op: 'take_back', item_id: item.item_id } : { op: 'hand', item_id: item.item_id, day: local };
+      if (!asked && select.value) body.to = select.value;
+      const done = await write(body, status, button);
       if (done) load(true);
     });
-    row.append(button);
-    if (asked) row.append(el('span', 'board-write-note', '依頼の番号：' + item.handoff.request_id + '（' + when(item.handoff.requested_at) + '）'));
+    if (asked) {
+      row.append(el('span', 'board-write-note', '行き先：' + targetLabel(item.handoff.to) + '　依頼の番号：' + item.handoff.request_id + '（' + when(item.handoff.requested_at) + '）'));
+      // Changing the destination; a request on hold or on the owner waits for this.
+      const reroute = el('button', 'quiet', '行き先を変える');
+      reroute.type = 'button';
+      reroute.setAttribute('aria-label', '「' + short(item.title) + '」の行き先を変える');
+      reroute.addEventListener('click', async () => {
+        const done = await write({ op: 'route', item_id: item.item_id, to: select.value || null }, status, reroute);
+        if (done) load(true);
+      });
+      row.append(select, reroute, button);
+    } else {
+      row.append(select, button);
+    }
     row.append(status);
     return row;
   }

@@ -386,6 +386,9 @@ export default {
         const item = raw as Record<string, unknown>;
         const request = item.request_id;
         if (typeof request !== "string") continue;
+        // A request for another destination is not Devin's to take (the board refuses
+        // it), so starting a session for it would only spend one of the day's starts.
+        if (item.to !== null && item.to !== undefined && item.to !== "devin") continue;
         const state = await stub.dispatchState(request, now - DAY_MS);
         if (state.ok !== true) continue;
         if (typeof state.total_since === "number" && state.total_since >= DISPATCH_MAX_PER_DAY) return;
