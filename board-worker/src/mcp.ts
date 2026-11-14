@@ -56,6 +56,15 @@ export const TOOLS: Json[] = [
     [],
   ),
   tool(
+    "board_request_handoff",
+    "Mark work on the pile (kind task, state planned) as handed over — the writer-side form of the page's \"hand\", so delegating work does not need the owner to open the board. Returns the item with its new handoff.request_id; whoever takes the work sends that id to board_accept_handoff.",
+    {
+      item_id: text("The item to hand over"),
+      day: text("Optional calendar day YYYYMMDD for the request id (board day or the day before/after it)"),
+    },
+    ["item_id"],
+  ),
+  tool(
     "board_accept_handoff",
     "Take a piece of work the board's owner asked to have done (an item whose handoff.state is \"requested\" in board_list). Send the item's handoff.request_id. Only the first writer gets it; the item then becomes in progress under that writer.",
     {

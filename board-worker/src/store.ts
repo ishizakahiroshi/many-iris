@@ -272,6 +272,35 @@ export class Store {
     return { ok: true, changed: true, item: written.item, handoff: this.loadHandoff(itemId) };
   }
 
+  /**
+   * The `board_request_handoff` tool: a writer marks work on the pile as handed
+   * over — the writer-side form of the page's "hand", so delegation does not
+   * require the owner to open the board page. Returns the item with its new
+   * handoff.request_id; whoever takes the work sends that id to
+   * board_accept_handoff.
+   */
+  requestHandoff(actor: string, input: unknown, newId: (day: string | null, prefix?: string) => string): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "day"]);
+    const itemId = requiredStr(obj, "item_id");
+    const day = optionalStr(obj, "day");
+    return this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (item.kind !== "task" || item.state !== "planned")
+        throw new BoardError("FORBIDDEN", "Only work on the pile (kind task, state planned) can be handed over");
+      if (this.loadHandoff(itemId) !== null) throw new BoardError("HANDOFF_CONFLICT", "This work is handed over already");
+      const request = newId(day, "REQ-");
+      const now = Date.now();
+      this.sql.exec(
+        "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL WHERE item_id=?",
+        request, now, itemId,
+      );
+      this.insertEvent(itemId, now, actor, "note", `handed over ${request}`, null);
+      return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
+    });
+  }
+
   /** The `board_list` tool: arguments `project` and `since_seq`. */
   listForTool(input: unknown): Record<string, unknown> {
     const obj = asObject(input);
