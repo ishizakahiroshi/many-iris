@@ -127,6 +127,13 @@ export class Store {
     this.addColumn("handoff_accepted_at", "INTEGER");
     // Who the request is for (HANDOFF_TARGETS); NULL = no destination yet.
     this.addColumn("handoff_to", "TEXT");
+    // Who asked (the owner's page or a writer), who set the current destination
+    // (the asker, a writer that routed it, or the dispatcher's router), and the
+    // title as it was when the work was handed over. A taker that runs work
+    // unattended reads these instead of trusting a title that may change later.
+    this.addColumn("handoff_by", "TEXT");
+    this.addColumn("handoff_to_by", "TEXT");
+    this.addColumn("handoff_title", "TEXT");
   }
   /** Adds a column to `board_items` when an older board does not have it yet. */
   private addColumn(name: string, type: "INTEGER" | "TEXT"): void {
@@ -189,7 +196,7 @@ export class Store {
       const handoff = this.loadHandoff(itemId);
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request || handoff.to !== null)
         return { ok: true, changed: false, handoff };
-      this.sql.exec("UPDATE board_items SET handoff_to=? WHERE item_id=?", to, itemId);
+      this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, actor, itemId);
       this.insertEvent(itemId, Date.now(), actor, "note", text, null);
       return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
     });
@@ -206,11 +213,14 @@ export class Store {
       accepted_by: strOrNull(r[prefix + "handoff_actor"] ?? null),
       accepted_at: acceptedAt === null ? null : num(acceptedAt),
       to: strOrNull(r[prefix + "handoff_to"] ?? null),
+      requested_by: strOrNull(r[prefix + "handoff_by"] ?? null),
+      to_set_by: strOrNull(r[prefix + "handoff_to_by"] ?? null),
+      title: strOrNull(r[prefix + "handoff_title"] ?? null),
     };
   }
   private loadHandoff(id: string): Record<string, unknown> | null {
     const rows = this.sql.exec(
-      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at,handoff_to FROM board_items WHERE item_id=?", id,
+      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at,handoff_to,handoff_by,handoff_to_by,handoff_title FROM board_items WHERE item_id=?", id,
     ).toArray() as Row[];
     return rows.length ? this.handoffOf(rows[0]) : null;
   }
@@ -400,8 +410,8 @@ export class Store {
     const request = newId(day, "REQ-");
     const now = Date.now();
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=? WHERE item_id=?",
-      request, now, to, item.item_id,
+      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=? WHERE item_id=?",
+      request, now, to, actor, to === null ? null : actor, item.title, item.item_id,
     );
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
   }
@@ -411,7 +421,7 @@ export class Store {
     if (handoff === null || handoff.state !== "requested")
       throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");
     this.sql.exec(
-      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL WHERE item_id=?",
       itemId,
     );
     this.insertEvent(itemId, now, actor, "note", `taken back ${String(handoff.request_id)}`, null);
@@ -422,7 +432,7 @@ export class Store {
     if (handoff === null || handoff.state !== "requested")
       throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be routed");
     if (handoff.to === to) return false;
-    this.sql.exec("UPDATE board_items SET handoff_to=? WHERE item_id=?", to, itemId);
+    this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, to === null ? null : actor, itemId);
     this.insertEvent(itemId, now, actor, "note", `routed ${String(handoff.request_id)} to ${to ?? "the board's choice"}`, null);
     return true;
   }
@@ -590,7 +600,7 @@ export class Store {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
       `SELECT ${itemCols},i.pile_rank AS i_pile_rank,i.handoff_state AS i_handoff_state,i.handoff_request AS i_handoff_request,
-              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
        WHERE (? IS NULL OR i.project=?) ORDER BY i.project,

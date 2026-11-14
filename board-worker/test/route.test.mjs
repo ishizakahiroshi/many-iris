@@ -18,7 +18,9 @@ check("an answer below the floor goes to hold", decideRoute({ answers: { to: { c
 check("an unknown destination goes to hold", decideRoute({ answers: { to: { choice: "someone", probabilities: { someone: 0.9 }, confidence: 0.3 } } }).to === "hold");
 check("a missing answer goes to hold", decideRoute({}).to === "hold" && decideRoute(null).to === "hold");
 check("a probability outside 0..1 goes to hold", decideRoute({ answers: { to: { choice: "devin", probabilities: { devin: 1.5 }, confidence: 0.3 } } }).to === "hold");
-check("the decision says the probability and the confidence", decideRoute({ answers: { to: { choice: "muse", probabilities: { muse: 0.83 }, confidence: 0.3 } } }).text === "routed to muse (probability 0.83, confidence 0.30)");
+check("the decision says the probability and the confidence", decideRoute({ answers: { to: { choice: "owner", probabilities: { owner: 0.83 }, confidence: 0.3 } } }).text === "routed to owner (probability 0.83, confidence 0.30)");
+for (const nobody of ["muse", "grokbot", "vps-claude", "local-claude"])
+  check(`the router does not send work to ${nobody}, which nobody picks up yet`, decideRoute({ answers: { to: { choice: nobody, probabilities: { [nobody]: 0.92 }, confidence: 0.83 } } }).to === "hold");
 check("Clef's low confidence alone does not send work to hold", decideRoute({ answers: { to: { choice: "devin", probabilities: { devin: 0.59 }, confidence: 0.28 } } }).to === "devin");
 check("a choice that is not more likely than the rest goes to hold", decideRoute({ answers: { to: { choice: "hold", probabilities: { hold: 0.39 }, confidence: 0.09 } } }).to === "hold");
 const fromUsage = estimateNeurons({ usage: { input_tokens: 1000 } }, 99999);
@@ -29,7 +31,7 @@ check("the guard opens below the cap and closes at it", routeAllowed(ROUTE_DAILY
 check("the day is the UTC day", utcDay(Date.UTC(2026, 10, 14, 23, 59)) === "2026-11-14" && utcDay(Date.UTC(2026, 10, 15, 0, 0)) === "2026-11-15");
 const req = routeRequest({ project: "demo", title: "a\n  title\twith   space ".repeat(30), source_ref: "https://example.com/x" });
 check("the title is one short line of data", req.model === "clef-flash" && req.state.title.length === 200 && !/\s{2}|\n/.test(req.state.title) &&
-  req.state.reference === "https://example.com/x" && Object.keys(req.questions.to.criteria).length === 7);
+  req.state.reference === "https://example.com/x" && Object.keys(req.questions.to.criteria).join(",") === "devin,owner,hold");
 
 // --- the dispatcher with stand-ins
 function fakeBoard(items, { neurons = 0, dispatched = 0 } = {}) {

@@ -447,10 +447,14 @@ async function main() {
   r = await ownerPost({ op: "hand", item_id: "pile3", to: "hold" });
   out = await r.json();
   check("the owner hands work over with a destination", r.status === 200 && out.handoff?.to === "hold" && (await handoffOf("pile3"))?.to === "hold", JSON.stringify(out));
+  const ownerHanded = await handoffOf("pile3");
+  check("a request records who asked, who set the destination and the title then", ownerHanded?.requested_by === "page:owner" && ownerHanded?.to_set_by === "page:owner" && ownerHanded?.title === "work for one writer", JSON.stringify(ownerHanded));
   check("taking a request back clears its destination", (await ownerCode({ op: "take_back", item_id: "pile3" })) === "200 OK" && (await handoffOf("pile3")) === null);
   const toMuse = await call(K.alpha, "board_request_handoff", { item_id: "pile3", to: "muse" });
   const museRequest = toMuse.handoff?.request_id ?? "";
   check("a writer hands work to a destination", toMuse.handoff?.to === "muse" && (await handoffOf("pile3"))?.to === "muse", JSON.stringify(toMuse));
+  const writerHanded = await handoffOf("pile3");
+  check("a request handed by a writer names the writer", writerHanded?.requested_by === "alpha" && writerHanded?.to_set_by === "alpha", JSON.stringify(writerHanded));
   check("a request for muse cannot be taken by another writer", code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
   check("the owner routes the request to hold", (await ownerCode({ op: "route", item_id: "pile3", to: "hold" })) === "200 OK" && (await handoffOf("pile3"))?.to === "hold");
   check("nobody takes a request on hold", code(await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN" &&
@@ -460,11 +464,17 @@ async function main() {
   check("a writer must name the destination", code(await call(K.alpha, "board_route_handoff", { item_id: "pile3" })) === -32602);
   const writerRouted = await call(K.muse, "board_route_handoff", { item_id: "pile3", to: "devin" });
   check("a writer routes a request on hold", writerRouted.changed === true && writerRouted.handoff?.to === "devin" && (await handoffOf("pile3"))?.to === "devin", JSON.stringify(writerRouted));
+  const afterWriterRoute = await handoffOf("pile3");
+  check("routing by a writer records who set the destination", afterWriterRoute?.to_set_by === "muse" && afterWriterRoute?.requested_by === "alpha", JSON.stringify(afterWriterRoute));
   check("routing by a writer names the writer", (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === "pile3" && e.actor === "muse" && e.text === `routed ${museRequest} to devin`));
   check("routing to the same destination changes nothing", (await call(K.alpha, "board_route_handoff", { item_id: "pile3", to: "devin" })).changed === false);
   r = await ownerPost({ op: "route", item_id: "pile3", to: "muse" });
   out = await r.json();
   check("the owner routes a request on hold to a writer", r.status === 200 && out.changed === true && out.handoff?.to === "muse" && out.handoff?.request_id === museRequest, JSON.stringify(out));
+  check("routing by the owner records the owner as the one who set the destination", out.handoff?.to_set_by === "page:owner");
+  await call(K.alpha, "board_upsert_item", { item_id: "pile3", title: "work for one writer, renamed" });
+  const renamed = await handoffOf("pile3");
+  check("the request keeps the title it was handed over with", renamed?.title === "work for one writer", JSON.stringify(renamed));
   const page3 = (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items.find((i) => i.item_id === "pile3");
   check("the page data carries the destination", page3?.handoff?.to === "muse");
   const routedEvent = (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === "pile3" && e.text === `routed ${museRequest} to muse`);
