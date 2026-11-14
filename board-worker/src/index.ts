@@ -84,6 +84,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.acceptHandoff(actor, args);
         case "board_route_handoff":
           return this.store.routeForTool(actor, args);
+        case "board_take_back_handoff":
+          return this.store.takeBackForTool(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }

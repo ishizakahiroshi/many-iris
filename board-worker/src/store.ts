@@ -406,6 +406,17 @@ export class Store {
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
   }
 
+  /** Withdraws a request that nobody has taken yet, so the work is back on the pile. Runs inside a transaction. */
+  private withdraw(actor: string, itemId: string, handoff: Record<string, unknown> | null, now: number): void {
+    if (handoff === null || handoff.state !== "requested")
+      throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");
+    this.sql.exec(
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL WHERE item_id=?",
+      itemId,
+    );
+    this.insertEvent(itemId, now, actor, "note", `taken back ${String(handoff.request_id)}`, null);
+  }
+
   /** Changes the destination of an open request; false when it already had that one. Runs inside a transaction. */
   private reroute(actor: string, itemId: string, handoff: Record<string, unknown> | null, to: string | null, now: number): boolean {
     if (handoff === null || handoff.state !== "requested")
@@ -434,6 +445,28 @@ export class Store {
       const handoff = this.loadHandoff(itemId);
       const changed = this.reroute(actor, itemId, handoff, to, Date.now());
       return { ok: true, changed, item, handoff: this.loadHandoff(itemId) };
+    });
+  }
+
+  /**
+   * The `board_take_back_handoff` tool: a writer withdraws a request that
+   * nobody has taken yet — the writer-side form of the page's "take back".
+   * Any writer may do it; the event names who did.
+   */
+  takeBackForTool(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id"]);
+    const itemId = requiredStr(obj, "item_id");
+    const request = optionalStr(obj, "request_id");
+    return this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      const handoff = this.loadHandoff(itemId);
+      // With the request id, only that request is withdrawn (not a newer one on the same item).
+      if (request !== null && handoff !== null && handoff.request_id !== request)
+        throw new BoardError("HANDOFF_CONFLICT", "This request is not the open one: it was taken back or the id is another one");
+      this.withdraw(actor, itemId, handoff, Date.now());
+      return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
     });
   }
 
@@ -494,13 +527,7 @@ export class Store {
         } else if (op === "route") {
           if (!this.reroute(actor, itemId, handoff, to, now)) return { ok: true, changed: false, item, handoff };
         } else {
-          if (handoff === null || handoff.state !== "requested")
-            throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");
-          this.sql.exec(
-            "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL WHERE item_id=?",
-            itemId,
-          );
-          this.insertEvent(itemId, now, actor, "note", `taken back ${String(handoff.request_id)}`, null);
+          this.withdraw(actor, itemId, handoff, now);
         }
         return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
       });

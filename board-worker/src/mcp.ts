@@ -83,6 +83,15 @@ export const TOOLS: Json[] = [
     },
     ["item_id", "to"],
   ),
+  tool(
+    "board_take_back_handoff",
+    "Withdraw handed-over work that nobody has taken yet — the writer-side form of the page's \"取り下げ\". The work goes back on the pile as it was before it was handed over. A request somebody already took cannot be withdrawn. The event records who did it.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("Optional handoff.request_id: withdraw only that request"),
+    },
+    ["item_id"],
+  ),
 ];
 
 const validId = (v: unknown) => typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));
