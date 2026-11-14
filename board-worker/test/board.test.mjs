@@ -160,7 +160,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_accept_handoff",
+  check("five tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -418,8 +418,25 @@ async function main() {
   const accepted = await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request });
   check("a writer accepts the request", accepted.handoff?.state === "accepted" && accepted.handoff?.accepted_by === "alpha" &&
     accepted.item?.state === "in_progress" && accepted.item?.updated_by === "alpha", JSON.stringify(accepted));
-  check("a writer cannot write the hand-off itself", code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff: { state: "requested" } })) === -32602 &&
+  check("a writer cannot write the hand-off fields directly", code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff: { state: "requested" } })) === -32602 &&
     code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff_state: null })) === -32602);
+
+  // --- a writer hands work over without the page (board_request_handoff)
+  await call(K.alpha, "board_upsert_item", { item_id: "pile2", project: "demo", kind: "task", title: "writer-handed work", state: "planned" });
+  check("requesting a hand-off on unknown work is not found", code(await call(K.alpha, "board_request_handoff", { item_id: "nope" })) === "NOT_FOUND");
+  check("only work on the pile can be handed over by a writer", code(await call(K.alpha, "board_request_handoff", { item_id: piled.item_id })) === "FORBIDDEN");
+  const writerHand = await call(K.alpha, "board_request_handoff", { item_id: "pile2" });
+  const writerRequest = writerHand.handoff?.request_id ?? "";
+  check("a writer hands work over", writerHand.handoff?.state === "requested" && new RegExp(`^REQ-${dayOf(0)}-[0-9a-f]{8}$`).test(writerRequest) &&
+    writerHand.handoff?.accepted_by === null, JSON.stringify(writerHand));
+  check("the same work cannot be handed over twice by a writer", code(await call(K.alpha, "board_request_handoff", { item_id: "pile2" })) === "HANDOFF_CONFLICT");
+  check("the owner can still take back a writer's request", (await ownerCode({ op: "take_back", item_id: "pile2" })) === "200 OK" && (await handoffOf("pile2")) === null);
+  const writerHand2 = await call(K.alpha, "board_request_handoff", { item_id: "pile2" });
+  const writerRequest2 = writerHand2.handoff?.request_id ?? "";
+  check("a re-request gets a new id", writerRequest2 !== "" && writerRequest2 !== writerRequest);
+  const writerAccepted = await call(K.alpha, "board_accept_handoff", { item_id: "pile2", request_id: writerRequest2 });
+  check("a writer accepts its own request", writerAccepted.handoff?.state === "accepted" && writerAccepted.item?.state === "in_progress", JSON.stringify(writerAccepted));
+
   check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
   check("the page data carries the hand-off", (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
