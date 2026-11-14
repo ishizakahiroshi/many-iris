@@ -40,7 +40,7 @@ Iris は初回送信前に完全 binding と元 request ID を domain transactio
 
 ## 看板（board）
 
-案件・計画・Issue・PR・作業の一覧と、それぞれの出来事の記録です。実行系とは別の機能で、既存の表と挙動は変えません。同じ SQLite ファイルに `board_items` と `board_events` の2表を足すだけで、`user_version` も変えません（何度起動しても同じ結果です）。
+案件・計画・Issue・PR・作業の一覧と、それぞれの出来事の記録です。実行系とは別の機能で、既存の表と挙動は変えません。作業を AI に「任せる」こと（行き先・振り分け・Devin の起動）は Cloudflare 版の看板（`board-worker/`）だけにあり、この Rust 版にはありません。同じ SQLite ファイルに `board_items` と `board_events` の2表を足すだけで、`user_version` も変えません（何度起動しても同じ結果です）。
 
 起動の引数:
 

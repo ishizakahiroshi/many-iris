@@ -72,6 +72,16 @@ const SCHEMA = [
     request_id TEXT NOT NULL,
     at INTEGER NOT NULL
   )`,
+  // The router's calls per UTC day and the neurons they are counted as, so the
+  // board stops calling before the free allowance runs out (route.ts).
+  // `counted_calls` is how many of them had no token count in the answer and
+  // were counted from the characters sent instead.
+  `CREATE TABLE IF NOT EXISTS route_usage(
+    day TEXT PRIMARY KEY NOT NULL,
+    calls INTEGER NOT NULL,
+    neurons REAL NOT NULL,
+    counted_calls INTEGER NOT NULL
+  )`,
 ];
 
 type Row = Record<string, SqlStorageValue>;
@@ -150,6 +160,39 @@ export class Store {
   recordDispatch(request: string, at: number): Record<string, unknown> {
     this.sql.exec("INSERT INTO dispatch_log(request_id,at) VALUES(?,?)", request, at);
     return { ok: true, changed: true };
+  }
+
+  /** The router's use on one UTC day (`YYYY-MM-DD`). */
+  routeUsage(day: string): Record<string, unknown> {
+    const rows = this.sql.exec("SELECT calls,neurons,counted_calls FROM route_usage WHERE day=?", day).toArray() as Row[];
+    const r = rows[0];
+    return { ok: true, day, calls: r ? num(r.calls) : 0, neurons: r ? num(r.neurons) : 0, counted_calls: r ? num(r.counted_calls) : 0 };
+  }
+
+  /** Adds one router call to the day. `fromUsage` is false when the neurons were counted from the characters sent. */
+  recordRouteUse(day: string, neurons: number, fromUsage: boolean): Record<string, unknown> {
+    this.sql.exec(
+      `INSERT INTO route_usage(day,calls,neurons,counted_calls) VALUES(?,1,?,?)
+       ON CONFLICT(day) DO UPDATE SET calls=calls+1,neurons=neurons+excluded.neurons,counted_calls=counted_calls+excluded.counted_calls`,
+      day, neurons, fromUsage ? 0 : 1,
+    );
+    return this.routeUsage(day);
+  }
+
+  /**
+   * The router's answer for a request without a destination: sets it, unless the
+   * request was taken, taken back or given a destination by the owner meanwhile.
+   */
+  routeHandoff(actor: string, itemId: string, request: string, to: string, text: string): Record<string, unknown> {
+    if (!(HANDOFF_TARGETS as readonly string[]).includes(to)) throw invalid("unknown destination");
+    return this.tx(() => {
+      const handoff = this.loadHandoff(itemId);
+      if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request || handoff.to !== null)
+        return { ok: true, changed: false, handoff };
+      this.sql.exec("UPDATE board_items SET handoff_to=? WHERE item_id=?", to, itemId);
+      this.insertEvent(itemId, Date.now(), actor, "note", text, null);
+      return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
+    });
   }
   /** The hand-off columns of one item, or `null` when the work was not handed to anyone. */
   private handoffOf(r: Row, prefix = ""): Record<string, unknown> | null {

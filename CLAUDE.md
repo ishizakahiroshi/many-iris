@@ -12,7 +12,7 @@ Many Iris は複数人・複数組織の協働を目指す公開 OSS です。Ma
 
 ## スタックとコマンド
 
-本体は Rust（`iris/`。試験は `iris/` で `cargo test`）、看板は Cloudflare Workers の TypeScript（`board-worker/`。試験は `board-worker/` で `node test/board.test.mjs`）です。`prototype/` と `tests/` は旧 Python 試作、`experiments/` は言語比較の記録です。ガイドの構造検査は `node scripts/check-claude-md.mjs` を手動で実行します。
+本体は Rust（`iris/`。試験は `iris/` で `cargo test`）、看板は Cloudflare Workers の TypeScript（`board-worker/`。試験は `board-worker/` で `pnpm test`）です。`prototype/` と `tests/` は旧 Python 試作、`experiments/` は言語比較の記録です。ガイドの構造検査は `node scripts/check-claude-md.mjs` を手動で実行します。
 
 ## AI 作業共通ルール
 

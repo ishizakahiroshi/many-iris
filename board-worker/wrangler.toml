@@ -25,10 +25,17 @@ id = "b055efabcf8249f2ad7ba2ea06cc772c"
 [assets]
 directory = "./public"
 
-# The scheduled dispatcher polls the pile and hands requested work to new
-# Devin sessions (see the scheduled handler in src/index.ts).
+# The scheduled dispatcher polls the pile: work handed over without a
+# destination gets one from Clef-flash, and work for devin goes to new Devin
+# sessions (src/dispatch.ts).
 [triggers]
 crons = ["*/10 * * * *"]
+
+# Workers AI for the router (Clef-flash). Calls stop at 70% of the daily free
+# allowance (src/route.ts); on the Workers Free plan, going over the allowance
+# makes calls fail instead of costing money.
+[ai]
+binding = "AI"
 
 [[durable_objects.bindings]]
 name = "BOARD"

@@ -70,7 +70,7 @@ async function start() {
   // which is the origin the OAuth resource and issuer are configured with.
   child = spawn(process.execPath, [wranglerJs(), "dev", "--local", "--ip", "127.0.0.1", "--port", String(port),
     "--local-upstream", `127.0.0.1:${port}`, "--upstream-protocol", "http",
-    "--persist-to", join(temp, "state"), "--env-file", join(temp, "test.env"), "--show-interactive-dev-session=false"],
+    "--persist-to", join(temp, "state"), "--env-file", join(temp, "test.env"), "--show-interactive-dev-session=false", "--test-scheduled"],
     { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1" } });
   let log = "";
   child.stdout.on("data", (d) => (log += d));
@@ -114,7 +114,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=13\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=14\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -467,20 +467,35 @@ async function main() {
   check("the writer of the destination takes the request", museTook.handoff?.state === "accepted" && museTook.handoff?.accepted_by === "muse", JSON.stringify(museTook));
   check("an accepted request cannot be routed", (await ownerCode({ op: "route", item_id: "pile3", to: "devin" })) === "409 HANDOFF_CONFLICT");
 
+  // --- the cron gives a destination to work handed over without one (Clef, or hold
+  // when the router cannot answer). The test has no Devin key, so nobody is started.
+  await call(K.alpha, "board_upsert_item", { item_id: "pile4", project: "demo", kind: "task", title: "write the release notes", state: "planned" });
+  await call(K.alpha, "board_request_handoff", { item_id: "pile4" });
+  check("the cron can be started in the test", (await fetch(`${base}/__scheduled?cron=*/10+*+*+*+*`)).ok);
+  let routedTo = null;
+  for (let i = 0; i < 60 && routedTo === null; i++) {
+    routedTo = (await handoffOf("pile4"))?.to ?? null;
+    if (routedTo === null) await new Promise((r) => setTimeout(r, 500));
+  }
+  const routedNote = (await call(K.alpha, "board_list", {})).events.find((e) => e.item_id === "pile4" && e.actor === "dispatcher");
+  check("the cron gives the work a destination and says why", routedTo !== null && routedNote?.text?.startsWith(`routed to ${routedTo}`), `${routedTo} / ${routedNote?.text}`);
+  console.log(`(router in this run: ${routedNote?.text ?? "no event"})`);
+  check("the cron leaves work with a destination alone", (await handoffOf("pile3"))?.to === "muse");
+
   check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
   check("the page data carries the hand-off", (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
     .find((i) => i.item_id === piled.item_id)?.handoff?.state === "accepted");
   check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
 
-  // --- the item limit (13 in this run)
+  // --- the item limit (14 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 13 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 14 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 13, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 14, String(list.counts.items));
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
