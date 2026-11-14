@@ -87,3 +87,5 @@ artifacts/
 # === obsidian-link: managed ===
 /docs/obsidian/
 # === /obsidian-link: managed ===
+# 依存のファイル（pnpm install で作られる。リポジトリのどこにできても commit しない）
+node_modules/
