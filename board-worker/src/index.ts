@@ -38,6 +38,10 @@ export interface Env {
   /** Test-only overrides of the item and event limits. */
   BOARD_LIMIT_ITEMS?: string;
   BOARD_LIMIT_EVENTS?: string;
+  /** Devin API key for the scheduled dispatcher (wrangler secret put DEVIN_API_KEY). */
+  DEVIN_API_KEY?: string;
+  /** Override of the sessions endpoint (defaults to https://api.devin.ai/v3/sessions). */
+  DEVIN_SESSIONS_URL?: string;
 }
 
 const MCP_PATH = "/board/mcp";
@@ -83,6 +87,16 @@ export class BoardStore extends DurableObject<Env> {
   /** A write by the signed-in owner from the page (see Store.ownerWrite). */
   async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
     return guarded(() => this.store.ownerWrite(OWNER_ACTOR, args, newBacklogId));
+  }
+  /** The dispatcher's reads and marks (see the scheduled handler). */
+  async pendingHandoffs(): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.pendingHandoffs());
+  }
+  async dispatchAge(request: string): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.dispatchAge(request));
+  }
+  async recordDispatch(request: string, at: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.recordDispatch(request, at));
   }
 }
 
@@ -296,10 +310,79 @@ function providerFor(origin: string): OAuthProvider<Env> {
   return provider;
 }
 
+// The scheduled dispatcher: on each cron tick, every task whose handoff is
+// still "requested" is handed to a new Devin session, which takes it with
+// board_accept_handoff, does the work and writes the result back. A request
+// already dispatched within DISPATCH_DEDUPE_MS is skipped so the gap between
+// spawn and accept cannot fire the same work twice.
+const DISPATCH_DEDUPE_MS = 15 * 60 * 1000;
+const DISPATCH_MAX_PER_TICK = 3;
+const DEVIN_SESSIONS_URL = "https://api.devin.ai/v3/sessions";
+const DISPATCH_ACTOR = "dispatcher";
+
+function dispatchPrompt(item: Record<string, unknown>): string {
+  const ref = typeof item.source_ref === "string" ? item.source_ref : null;
+  return [
+    "many-iris 看板 (https://iris.ishizakahiroshi.com) の task を1件引き受けてください。",
+    `item_id: ${String(item.item_id)} / request_id: ${String(item.request_id)} / 作業: ${String(item.title)}`,
+    ref ? `参照: ${ref}` : null,
+    "",
+    "手順:",
+    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領",
+    "2. タイトルの作業を実行",
+    "3. board_add_event({item_id, kind: 'note', text}) で結果を報告",
+    "4. board_upsert_item({item_id, state: 'done'}) で締める",
+    "受領に失敗したら別の作業には移らず、そのまま終了してください。",
+  ].filter((line): line is string => line !== null).join("\n");
+}
+
+async function spawnDevinSession(env: Env, prompt: string): Promise<{ session_id?: string; url?: string } | null> {
+  const endpoint = env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL;
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${env.DEVIN_API_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { session_id?: string; url?: string };
+    return body;
+  } catch {
+    return null;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = publicOrigin(env.BOARD_PUBLIC_ORIGIN);
     if (origin === null) return failure(503, "CONFIG", "The board's public origin is not set up");
     return providerFor(origin).fetch(request, env, ctx);
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (!env.DEVIN_API_KEY) return;
+    ctx.waitUntil((async () => {
+      const stub = boardStub(env);
+      const pending = await stub.pendingHandoffs();
+      if (pending.ok !== true || !Array.isArray(pending.items)) return;
+      const now = Date.now();
+      for (const raw of pending.items.slice(0, DISPATCH_MAX_PER_TICK)) {
+        const item = raw as Record<string, unknown>;
+        const request = item.request_id;
+        if (typeof request !== "string") continue;
+        const last = await stub.dispatchAge(request);
+        if (last.ok === true && typeof last.at === "number" && now - last.at < DISPATCH_DEDUPE_MS) continue;
+        const session = await spawnDevinSession(env, dispatchPrompt(item));
+        if (session === null) continue;
+        const at = Date.now();
+        await stub.recordDispatch(request, at);
+        await stub.run("board_add_event", DISPATCH_ACTOR, {
+          item_id: item.item_id,
+          kind: "note",
+          text: `dispatched ${request} to devin session ${session.session_id ?? "unknown"}`,
+          ref: session.url ?? null,
+        });
+      }
+    })());
   },
 } satisfies ExportedHandler<Env>;

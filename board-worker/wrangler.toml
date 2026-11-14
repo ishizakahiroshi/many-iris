@@ -25,6 +25,11 @@ id = "b055efabcf8249f2ad7ba2ea06cc772c"
 [assets]
 directory = "./public"
 
+# The scheduled dispatcher polls the pile and hands requested work to new
+# Devin sessions (see the scheduled handler in src/index.ts).
+[triggers]
+crons = ["*/10 * * * *"]
+
 [[durable_objects.bindings]]
 name = "BOARD"
 class_name = "BoardStore"
@@ -38,3 +43,4 @@ new_sqlite_classes = ["BoardStore"]
 #   ACCESS_TEAM_DOMAIN  https://<team>.cloudflareaccess.com
 #   ACCESS_AUD          Application Audience (AUD) tag of the Access application
 #   BOARD_OWNERS        comma-separated emails allowed to read the page
+#   DEVIN_API_KEY       Devin API key the dispatcher spawns sessions with
