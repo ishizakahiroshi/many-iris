@@ -4,9 +4,14 @@
 //      reached, the call fails, or the answer is not confident enough, the work
 //      goes to `hold` and the owner decides (route.ts).
 //   2. Work for `devin` is handed to a new Devin session, which takes it with
-//      board_accept_handoff, does the work and writes the result back. A request
-//      already dispatched within DISPATCH_DEDUPE_MS is skipped so the gap
-//      between spawn and accept cannot fire the same work twice.
+//      board_accept_handoff, does the work and writes the result back. The
+//      start is claimed on the board BEFORE the session is started (one
+//      atomic claim per request, store.ts claimDispatch), so two ticks
+//      racing each other cannot both start it, and a start whose answer is
+//      lost leaves the claim `unknown` — never retried on its own, only
+//      settled by a person (board_resolve_dispatch). A request already
+//      dispatched within DISPATCH_DEDUPE_MS is skipped so the gap between
+//      spawn and accept cannot fire the same work twice.
 // Work for any other destination is left for that writer to pick up.
 // The board, Workers AI and the Devin start come in as `DispatchDeps`, so
 // test/route.test.mjs runs this with stand-ins under Node.
@@ -30,7 +35,9 @@ type Result = Record<string, unknown>;
 export interface BoardCalls {
   pendingHandoffs(): Promise<Result>;
   dispatchState(request: string, since: number): Promise<Result>;
-  recordDispatch(request: string, at: number): Promise<Result>;
+  claimDispatch(request: string, at: number, limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number }): Promise<Result>;
+  confirmDispatch(claimId: number, sessionId: string | null): Promise<Result>;
+  markDispatchUnknown(claimId: number): Promise<Result>;
   run(tool: string, actor: string, args: Record<string, unknown>): Promise<Result>;
   routeUsage(day: string): Promise<Result>;
   recordRouteUse(day: string, neurons: number, fromUsage: boolean): Promise<Result>;
@@ -117,18 +124,43 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     const state = await deps.board.dispatchState(request, now - DAY_MS);
     if (state.ok !== true) continue;
     if (typeof state.total_since === "number" && state.total_since >= DISPATCH_MAX_PER_DAY) return;
+    if (state.blocked === true) continue;
     if (typeof state.count === "number" && state.count >= DISPATCH_MAX_PER_REQUEST) continue;
     if (typeof state.at === "number" && now - state.at < DISPATCH_DEDUPE_MS) continue;
-    const session = await deps.startDevin(dispatchPrompt(item));
-    if (session === null) continue;
-    const at = clock();
+    // Claim first, atomically, and only then start anything: a second tick
+    // racing this one loses the claim, and a crash or a lost answer from
+    // here on leaves the claim behind as the record of the attempt.
+    const claim = await deps.board.claimDispatch(request, clock(), {
+      dedupeMs: DISPATCH_DEDUPE_MS, maxPerRequest: DISPATCH_MAX_PER_REQUEST,
+      daySince: now - DAY_MS, maxPerDay: DISPATCH_MAX_PER_DAY,
+    });
+    if (claim.ok !== true || claim.claimed !== true || typeof claim.claim_id !== "number") continue;
     started += 1;
-    await deps.board.recordDispatch(request, at);
+    let session: { session_id?: string; url?: string } | null = null;
+    try {
+      session = await deps.startDevin(dispatchPrompt(item));
+    } catch {
+      session = null;
+    }
+    if (session === null) {
+      // The start may or may not have happened — its answer never arrived.
+      // Marking the claim unknown is the whole response: no automatic
+      // retry, ever. A person settles it with board_resolve_dispatch.
+      await deps.board.markDispatchUnknown(claim.claim_id);
+      await deps.board.run("board_add_event", DISPATCH_ACTOR, {
+        item_id: item.item_id,
+        kind: "note",
+        text: `dispatch of ${request} to devin is unknown: the start's answer was lost, so it will not be retried automatically. Check the Devin side, then settle it with board_resolve_dispatch`,
+      });
+      continue;
+    }
+    await deps.board.confirmDispatch(claim.claim_id, session.session_id ?? null);
     await deps.board.run("board_add_event", DISPATCH_ACTOR, {
       item_id: item.item_id,
       kind: "note",
       text: `dispatched ${request} to devin session ${session.session_id ?? "unknown"}`,
-      ref: session.url ?? null,
+      // board_add_event takes no null ref; the field is simply left out.
+      ...(typeof session.url === "string" ? { ref: session.url } : {}),
     });
   }
 }

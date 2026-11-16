@@ -12,7 +12,10 @@
 // for one); from `unknown` a person either confirms the old run is stopped
 // and releases the work back to the pile, or confirms it is still working
 // and resumes the same run. Every progress/completion write of a run carries
-// its generation; a generation that is not the current one is refused.
+// its generation; a generation that is not the current one is refused. The
+// plain write tools carry no generation, so `checkGenericWrite` below is
+// the boundary for them: it fences the one writer a stale run can speak
+// for — its own.
 
 /** How long an accepted run may stay silent before its lease is expired. A
  * run keeps its lease by heartbeating; expiry alone changes nothing. */
@@ -43,7 +46,7 @@ export function nextGeneration(current: number | null): number {
 
 export type FenceVerdict =
   | { ok: true }
-  | { ok: false; code: "HANDOFF_CONFLICT" | "STALE_GENERATION" | "FORBIDDEN"; detail: string };
+  | { ok: false; code: "HANDOFF_CONFLICT" | "STALE_GENERATION" | "FORBIDDEN" | "FENCE_REQUIRED"; detail: string };
 
 /**
  * May `actor` write as the run (requestId, generation)? Only the writer that
@@ -69,13 +72,56 @@ export function checkFence(
 
 /** May the handoff be marked `unknown` at `now`? Only an accepted run whose
  * lease has expired: a run that is still heartbeating is not "unknown", it is
- * working, and a requested/completed handoff has nothing to lose track of. */
+ * working, and a requested/completed handoff has nothing to lose track of.
+ * A run with no lease on record at all (accepted before leases existed) can
+ * also be marked: nothing proves it is alive, so its outcome is exactly as
+ * unconfirmed as an expired run's — a person still has to look. */
 export function canMarkUnknown(h: HandoffView, now: number): FenceVerdict {
   if (h.state !== "accepted")
     return { ok: false, code: "HANDOFF_CONFLICT", detail: "Only a run that was taken can be marked unknown" };
+  if (h.lease_until === null) return { ok: true };
   if (!leaseExpired(h, now))
     return { ok: false, code: "HANDOFF_CONFLICT", detail: "The run's lease has not expired: it may still be working, so it is not unknown yet" };
   return { ok: true };
+}
+
+/** A run taken before generations existed: its handoff is `accepted` or
+ * `unknown` but has no generation, so no fence can ever match it. Such a run
+ * keeps writing through the plain tools (there is no token it could send);
+ * it gains a generation when it is resumed from `unknown`, and any work
+ * handed over or accepted now always has one. */
+export function isLegacyRun(h: HandoffView): boolean {
+  return (h.state === "accepted" || h.state === "unknown") && h.generation === null;
+}
+
+/** The fence a plain write (board_upsert_item / board_add_event) carries. */
+export type GenericFence = { request_id: string; generation: number } | null;
+
+/**
+ * May `actor` write to this item through the plain tools, which carry no
+ * fence of their own? The board's keys name writers, not runs, so the only
+ * write a stale run can be fenced out of is one made under its own writer's
+ * name: while a handoff is `accepted`, a plain write by the writer that
+ * took it must carry the run's current fence (request_id + generation), or
+ * use the fenced tools — otherwise a replaced run of the same writer could
+ * keep writing over its successor through the old path. While the handoff
+ * is `unknown`, that writer may not write plainly at all: the run is
+ * quarantined until it is resumed. Every other writer (and the owner's
+ * page, whose actor is not a writer) writes as before: their writes are
+ * their own, under their own name, and the board has never fenced those.
+ * A legacy run (no generation on record) cannot be asked for a fence it
+ * never received, so its plain writes stay allowed until it is resumed or
+ * the work is handed over again and a generation exists.
+ */
+export function checkGenericWrite(h: HandoffView, actor: string, fence: GenericFence): FenceVerdict {
+  if (h.state !== "accepted" && h.state !== "unknown") return { ok: true };
+  if (h.accepted_by === null || actor !== h.accepted_by) return { ok: true };
+  if (h.state === "unknown")
+    return { ok: false, code: "HANDOFF_CONFLICT", detail: "This run is marked unknown: its plain writes are refused until the run is resumed (board_resume_handoff) or the work is released" };
+  if (h.generation === null) return { ok: true };
+  if (fence === null)
+    return { ok: false, code: "FENCE_REQUIRED", detail: `This item is being run as request ${h.request_id} generation ${h.generation}: a plain write by ${actor} must carry that request_id and generation, or use board_progress_handoff / board_complete_handoff. Other writers are not affected` };
+  return checkFence(h, actor, fence.request_id, fence.generation);
 }
 
 /** May the work go back to the pile from `unknown`? Only from `unknown`

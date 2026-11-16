@@ -105,6 +105,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.releaseHandoff(actor, args);
         case "board_resume_handoff":
           return this.store.resumeHandoff(actor, args);
+        case "board_resolve_dispatch":
+          return this.store.resolveDispatch(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
@@ -124,8 +126,17 @@ export class BoardStore extends DurableObject<Env> {
   async dispatchState(request: string, since: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.dispatchState(request, since));
   }
-  async recordDispatch(request: string, at: number): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.recordDispatch(request, at));
+  async claimDispatch(
+    request: string, at: number,
+    limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number },
+  ): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.claimDispatch(request, at, limits));
+  }
+  async confirmDispatch(claimId: number, sessionId: string | null): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.confirmDispatch(claimId, sessionId));
+  }
+  async markDispatchUnknown(claimId: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.markDispatchUnknown(claimId));
   }
   async routeUsage(day: string): Promise<Record<string, unknown>> {
     return guarded(() => this.store.routeUsage(day));
@@ -167,6 +178,7 @@ function ownerWriteStatus(code: unknown): number {
     case "REVISION_CONFLICT":
     case "HANDOFF_CONFLICT":
     case "STALE_GENERATION":
+    case "FENCE_REQUIRED":
     case "BOARD_ITEM_LIMIT":
     case "BOARD_EVENT_LIMIT":
       return 409;

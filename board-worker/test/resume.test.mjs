@@ -6,7 +6,7 @@
 //   node test/resume.test.mjs
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown,
-  checkFence, leaseExpired, nextGeneration,
+  checkFence, checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration,
 } from "../src/resume.ts";
 
 let passed = 0;
@@ -53,6 +53,35 @@ check("accepted work cannot be released through the unknown path", canReleaseUnk
 check("requested work cannot be released through the unknown path", canReleaseUnknown(run({ state: "requested" })).code === "HANDOFF_CONFLICT");
 check("unknown work can be resumed as the same run", canResumeUnknown(run({ state: "unknown" })).ok === true);
 check("accepted work needs no resume", canResumeUnknown(run()).code === "HANDOFF_CONFLICT");
+
+// --- the plain tools' boundary: only the run writer's own writes are fenced
+check("another writer's plain write is not fenced", checkGenericWrite(run(), "alpha", null).ok === true);
+check("the owner page's actor is not fenced", checkGenericWrite(run(), "page:owner", null).ok === true);
+check("the run writer's plain write needs its fence", (() => { const v = checkGenericWrite(run(), "muse", null); return !v.ok && v.code === "FENCE_REQUIRED"; })());
+check("the run writer's plain write with the current fence passes",
+  checkGenericWrite(run(), "muse", { request_id: "REQ-20261116-aaaaaaaa", generation: 3 }).ok === true);
+check("the run writer's plain write with an old generation is stale",
+  checkGenericWrite(run(), "muse", { request_id: "REQ-20261116-aaaaaaaa", generation: 2 }).code === "STALE_GENERATION");
+check("the run writer's plain write under another request is a conflict",
+  checkGenericWrite(run(), "muse", { request_id: "REQ-20261116-bbbbbbbb", generation: 3 }).code === "HANDOFF_CONFLICT");
+check("a requested item fences nobody's plain writes",
+  checkGenericWrite(run({ state: "requested", accepted_by: null, lease_until: null }), "muse", null).ok === true);
+check("a completed item fences nobody's plain writes", checkGenericWrite(run({ state: "completed" }), "muse", null).ok === true);
+check("an unknown run's plain writes are refused until it is resumed",
+  checkGenericWrite(run({ state: "unknown" }), "muse", { request_id: "REQ-20261116-aaaaaaaa", generation: 3 }).code === "HANDOFF_CONFLICT");
+check("another writer still writes plainly on unknown work", checkGenericWrite(run({ state: "unknown" }), "alpha", null).ok === true);
+
+// --- runs taken before generations and leases existed (migration)
+check("a run with no generation is a legacy run", isLegacyRun(run({ generation: null, lease_until: null })) === true);
+check("an unknown run with no generation is a legacy run", isLegacyRun(run({ state: "unknown", generation: null })) === true);
+check("a run with a generation is not legacy", isLegacyRun(run()) === false);
+check("work never taken is not a legacy run", isLegacyRun(run({ state: "requested", accepted_by: null, generation: null, lease_until: null })) === false);
+check("a legacy run can be marked unknown: no lease was ever recorded", canMarkUnknown(run({ generation: null, lease_until: null }), NOW).ok === true);
+check("an accepted run with no lease on record can be marked unknown", canMarkUnknown(run({ lease_until: null }), NOW).ok === true);
+check("a legacy run has no generation a fence could match",
+  checkFence(run({ generation: null, lease_until: null }), "muse", "REQ-20261116-aaaaaaaa", 1).code === "STALE_GENERATION");
+check("a legacy run's plain writes stay allowed: it has no fence to send",
+  checkGenericWrite(run({ generation: null, lease_until: null }), "muse", null).ok === true);
 
 console.log(`passed ${passed}, failed ${failures.length}`);
 for (const f of failures) console.log(`FAIL ${f}`);

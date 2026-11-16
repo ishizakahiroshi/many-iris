@@ -9,7 +9,7 @@ import {
 } from "./rules";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
-  leaseExpired, nextGeneration, type HandoffView,
+  checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
 } from "./resume";
 
 export interface Limits {
@@ -150,6 +150,22 @@ export class Store {
     this.addColumn("handoff_generation", "INTEGER");
     this.addColumn("handoff_heartbeat_at", "INTEGER");
     this.addColumn("handoff_lease_until", "INTEGER");
+    // The dispatcher's claim on a start (dispatch.ts): a row is written
+    // BEFORE the session is started, with its outcome as the status —
+    // claimed, started, unknown (the start's answer was lost; never retried
+    // on its own) or resolved (a person cleared an unknown claim). Rows
+    // written before claims existed have no status and count as started:
+    // recording used to happen after the start, so that is what they were.
+    this.addDispatchColumn("status", "TEXT");
+    this.addDispatchColumn("session_id", "TEXT");
+  }
+  /** Adds a column to `dispatch_log` when an older board does not have it yet. */
+  private addDispatchColumn(name: string, type: "INTEGER" | "TEXT"): void {
+    try {
+      this.sql.exec(`SELECT ${name} FROM dispatch_log LIMIT 0`);
+    } catch {
+      this.sql.exec(`ALTER TABLE dispatch_log ADD COLUMN ${name} ${type}`);
+    }
   }
   /** Adds a column to `board_items` when an older board does not have it yet. */
   private addColumn(name: string, type: "INTEGER" | "TEXT"): void {
@@ -172,17 +188,119 @@ export class Store {
     return { ok: true, items };
   }
 
-  /** What the dispatcher already did for a request: when it last started a session, how many times, and how many starts happened since `since` in total. */
-  dispatchState(request: string, since: number): Record<string, unknown> {
-    const mine = this.sql.exec("SELECT MAX(at) AS at, COUNT(*) AS n FROM dispatch_log WHERE request_id=?", request).toArray() as Row[];
-    const all = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", since).toArray() as Row[];
-    return { ok: true, at: mine[0]?.at == null ? null : num(mine[0].at), count: num(mine[0]?.n ?? 0), total_since: num(all[0]?.n ?? 0) };
+  /** One dispatch_log row, with the pre-claim rows (status NULL) read as started. */
+  private dispatchRows(request: string): { at: number; status: string }[] {
+    return (this.sql.exec("SELECT at,status FROM dispatch_log WHERE request_id=?", request).toArray() as Row[])
+      .map((r) => ({ at: num(r.at), status: r.status === null ? "started" : str(r.status) }));
   }
 
-  /** Record that a session was started for a request at `at`. */
-  recordDispatch(request: string, at: number): Record<string, unknown> {
-    this.sql.exec("INSERT INTO dispatch_log(request_id,at) VALUES(?,?)", request, at);
-    return { ok: true, changed: true };
+  /** What the dispatcher already did for a request: when a session was last
+   * confirmed started, how many attempts were made, how many rows were
+   * written since `since` in total, and whether a claim is in flight or an
+   * outcome is unknown (either one blocks any new start). */
+  dispatchState(request: string, since: number): Record<string, unknown> {
+    const rows = this.dispatchRows(request);
+    const started = rows.filter((r) => r.status === "started");
+    const all = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", since).toArray() as Row[];
+    return {
+      ok: true,
+      at: started.length ? Math.max(...started.map((r) => r.at)) : null,
+      count: rows.length,
+      total_since: num(all[0]?.n ?? 0),
+      blocked: rows.some((r) => r.status === "claimed" || r.status === "unknown"),
+    };
+  }
+
+  /**
+   * Claims a request for one start, atomically: the check and the insert run
+   * in one transaction inside the Durable Object, so two dispatcher ticks
+   * racing each other cannot both claim the same request. The claim is
+   * written BEFORE anything is started; what happens next is recorded on
+   * the same row (confirmDispatch / markDispatchUnknown). A request with a
+   * claim in flight or an unknown outcome is never claimed again on its
+   * own — an unknown outcome waits for a person (resolveDispatch).
+   */
+  claimDispatch(
+    request: string, at: number,
+    limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number },
+  ): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.dispatchRows(request);
+      if (rows.some((r) => r.status === "claimed" || r.status === "unknown"))
+        return { ok: true, claimed: false, reason: "blocked" };
+      if (rows.length >= limits.maxPerRequest) return { ok: true, claimed: false, reason: "per_request_cap" };
+      const started = rows.filter((r) => r.status === "started");
+      if (started.length && at - Math.max(...started.map((r) => r.at)) < limits.dedupeMs)
+        return { ok: true, claimed: false, reason: "dedupe" };
+      const day = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", limits.daySince).toArray() as Row[];
+      if (num(day[0]?.n ?? 0) >= limits.maxPerDay) return { ok: true, claimed: false, reason: "day_cap" };
+      const row = this.sql.exec(
+        "INSERT INTO dispatch_log(request_id,at,status) VALUES(?,?,?) RETURNING seq", request, at, "claimed",
+      ).one() as Row;
+      return { ok: true, claimed: true, claim_id: num(row.seq) };
+    });
+  }
+
+  /** Records the claim's session: the start answered, with its session id. */
+  confirmDispatch(claimId: number, sessionId: string | null): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='started',session_id=? WHERE seq=?", sessionId, claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /** Records that the start's outcome is unknown (the call failed or its
+   * answer was lost after the claim). Nothing retries this on its own; the
+   * claim blocks the dispatcher until a person resolves it. */
+  markDispatchUnknown(claimId: number): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='unknown' WHERE seq=?", claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /**
+   * The `board_resolve_dispatch` tool: a person settles a dispatch whose
+   * outcome was unknown, after looking at the Devin side themselves.
+   * `retry` states that no session is running for the request, so the
+   * dispatcher may claim it again (the settled attempt still counts toward
+   * the per-request cap). `started` states that a session IS running, with
+   * its id: it will take the work itself with board_accept_handoff, and the
+   * dispatcher leaves the request alone. Only an `unknown` row can be
+   * resolved; anything else means there is nothing waiting for a person.
+   */
+  resolveDispatch(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["request_id", "resolution", "session_id"]);
+    const request = requiredStr(obj, "request_id");
+    const resolution = requiredStr(obj, "resolution");
+    if (resolution !== "retry" && resolution !== "started") throw invalid("resolution must be retry or started");
+    const sessionId = optionalStr(obj, "session_id");
+    if (resolution === "started" && (sessionId === null || !validLine(sessionId, 200, false)))
+      throw invalid("session_id is required when the resolution is started");
+    if (resolution === "retry" && sessionId !== null) throw invalid("session_id is only for the started resolution");
+    return this.tx(() => {
+      const rows = this.sql.exec(
+        "SELECT seq FROM dispatch_log WHERE request_id=? AND status='unknown' ORDER BY seq DESC", request,
+      ).toArray() as Row[];
+      if (!rows.length)
+        throw new BoardError("HANDOFF_CONFLICT", "No dispatch of this request is waiting for a person: its outcome is not unknown");
+      const seq = num(rows[0].seq);
+      if (resolution === "retry") this.sql.exec("UPDATE dispatch_log SET status='resolved' WHERE seq=?", seq);
+      else this.sql.exec("UPDATE dispatch_log SET status='started',session_id=? WHERE seq=?", sessionId, seq);
+      const items = this.sql.exec("SELECT item_id FROM board_items WHERE handoff_request=?", request).toArray() as Row[];
+      if (items.length) {
+        this.insertEvent(str(items[0].item_id), Date.now(), actor, "note",
+          resolution === "retry"
+            ? `dispatch of ${request} settled by ${actor}: no session is running, so the dispatcher may start one again`
+            : `dispatch of ${request} settled by ${actor}: session ${sessionId} is running and will take the work itself`, null);
+      }
+      return { ok: true, changed: true, request_id: request, resolution };
+    });
   }
 
   /** The router's use on one UTC day (`YYYY-MM-DD`). */
@@ -245,6 +363,7 @@ export class Store {
       heartbeat_at: heartbeatAt === null ? null : num(heartbeatAt),
       lease_until: view.lease_until,
       lease_expired: leaseExpired(view, Date.now()),
+      legacy_run: isLegacyRun(view),
     };
   }
   private loadHandoff(id: string): Record<string, unknown> | null {
@@ -292,13 +411,39 @@ export class Store {
     return this.storage.transactionSync(fn);
   }
 
-  /** Creates or updates one item. `actor` comes from the writer's key. */
-  upsertItem(actor: string, input: unknown): Record<string, unknown> {
+  /** The optional fence a plain write carries (see checkGenericWrite). The
+   * two fields come together or not at all. */
+  private parseFence(obj: Record<string, unknown>): GenericFence {
+    if (!has(obj, "request_id") && !has(obj, "generation")) return null;
+    if (!has(obj, "request_id") || !has(obj, "generation"))
+      throw invalid("request_id and generation must be sent together (the fence of the run writing this)");
+    const request = requiredStr(obj, "request_id");
+    if (!nonNegativeInteger(obj.generation) || (obj.generation as number) < 1)
+      throw invalid("generation must be the positive integer the accept returned (handoff.generation)");
+    return { request_id: request, generation: obj.generation as number };
+  }
+  /** Refuses a plain write that a stale run could hide behind (resume.ts
+   * checkGenericWrite decides; only the run writer's own plain writes to an
+   * item it is running are fenced). Runs inside the write's transaction. */
+  private guardGenericWrite(actor: string, itemId: string, fence: GenericFence): void {
+    const view = this.handoffView(itemId);
+    if (view === null) return;
+    const verdict = checkGenericWrite(view, actor, fence);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+  }
+
+  /** Creates or updates one item. `actor` comes from the writer's key.
+   * `internal` marks the store's own follow-up writes (the accept flipping
+   * the item to in progress), which are part of a fenced operation already
+   * and must not be fenced a second time. */
+  upsertItem(actor: string, input: unknown, internal = false): Record<string, unknown> {
     const obj = asObject(input);
     onlyKeys(obj, [
       "item_id", "project", "kind", "title", "source_ref", "parent_id", "state",
       "waiting_reason", "planned_start", "planned_end", "expected_revision",
+      "request_id", "generation",
     ]);
+    const fence = this.parseFence(obj);
     const itemId = requiredStr(obj, "item_id");
     if (!validItemId(itemId)) throw invalid("item_id must match ^[A-Za-z0-9._:/-]{1,128}$");
     const project = optionalStr(obj, "project");
@@ -318,6 +463,7 @@ export class Store {
     const now = Date.now();
     return this.tx(() => {
       const existing = this.loadItem(itemId);
+      if (!internal && existing !== null) this.guardGenericWrite(actor, itemId, fence);
       const current = existing ? existing.revision : 0;
       if (expected !== null && expected !== current)
         throw new BoardError("REVISION_CONFLICT", `expected_revision ${expected} does not match the current revision ${current}`);
@@ -383,7 +529,8 @@ export class Store {
   /** Appends one event to an existing item. `actor` comes from the writer's key. */
   addEvent(actor: string, input: unknown): Record<string, unknown> {
     const obj = asObject(input);
-    onlyKeys(obj, ["item_id", "kind", "text", "ref"]);
+    onlyKeys(obj, ["item_id", "kind", "text", "ref", "request_id", "generation"]);
+    const fence = this.parseFence(obj);
     const itemId = requiredStr(obj, "item_id");
     const kind = requiredStr(obj, "kind");
     const text = requiredStr(obj, "text");
@@ -394,6 +541,7 @@ export class Store {
     if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
     return this.tx(() => {
       if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+      this.guardGenericWrite(actor, itemId, fence);
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
       return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference } };
@@ -420,6 +568,16 @@ export class Store {
       // the same handoff back, not a conflict and never a second run.
       if (handoff !== null && handoff.state === "accepted" && handoff.request_id === request && handoff.accepted_by === actor) {
         again = true;
+        // A run taken before generations existed has none on record: give
+        // it one now, and a lease, so from here on it is fenced and timed
+        // like any other run. The retrying writer learns both from this
+        // very answer, so nothing is stranded by the upgrade.
+        if (handoff.generation === null) {
+          this.sql.exec(
+            "UPDATE board_items SET handoff_generation=?,handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?",
+            nextGeneration(this.loadGeneration(itemId)), now, now + this.leaseMs, itemId,
+          );
+        }
         return;
       }
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request)
@@ -430,16 +588,19 @@ export class Store {
         throw new BoardError("FORBIDDEN", UNTAKEN_TARGETS.has(to)
           ? `This request is on ${to}: nobody takes it until the owner routes it to someone`
           : `This request is for ${to}, not for ${actor}`);
+      // COALESCE: a request made before generations existed has none yet;
+      // the accept is where its run begins, so it gets the first one here.
       this.sql.exec(
-        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=?,handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?",
-        actor, now, now, now + this.leaseMs, itemId,
+        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=?,handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?) WHERE item_id=?",
+        actor, now, now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)), itemId,
       );
       this.insertEvent(itemId, now, actor, "note", `accepted ${request}`, null);
     });
     if (again) return { ok: true, changed: false, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
-    // The request is this writer's now; the state follows as an ordinary write.
+    // The request is this writer's now; the state follows as an internal
+    // write (the accept itself is the fenced operation; see upsertItem).
     const item = this.loadItem(itemId);
-    const written = item !== null && item.state === "planned" ? this.upsertItem(actor, { item_id: itemId, state: "in_progress" }) : { item };
+    const written = item !== null && item.state === "planned" ? this.upsertItem(actor, { item_id: itemId, state: "in_progress" }, true) : { item };
     return { ok: true, changed: true, item: written.item, handoff: this.loadHandoff(itemId) };
   }
 
@@ -583,9 +744,13 @@ export class Store {
     if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
     if (!byOwner && view.accepted_by !== actor)
       throw new BoardError("FORBIDDEN", `This run was taken by ${view.accepted_by ?? "another writer"}: only that writer, or the owner from the page, can resume it`);
+    // A run taken before generations existed has none: resuming is where it
+    // rejoins the fenced world, so it gets the next generation here and the
+    // caller learns it from the answer. Its plain writes were the only ones
+    // it could make until now; from here on it is fenced like any run.
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='accepted',handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?",
-      now, now + this.leaseMs, itemId,
+      "UPDATE board_items SET handoff_state='accepted',handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?) WHERE item_id=?",
+      now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)), itemId,
     );
     this.insertEvent(itemId, now, actor, "note", `resumed ${request}: the same run was confirmed still working`, null);
   }

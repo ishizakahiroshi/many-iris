@@ -34,13 +34,59 @@ check("the title is one short line of data", req.model === "clef-flash" && req.s
   req.state.reference === "https://example.com/x" && Object.keys(req.questions.to.criteria).join(",") === "devin,owner,hold");
 
 // --- the dispatcher with stand-ins
+// The fake's dispatch rows follow the real store's claim rules (store.ts
+// claimDispatch): a claim is written before the start, an unknown outcome
+// blocks the request until a person resolves it, and a confirmed start
+// dedupes. claimDispatch's body runs without awaiting, like the real one's
+// single transaction, so two ticks racing in these tests interleave the
+// same way they would against the Durable Object.
 function fakeBoard(items, { neurons = 0, dispatched = 0 } = {}) {
-  const log = { routed: [], usage: [], dispatched: [], events: [] };
+  const log = { routed: [], usage: [], dispatched: [], events: [], claims: [] };
   let used = neurons;
+  const rows = [];
+  for (let i = 0; i < dispatched; i++) rows.push({ request: "REQ-seed", at: Date.now(), status: "started", id: rows.length + 1 });
+  const stateOf = (request, since) => {
+    const mine = rows.filter((r) => r.request === request);
+    const startedRows = mine.filter((r) => r.status === "started");
+    return {
+      ok: true,
+      at: startedRows.length ? Math.max(...startedRows.map((r) => r.at)) : null,
+      count: mine.length,
+      total_since: rows.filter((r) => r.at >= since).length,
+      blocked: mine.some((r) => r.status === "claimed" || r.status === "unknown"),
+    };
+  };
   const board = {
     async pendingHandoffs() { return { ok: true, items: items.map((i) => ({ ...i })) }; },
-    async dispatchState() { return { ok: true, at: null, count: 0, total_since: dispatched + log.dispatched.length }; },
-    async recordDispatch(request) { log.dispatched.push(request); return { ok: true }; },
+    async dispatchState(request, since) { return stateOf(request, since); },
+    async claimDispatch(request, at, lim) {
+      const mine = rows.filter((r) => r.request === request);
+      if (mine.some((r) => r.status === "claimed" || r.status === "unknown")) return { ok: true, claimed: false, reason: "blocked" };
+      if (mine.length >= lim.maxPerRequest) return { ok: true, claimed: false, reason: "per_request_cap" };
+      const startedRows = mine.filter((r) => r.status === "started");
+      if (startedRows.length && at - Math.max(...startedRows.map((r) => r.at)) < lim.dedupeMs) return { ok: true, claimed: false, reason: "dedupe" };
+      if (rows.filter((r) => r.at >= lim.daySince).length >= lim.maxPerDay) return { ok: true, claimed: false, reason: "day_cap" };
+      const row = { request, at, status: "claimed", id: rows.length + 1 };
+      rows.push(row);
+      log.claims.push(request);
+      return { ok: true, claimed: true, claim_id: row.id };
+    },
+    async confirmDispatch(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "started"; log.dispatched.push(row.request); return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async markDispatchUnknown(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "unknown"; return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async resolveDispatch(request, resolution) {
+      const row = rows.find((r) => r.request === request && r.status === "unknown");
+      if (!row) return { ok: false };
+      row.status = resolution === "retry" ? "resolved" : "started";
+      return { ok: true, changed: true };
+    },
     async run(tool, actor, args) { log.events.push(args.text); return { ok: true }; },
     async routeUsage(day) { return { ok: true, day, neurons: used }; },
     async recordRouteUse(day, n, fromUsage) { used += n; log.usage.push({ day, n, fromUsage }); return { ok: true }; },
@@ -109,6 +155,44 @@ const startDevin = async () => { devinStarts++; return { session_id: `s${devinSt
   devinStarts = 0;
   await runDispatcher({ board, ai: ai({ answers: { to: { choice: "devin", probabilities: { devin: 0.9 }, confidence: 0.3 } } }), startDevin: null });
   check("without a Devin key the work is still routed", log.routed[0]?.to === "devin" && devinStarts === 0);
+}
+
+// --- the claim before the start: races, lost answers, a person's settlement
+{
+  const { board, log } = fakeBoard([item("race", "devin")]);
+  let starts = 0;
+  const slowStart = async () => { starts++; await new Promise((r) => setTimeout(r, 50)); return { session_id: `sr${starts}` }; };
+  await Promise.all([
+    runDispatcher({ board, ai: null, startDevin: slowStart }),
+    runDispatcher({ board, ai: null, startDevin: slowStart }),
+  ]);
+  check("two ticks racing claim once and start Devin once", starts === 1 && log.claims.length === 1 && log.dispatched.length === 1, JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("lost", "devin")]);
+  let starts = 0;
+  const lostStart = async () => { starts++; throw new Error("the answer was lost"); };
+  await runDispatcher({ board, ai: null, startDevin: lostStart });
+  check("a lost start was claimed once and tried once", starts === 1 && log.claims.length === 1 && log.dispatched.length === 0, JSON.stringify(log));
+  check("the lost start is left unknown and blocks the dispatcher", (await board.dispatchState("REQ-lost", 0)).blocked === true);
+  check("the board was told the outcome is unknown", log.events.some((t) => t.includes("REQ-lost") && t.includes("unknown")), JSON.stringify(log.events));
+  await runDispatcher({ board, ai: null, startDevin: lostStart });
+  check("an unknown start is never retried on its own", starts === 1, `starts=${starts}`);
+  const settled = await board.resolveDispatch("REQ-lost", "retry");
+  check("a person settles the unknown start as not running", settled.ok === true && (await board.dispatchState("REQ-lost", 0)).blocked === false);
+  let okStarts = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { okStarts++; return { session_id: "s-ok" }; } });
+  check("after the settlement the dispatcher may start it again", okStarts === 1 && log.dispatched[0] === "REQ-lost", JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("found", "devin")]);
+  let starts = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { starts++; return null; } });
+  check("a start that answers nothing is unknown too, not a silent retry", starts === 1 && (await board.dispatchState("REQ-found", 0)).blocked === true);
+  const settled = await board.resolveDispatch("REQ-found", "started");
+  let more = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { more++; return { session_id: "s-more" }; } });
+  check("settled as started, the session is left to take the work itself", settled.ok === true && more === 0 && log.dispatched.length === 0, JSON.stringify(log));
 }
 
 console.log(`passed ${passed}, failed ${failures.length}`);
