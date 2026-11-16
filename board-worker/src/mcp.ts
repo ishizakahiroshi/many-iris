@@ -92,6 +92,70 @@ export const TOOLS: Json[] = [
     },
     ["item_id"],
   ),
+  tool(
+    "board_heartbeat_handoff",
+    "Say the run that took a request is still working, and extend its lease (handoff.lease_until). Send the item's handoff.request_id and the handoff.generation the accept returned. A stale generation is refused (STALE_GENERATION): a replaced run must stop. Writes no event.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+    },
+    ["item_id", "request_id", "generation"],
+  ),
+  tool(
+    "board_progress_handoff",
+    "Append an event as the current run (progress or a result), fenced by request_id and generation: a late write from an old run is refused instead of landing on work somebody else took over. Also extends the lease, like a heartbeat.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+      kind: { type: "string", enum: WRITER_EVENT_KINDS },
+      text: text("1 to 2000 characters"),
+      ref: text("Optional https URL"),
+    },
+    ["item_id", "request_id", "generation", "kind", "text"],
+  ),
+  tool(
+    "board_complete_handoff",
+    "Finish the work as the current run, fenced by request_id and generation. outcome done closes the item as done; outcome stopped closes it as stopped. The handoff stays on the item as completed, for the record.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+      outcome: { type: "string", enum: ["done", "stopped"], description: "done or stopped" },
+      text: text("Optional result note (1 to 2000 characters)"),
+    },
+    ["item_id", "request_id", "generation", "outcome"],
+  ),
+  tool(
+    "board_mark_handoff_unknown",
+    "Record that a taken run's outcome is unknown: only for a run whose lease (handoff.lease_until) has expired without a report. Nothing restarts or re-queues the work; it waits in handoff.state unknown until a person releases it (board_release_handoff with stopped_confirmed) or resumes the same run (board_resume_handoff).",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+    },
+    ["item_id", "request_id"],
+  ),
+  tool(
+    "board_release_handoff",
+    "Put work back on the pile. Two safe ways: the run itself gives it back (send its request_id and generation), or work marked unknown is released with stopped_confirmed true — a person has confirmed the old run has stopped and its outcome was checked. An unconfirmed run is never re-queued by this tool.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation (required when the run itself gives the work back)" },
+      stopped_confirmed: { type: "boolean", description: "Required true when releasing work marked unknown" },
+    },
+    ["item_id", "request_id"],
+  ),
+  tool(
+    "board_resume_handoff",
+    "Resume a run that was marked unknown, as the same run (same request and generation), after it was confirmed still working. Only the writer that took the request can call this; the owner can do the same from the board page.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+    },
+    ["item_id", "request_id"],
+  )
 ];
 
 const validId = (v: unknown) => typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));

@@ -54,10 +54,10 @@ export function dispatchPrompt(item: Record<string, unknown>): string {
     ref ? `参照: ${JSON.stringify(plainLine(ref))}` : null,
     "",
     "手順:",
-    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領",
-    "2. タイトルの作業を実行",
-    "3. board_add_event({item_id, kind: 'note', text}) で結果を報告",
-    "4. board_upsert_item({item_id, state: 'done'}) で締める",
+    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領し、返ってきた handoff.generation を控える",
+    "2. タイトルの作業を実行する。長くかかるときは board_heartbeat_handoff({item_id, request_id, generation}) で連絡を続け、進み具合は board_progress_handoff({item_id, request_id, generation, kind: 'note', text}) で報告する",
+    "3. board_complete_handoff({item_id, request_id, generation, outcome: 'done', text}) で結果を報告して締める（終われなければ outcome: 'stopped'）",
+    "STALE_GENERATION や HANDOFF_CONFLICT が返ったら、あなたの実行は差し替えられたか状態が変わっています。それ以上書かず、そのまま終了してください。",
     "受領に失敗したら別の作業には移らず、そのまま終了してください。",
   ].filter((line): line is string => line !== null).join("\n");
 }

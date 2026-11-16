@@ -21,6 +21,7 @@ import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
 import { validActor } from "./rules";
 import { DEFAULT_LIMITS, Store, guarded, type Limits } from "./store";
+import { HANDOFF_LEASE_MS } from "./resume";
 
 export interface Env {
   BOARD: DurableObjectNamespace<BoardStore>;
@@ -39,6 +40,8 @@ export interface Env {
   /** Test-only overrides of the item and event limits. */
   BOARD_LIMIT_ITEMS?: string;
   BOARD_LIMIT_EVENTS?: string;
+  /** Test-only override of the handoff lease, in milliseconds. */
+  BOARD_LEASE_MS?: string;
   /** Devin API key for the scheduled dispatcher (wrangler secret put DEVIN_API_KEY). */
   DEVIN_API_KEY?: string;
   /** Override of the sessions endpoint (defaults to https://api.devin.ai/v1/sessions).
@@ -59,7 +62,11 @@ function limitsFrom(env: Env): Limits {
     const n = Number(raw);
     return raw !== undefined && Number.isSafeInteger(n) && n > 0 ? n : fallback;
   };
-  return { items: pick(env.BOARD_LIMIT_ITEMS, DEFAULT_LIMITS.items), events: pick(env.BOARD_LIMIT_EVENTS, DEFAULT_LIMITS.events) };
+  return {
+    items: pick(env.BOARD_LIMIT_ITEMS, DEFAULT_LIMITS.items),
+    events: pick(env.BOARD_LIMIT_EVENTS, DEFAULT_LIMITS.events),
+    leaseMs: pick(env.BOARD_LEASE_MS, HANDOFF_LEASE_MS),
+  };
 }
 
 export class BoardStore extends DurableObject<Env> {
@@ -86,6 +93,18 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.routeForTool(actor, args);
         case "board_take_back_handoff":
           return this.store.takeBackForTool(actor, args);
+        case "board_heartbeat_handoff":
+          return this.store.heartbeatHandoff(actor, args);
+        case "board_progress_handoff":
+          return this.store.progressHandoff(actor, args);
+        case "board_complete_handoff":
+          return this.store.completeHandoff(actor, args);
+        case "board_mark_handoff_unknown":
+          return this.store.markUnknownForTool(actor, args);
+        case "board_release_handoff":
+          return this.store.releaseHandoff(actor, args);
+        case "board_resume_handoff":
+          return this.store.resumeHandoff(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
@@ -147,6 +166,7 @@ function ownerWriteStatus(code: unknown): number {
       return 403;
     case "REVISION_CONFLICT":
     case "HANDOFF_CONFLICT":
+    case "STALE_GENERATION":
     case "BOARD_ITEM_LIMIT":
     case "BOARD_EVENT_LIMIT":
       return 409;
