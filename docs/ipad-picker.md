@@ -1,0 +1,191 @@
+# 拾う側（picker）の設計と調査記録
+
+iPad から任せた仕事を、担当者側が自分で拾って実行し、結果を看板へ
+返す「拾う側」の設計と実装（`picker/`）の記録です。前段は
+`docs/ipad-cloud-resume.md`（PR #4）です。
+
+## この PR の位置づけ（依存関係）
+
+- この変更は **PR #4（ブランチ `muse/ipad-cloud-resume`）の上に積んだ
+  stacked PR** です。picker は PR #4 が看板に入れた fenced ツール
+  （`board_heartbeat_handoff` / `board_progress_handoff` /
+  `board_complete_handoff` と世代 fencing）に依存します。
+- **PR #4 はまだ独立レビュー中で、main には入っていません。PR #4 の
+  内容は採用済みではありません。** PR #4 が統合されなければ、この
+  picker も main へは入れられませんし、実看板でも動きません
+  （世代が返らない看板では picker は実行せずに止まります）。
+- 本番配備はしていません。配備と PR #4 の統合判断は持ち主の操作です。
+
+## 実装前調査
+
+### many-ai-cli の既存の拾い手（アクセスできた）
+
+`ishizakahiroshi/many-ai-cli` は公開リポジトリで、GitHub 連携の検索と
+実読で中身を確認しました。看板に関わる既存実装は 3 つあります。
+
+1. **`rust/src/application/board_sync.rs`（書き手）**: `board.json` が
+   あるときだけ、Hub のセッションの進捗を MCP 看板（Many Iris）へ
+   書く。任された仕事の一覧（`handed_work`）も持ち、人がセッションを
+   始めたときに `board_accept_handoff` でその項目に結び付ける。
+   自動では始めない。
+2. **`board_sync/taker.rs`（local_taker、自動の拾い手）**: Hub が
+   起っている間だけ、`interval_secs`（既定 300 秒）ごとに看板を見て、
+   `local-claude` 宛てで、持ち主が画面から任せ（`requested_by` =
+   `page:owner`）、行き先も持ち主が決め（`to_set_by` = `page:owner`）、
+   任せた時点の題名を持つ依頼を 1 回に 1 件だけ拾い、手元で
+   `claude -p` を実行する。題名は標準入力で「データ」として渡し、
+   permission mode は許可リスト制、1 日の上限とタイムアウトがある。
+   結果は看板へ出来事と状態で返す。
+   - 制限: Hub（手元 PC）の常時稼働が前提。行き先は `local-claude`
+     専用。報告は汎用書込み（`board_add_event` / `board_upsert_item`）
+     で、ハートビートや世代は使わない（PR #4 以前の看板の前提）。
+3. **`rust/src/hub/iris_execution*.rs`（実行の受入管理）**: Iris 側からの
+   実行を、承認済み grant・durable journal・検証で受け入れるための
+   opt-in な契約（MCP エンドポイント）。看板を polling する拾い手では
+   なく、本番の起動 backend は意図的に未接続（合成 backend のみ）。
+
+なお、GitHub Issue コメント監視（watch-issue-comments 相当）は
+many-ai-cli リポジトリ内にはありませんでした（`scripts/` は検査系
+スクリプトのみ）。それは利用者の手元環境側の仕組みで、この PR の
+対象ではありません。
+
+### many-iris（main 時点）の現行実装
+
+- **board-worker の dispatcher**（`src/dispatch.ts`）: cron で山を見て、
+  行き先なしを Clef-flash で振り分け、`devin` 宛てだけ Devin
+  セッションを起こす。拾い手は Devin 専用で、看板の内側の仕組み。
+- **Rust 本体 `iris/`**: `src/board.rs` は Rust 版の看板サーバそのもの
+  （handoff は無い）。`executor` 系はローカル実行の抽象で、看板の
+  依頼を拾う poller ではない。
+- **`prototype/`（Python 試作）**: `scheduler.py` は合成エンジンの
+  snapshot を回す試作で、看板のクライアントではない。README の
+  「`prototype/` は記録として残し、新しい機能は足さない」方針どおり
+  ここには足さない。ただし「空の polling 応答や接続断は、担当が
+  止まった証拠にしない」という試作の原則は、この picker の設計にも
+  反映している（通信不明では結果を書かず、安全側に止まる）。
+- README に明記のとおり、**VPS・手元 PC・Muse・GrokBot の拾う側は
+  main のこのリポジトリにはありませんでした**。今回の picker が
+  その受け口です。
+
+### 保留条件
+
+- PR #4: 未統合・独立レビュー中（上記のとおり）。
+- Issue #1（Handoff 機構の設計提案）: 実装依頼・統合決定では
+  ありません。この PR は Issue #1 の Manifest や受領確認には
+  踏み込みません。
+- 行き先（`handoff.to`）は固定の 7 値（devin / vps-claude /
+  local-claude / muse / grokbot / owner / hold）です。picker は
+  新しい行き先を作りません。担当者名はこの範囲で選びます。
+
+## 作ったもの／作らなかったもの
+
+作ったもの: `picker/`（独立した Node.js パッケージ、依存なし）。
+
+- `src/board-client.mjs`: 看板 MCP のクライアント。ツールの拒否
+  （`BoardRefusal`）と通信不能（`BoardUnreachable`）を分けて返す。
+  鍵は Authorization ヘッダだけに置き、ログやエラーに出さない。
+- `src/picker.mjs`: 拾う判定（純粋関数）と 1 パスの流れ。
+- `src/executors.mjs`: 実行系の差し替え境界。既定は記録のみの
+  `RecordExecutor`、ほかに運用者が指定したコマンドを起動する
+  `CommandExecutor`（シェルを介さず、仕事は標準入力の JSON で渡す）。
+- `src/main.mjs`: `--once`（cron 向け単発）と `--loop`（常駐）。
+  設定は環境変数、鍵はファイルから毎回読む。
+- テスト: 単体（フェイク看板）と、実看板（wrangler dev + Durable
+  Object）での e2e。
+
+作らなかったものと理由:
+
+- **board-worker の dispatcher の拡張**: dispatcher は看板の内側で
+  Devin を起こす仕組みで、担当者側のクライアントとは責務が別。
+  看板側の変更は PR #4 で完結しており、ここでは触らない。
+- **many-ai-cli への変更**: 今回は調査のみ（別リポジトリへの書込みは
+  範囲外）。下記の互換性の論点は持ち主の判断事項として残す。
+- **`prototype/`・Rust 本体への追加**: 上記の方針と責務から外れる。
+
+## 互換性の論点（PR #4 と many-ai-cli local_taker）
+
+調査で見つけた、PR #4 を実看板へ入れる前に知っておくべき点です。
+この PR では直していません（many-ai-cli 側の変更になるため）。
+
+- PR #4 の汎用書込み fence では、受理中の担当者本人の
+  `board_upsert_item` / `board_add_event` は request_id と世代の
+  提示が必須です。local_taker は受理の後に汎用書込みで開始・結果・
+  状態を返すため、**PR #4 配備後はそれらの書込みが `FENCE_REQUIRED`
+  で拒否され得ます**。
+- local_taker はハートビートを送らないため、30 分を超える実行は
+  リース切れとなり、看板側で `unknown` 隔離の対象になり得ます
+  （taker のタイムアウト上限は 4 時間）。
+- つまり PR #4 の統合には、local_taker 側の追随（fenced ツールへの
+  移行とハートビート）か、配備順序の判断が要ります。この picker は
+  最初から fenced ツールだけを使うので、この問題は持ちません。
+
+## 未解決の書込み境界と picker の関係
+
+PR #4 の残る限界: 鍵は担当者（writer）までしか識別せず、実行
+（セッション）を識別しません。仕事が**別の担当者**へ引き継がれた
+後は、旧実行の汎用書込みを「他の担当者の書込み」と区別できません。
+
+picker の設計への影響:
+
+- picker は実行状態の書込みに汎用ツールを使わず、fenced ツール
+  だけを使います。同じ担当者内の古い実行（前の picker プロセス等）
+  の進捗・完了は、世代不一致で看板に拒否されます。
+- 引き継ぎの際は、旧担当者の picker を止めることが運用の前提です。
+  止め忘れても、旧 picker の実行としての書込みは fence で拒否
+  されますが、汎用書込みまで含めた完全な遮断は鍵の発行単位を
+  変えない限りできません（PR #4 の限界そのまま）。
+
+## picker の安全の既定（判断と根拠）
+
+- **拾う条件**: `handoff.to` が自分の担当者名と一致し、
+  `state = requested`、`kind = task`、任せた時点の題名があること。
+  行き先なしは看板の dispatcher の仕事なので拾わない。
+- **持ち主の門（既定で有効）**: `requested_by` と `to_set_by` が
+  ともに `page:owner` の仕事だけを無人で実行する。many-ai-cli の
+  taker と同じ判断で、根拠も同じ（書き手キーだけで題名は書けるが、
+  実行は手元のファイルに届き得る）。`PICKER_OWNER_ONLY=0` で外せる
+  が、その範囲は運用者の責任で広げる。
+- **1 パス 1 件・1 日の上限**: 無人実行の影響範囲を絞る（taker と同じ）。
+- **ハートビートと中止**: 実行中はハートビートでリースを延長する。
+  世代不一致などの fence 拒否、または看板との通信断があれば実行を
+  中止し、結果は書かない。完了の直前にもハートビートで fence を
+  確かめる。自動の再実行・再試行・盲目的な完了はしない。結果を
+  伝えられなかった仕事は、リース切れ→`unknown` 隔離→人の復旧
+  （PR #4 の手順）に委ねる。
+- **世代のない看板では動かない**: 受理の応答に世代が無ければ、
+  汎用書込みへフォールバックせず実行しない。
+- **題名はデータ**: 任せた時点の題名スナップショットを仕事の名前
+  として実行系へ渡す。picker 自身への指示としては解釈しない。
+- **PC 常時稼働を前提にしない**: `--once` は cron から叩けば完結し、
+  冪等（受理は看板が原子的に決める）。`--loop` も同じパスの繰り返し。
+
+## テスト（実施済み）
+
+- picker 単体（`picker/test/picker.test.mjs`、33 件）: 拾う判定の
+  行列、受理→ハートビート→進捗→完了の一周と fence の引き継ぎ、
+  無関係な項目に触らないこと、同時パスの二重拾い防止、受理競合、
+  実行中の世代交代での中止と無書込み、通信断での中止と無書込み、
+  世代のない看板での不実行、実行系失敗時の stopped 完了、1 日の上限。
+- picker e2e（`picker/test/picker-e2e.test.mjs`、8 件）: 実看板
+  （wrangler dev + Durable Object）で任せる→拾う→完了の一周、
+  他人宛ての仕事がそのまま残ること、2 回目のパスで何も拾わない
+  こと、実行の記録が出来事として看板に残ること。
+- 回帰: board-worker の `npm test` 全 328 件（route 35 / resume 42 /
+  board e2e 230 / dispatch e2e 21）が引き続き通過。
+- `node scripts/secrets-scan.mjs --all-tracked --block` と
+  `node scripts/check-claude-md.mjs` を通す（結果は PR 本文に記載）。
+
+## 未実施・残る限界
+
+- 実在の外部 AI との実接続は未実施です。実行系は差し替え境界に
+  閉じ、既定は記録のみ、テストはフェイクと実看板で代替しました。
+  実コマンド（例: `claude -p` ラッパ）での運用確認は、配備する
+  運用者が自分の環境で行う段階のものです。
+- many-ai-cli の Hub 実機との連動（board_sync の `handed_work` 表示に
+  picker の実行が出るか等）は未確認です。看板側の出来事・状態は
+  既存と同じ形で書くため原理上は出ますが、実機では見ていません。
+- 本番配備、PR #4 の統合、local_taker の追随は、すべて持ち主の
+  判断・操作です。
+- picker の複数台同時稼働は、看板の原子的受理と世代 fencing で
+  二重実行にはなりませんが、1 台運用が前提の単純さで作って
+  あります（状態ファイルは台ごとのローカル記録です）。
