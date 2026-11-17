@@ -3,7 +3,7 @@
 //
 //   node test/route.test.mjs
 import { decideRoute, estimateNeurons, routeAllowed, routeRequest, utcDay, ROUTE_DAILY_NEURON_CAP } from "../src/route.ts";
-import { runDispatcher, DISPATCH_MAX_PER_DAY } from "../src/dispatch.ts";
+import { runDispatcher, spawnDevinSession, DISPATCH_MAX_PER_DAY, DISPATCH_MAX_PER_REQUEST } from "../src/dispatch.ts";
 
 let passed = 0;
 const failures = [];
@@ -79,6 +79,11 @@ function fakeBoard(items, { neurons = 0, dispatched = 0 } = {}) {
     async markDispatchUnknown(claimId) {
       const row = rows.find((r) => r.id === claimId);
       if (row?.status === "claimed") { row.status = "unknown"; return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async refuseDispatch(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "refused"; return { ok: true, changed: true }; }
       return { ok: true, changed: false };
     },
     async resolveDispatch(request, resolution) {
@@ -193,6 +198,42 @@ const startDevin = async () => { devinStarts++; return { session_id: `s${devinSt
   let more = 0;
   await runDispatcher({ board, ai: null, startDevin: async () => { more++; return { session_id: "s-more" }; } });
   check("settled as started, the session is left to take the work itself", settled.ok === true && more === 0 && log.dispatched.length === 0, JSON.stringify(log));
+}
+{
+  // Devin answered and said no (a 4xx, e.g. a revoked key): no session was
+  // started, so nothing is unknown and no person has to settle it. The
+  // attempt still counts, so a key that stays wrong stops at the per-request cap.
+  const { board, log } = fakeBoard([item("refused", "devin")]);
+  let starts = 0;
+  const refusing = async () => { starts++; return { refused: 401 }; };
+  await runDispatcher({ board, ai: null, startDevin: refusing });
+  check("a refused start is not unknown and does not wait for a person", starts === 1 && (await board.dispatchState("REQ-refused", 0)).blocked === false, JSON.stringify(log));
+  check("the board is told the start was refused, with the status", log.events.some((t) => t.includes("REQ-refused") && t.includes("refused (HTTP 401)") && !t.includes("unknown")), JSON.stringify(log.events));
+  for (let i = 0; i < DISPATCH_MAX_PER_REQUEST + 2; i++) await runDispatcher({ board, ai: null, startDevin: refusing });
+  check("refused starts stop at the per-request cap", starts === DISPATCH_MAX_PER_REQUEST && log.dispatched.length === 0, `starts=${starts}`);
+}
+
+// --- what a Devin answer means (spawnDevinSession), with a stand-in fetch
+{
+  const answer = (status, body) => async () => new Response(body, { status, headers: { "content-type": "application/json" } });
+  const started = await spawnDevinSession(answer(200, JSON.stringify({ session_id: "devin-1", url: "https://app.devin.ai/sessions/1" })), "https://devin.test/sessions", "k", "p");
+  check("a 2xx answer with a session is a start", started?.session_id === "devin-1" && started?.url === "https://app.devin.ai/sessions/1", JSON.stringify(started));
+  for (const status of [400, 401, 403, 429]) {
+    const refused = await spawnDevinSession(answer(status, "{}"), "https://devin.test/sessions", "k", "p");
+    check(`a ${status} answer is a refusal, not an unknown start`, refused?.refused === status, JSON.stringify(refused));
+  }
+  for (const status of [500, 502, 504]) {
+    const unknown = await spawnDevinSession(answer(status, "{}"), "https://devin.test/sessions", "k", "p");
+    check(`a ${status} answer is unknown (the start may have happened)`, unknown === null, JSON.stringify(unknown));
+  }
+  const lost = await spawnDevinSession(async () => { throw new Error("connection reset"); }, "https://devin.test/sessions", "k", "p");
+  check("a lost answer is unknown", lost === null);
+  const garbled = await spawnDevinSession(answer(200, "not json"), "https://devin.test/sessions", "k", "p");
+  check("a 2xx answer that cannot be read is unknown", garbled === null, JSON.stringify(garbled));
+  let sent = null;
+  await spawnDevinSession(async (url, init) => { sent = { url, init }; return new Response("{}", { status: 200 }); }, "https://devin.test/sessions", "key-1", "the prompt");
+  check("the start posts the prompt with the key", sent?.url === "https://devin.test/sessions" && sent.init.method === "POST" &&
+    sent.init.headers.authorization === "Bearer key-1" && JSON.parse(sent.init.body).prompt === "the prompt", JSON.stringify(sent?.init?.headers));
 }
 
 console.log(`passed ${passed}, failed ${failures.length}`);

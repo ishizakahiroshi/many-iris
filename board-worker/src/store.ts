@@ -153,7 +153,8 @@ export class Store {
     // The dispatcher's claim on a start (dispatch.ts): a row is written
     // BEFORE the session is started, with its outcome as the status —
     // claimed, started, unknown (the start's answer was lost; never retried
-    // on its own) or resolved (a person cleared an unknown claim). Rows
+    // on its own), refused (Devin answered no, so nothing started) or
+    // resolved (a person cleared an unknown claim). Rows
     // written before claims existed have no status and count as started:
     // recording used to happen after the start, so that is what they were.
     this.addDispatchColumn("status", "TEXT");
@@ -259,6 +260,18 @@ export class Store {
       const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
       if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
       this.sql.exec("UPDATE dispatch_log SET status='unknown' WHERE seq=?", claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /** Records that Devin refused the start (it answered with a 4xx), so no
+   * session exists. Unlike an unknown outcome this blocks nothing and needs
+   * no person; the row still counts toward the per-request and day caps. */
+  refuseDispatch(claimId: number): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='refused' WHERE seq=?", claimId);
       return { ok: true, changed: true };
     });
   }

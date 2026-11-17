@@ -15,7 +15,7 @@ import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
 import { accessUser, type AccessResult } from "./access";
-import { runDispatcher } from "./dispatch.ts";
+import { runDispatcher, spawnDevinSession } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
@@ -137,6 +137,9 @@ export class BoardStore extends DurableObject<Env> {
   }
   async markDispatchUnknown(claimId: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.markDispatchUnknown(claimId));
+  }
+  async refuseDispatch(claimId: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.refuseDispatch(claimId));
   }
   async routeUsage(day: string): Promise<Record<string, unknown>> {
     return guarded(() => this.store.routeUsage(day));
@@ -363,21 +366,6 @@ function providerFor(origin: string): OAuthProvider<Env> {
 
 const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
 
-async function spawnDevinSession(env: Env, key: string, prompt: string): Promise<{ session_id?: string; url?: string } | null> {
-  const endpoint = env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL;
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "authorization": `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({ prompt }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as { session_id?: string; url?: string };
-  } catch {
-    return null;
-  }
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = publicOrigin(env.BOARD_PUBLIC_ORIGIN);
@@ -390,7 +378,9 @@ export default {
     ctx.waitUntil(runDispatcher({
       board: boardStub(env),
       ai: env.AI ?? null,
-      startDevin: devinKey ? (prompt) => spawnDevinSession(env, devinKey, prompt) : null,
+      startDevin: devinKey
+        ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
+        : null,
     }));
   },
 } satisfies ExportedHandler<Env>;

@@ -174,7 +174,11 @@ iPad（看板の画面）から仕事を依頼し、クラウド側の担当（M
   `claimed`（起動中）→ `started`（応答が返り、セッション ID を記録）/
   `unknown`（起動の呼び出しが失敗したか応答が消えた。起動したかどうか
   自体が不明）→ 人が後始末して `resolved`（retry の確定）または
-  `started`（started の確定）。
+  `started`（started の確定）。Devin が 4xx（鍵の誤り・失効、要求の誤り、
+  回数制限）で断ったときは、起動していないことが確かなので `refused` に
+  する。`refused` は何も止めず、人の後始末も要らない。1 依頼 2 回・1 日
+  6 回の上限には数えるので、鍵が誤ったままでも起動の試行は 1 依頼 2 回で
+  止まる。5xx・応答なし・読めない応答は従来どおり `unknown`。
 - **`unknown` は自動では絶対に再試行しない**。claim が残る限り dispatcher
   はその依頼を素通りし、看板には「unknown: 応答が消えたので自動では
   再試行しない」という出来事が残る。
@@ -277,6 +281,20 @@ iPad（看板の画面）から仕事を依頼し、クラウド側の担当（M
   新しい境界に合わせて書き換え）
 - `README.md`（ツール数の更新）、この文書
 
+3 回目のレビュー修正（2026-11-17）で触った場所:
+
+- `board-worker/src/dispatch.ts`（Devin の起動を `spawnDevinSession` として
+  ここへ移し、4xx を `refused` として返す。dispatcher は `refused` を人の
+  後始末なしで記録する）、`board-worker/src/store.ts`（`refuseDispatch`）、
+  `board-worker/src/index.ts`（配線）
+- `board-worker/test/route.test.mjs`（断られた起動・応答の読み分けの試験）
+- `README.md`（Devin の起動の説明）、この文書（`refused` と「配備の前に」）
+
+手元にあった別の試作（起動前の予約だけを作ったもの、未コミット）とは
+2026-11-17 に突き合わせた。試作にあってこの PR に無い判断は「起動を
+試みた依頼は取り下げ・行き先変更をさせない」だけで、この PR は取り下げを
+許したうえで受理の時点で断る形にしているので、取り込まなかった。
+
 試作が同じ場所を触っている場合は、次を正として照合してください:
 世代は項目単位で単調増加し消さない／リース切れで自動動作しない／
 解放は unknown + 停止確認が必須／進捗・完了は request_id + generation で
@@ -299,6 +317,29 @@ fencing する／汎用書込みは「受けた担当者本人だけ」を fence
    世代で任せ直せる。
 4. 結果が一部だけ出ているなど判断が付かない間は `unknown` のまま置く。
    その仕事以外は止まらない。
+
+## 配備の前に（既存の拾い手の追随）
+
+この変更を本番へ出すと、受けた担当者本人の `board_upsert_item` /
+`board_add_event` に世代の提示が要るようになる。いま本番の看板に書いて
+いる拾い手のうち、次の 2 つは世代を送らないので、配備した時点から
+受けた仕事への書き込みが `FENCE_REQUIRED` で断られる（2026-11-17 に
+many-ai-cli の `rust/src/application/board_sync/taker.rs` を読んで確認）。
+
+- many-ai-cli の手元の受け取り（`local_taker`）: `board_accept_handoff` の
+  後、「開始」「[完了] …」「終了」を `board_add_event` で、状態を
+  `board_upsert_item` で書く。配備後は受けた仕事が `in_progress` のまま
+  残り、`claude -p` の結果は看板に載らない（`claude -p` 自体は動く）。
+- many-ai-cli の Hub の「看板から任された仕事」の一覧から始めたセッション:
+  受けた書き手の鍵で、同じ項目へセッションの記録を書く。
+
+順番は、many-ai-cli 側を先に直して（受理の応答の `handoff.generation` を
+控え、`board_progress_handoff` / `board_complete_handoff` か、世代つきの
+汎用書込みにする）Hub を入れ替え、その後で看板を配備する。配備の時点で
+まだ受けられていない依頼（`requested`）が無いことも、`board_list` で
+確かめる。配備前に旧い手順書で起こした Devin のセッションが配備後に
+受けると、受理で世代が付くので、その後の旧手順の書き込みが断られる
+（配備前に受理済みの実行は `legacy_run` として従来どおり書ける）。
 
 ## 未検証・残り
 

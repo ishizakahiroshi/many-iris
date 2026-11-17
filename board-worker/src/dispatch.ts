@@ -9,7 +9,9 @@
 //      atomic claim per request, store.ts claimDispatch), so two ticks
 //      racing each other cannot both start it, and a start whose answer is
 //      lost leaves the claim `unknown` — never retried on its own, only
-//      settled by a person (board_resolve_dispatch). A request already
+//      settled by a person (board_resolve_dispatch). A start Devin answered
+//      with a refusal (4xx) started nothing: it is recorded as `refused`,
+//      counts toward the caps, and needs nobody. A request already
 //      dispatched within DISPATCH_DEDUPE_MS is skipped so the gap between
 //      spawn and accept cannot fire the same work twice.
 // Work for any other destination is left for that writer to pick up.
@@ -38,6 +40,7 @@ export interface BoardCalls {
   claimDispatch(request: string, at: number, limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number }): Promise<Result>;
   confirmDispatch(claimId: number, sessionId: string | null): Promise<Result>;
   markDispatchUnknown(claimId: number): Promise<Result>;
+  refuseDispatch(claimId: number): Promise<Result>;
   run(tool: string, actor: string, args: Record<string, unknown>): Promise<Result>;
   routeUsage(day: string): Promise<Result>;
   recordRouteUse(day: string, neurons: number, fromUsage: boolean): Promise<Result>;
@@ -48,8 +51,38 @@ export interface DispatchDeps {
   /** The Workers AI binding; absent when it is not set up (then work goes to hold). */
   ai?: { run(model: string, input: Record<string, unknown>): Promise<unknown> } | null;
   /** Starts a Devin session; absent when no Devin key is set up. */
-  startDevin?: ((prompt: string) => Promise<{ session_id?: string; url?: string } | null>) | null;
+  startDevin?: ((prompt: string) => Promise<DevinStart>) | null;
   now?: () => number;
+}
+
+/** What one start of a Devin session came to:
+ *   - the session (a 2xx answer);
+ *   - `{ refused: status }`: Devin answered with a 4xx (a wrong or revoked
+ *     key, a malformed request, a rate limit). It said no, so no session was
+ *     started, and nobody has to check the Devin side;
+ *   - `null`: the outcome is unknown (no answer, a 5xx, or a 2xx that cannot
+ *     be read). The session may have been started, so it is never retried
+ *     on its own (store.ts markDispatchUnknown). */
+export type DevinStart = { session_id?: string; url?: string } | { refused: number } | null;
+
+/** Starts a Devin session (POST to the sessions endpoint). `fetchFn` is the
+ * Worker's fetch; the tests pass a stand-in. */
+export async function spawnDevinSession(
+  fetchFn: (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<Response>,
+  endpoint: string, key: string, prompt: string,
+): Promise<DevinStart> {
+  try {
+    const res = await fetchFn(endpoint, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (res.status >= 400 && res.status < 500) return { refused: res.status };
+    if (!res.ok) return null;
+    return (await res.json()) as { session_id?: string; url?: string };
+  } catch {
+    return null;
+  }
 }
 
 export function dispatchPrompt(item: Record<string, unknown>): string {
@@ -136,11 +169,23 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     });
     if (claim.ok !== true || claim.claimed !== true || typeof claim.claim_id !== "number") continue;
     started += 1;
-    let session: { session_id?: string; url?: string } | null = null;
+    let session: DevinStart = null;
     try {
       session = await deps.startDevin(dispatchPrompt(item));
     } catch {
       session = null;
+    }
+    if (session !== null && "refused" in session) {
+      // Devin answered no: nothing was started, so there is nothing for a
+      // person to check. The attempt counts toward the caps (a key that stays
+      // wrong stops at DISPATCH_MAX_PER_REQUEST), and a later tick may try again.
+      await deps.board.refuseDispatch(claim.claim_id);
+      await deps.board.run("board_add_event", DISPATCH_ACTOR, {
+        item_id: item.item_id,
+        kind: "note",
+        text: `dispatch of ${request} to devin was refused (HTTP ${session.refused}): no session was started. A later tick tries again, at most ${DISPATCH_MAX_PER_REQUEST} times per request`,
+      });
+      continue;
     }
     if (session === null) {
       // The start may or may not have happened — its answer never arrived.
