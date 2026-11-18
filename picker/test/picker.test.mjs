@@ -4,6 +4,9 @@
 // board Worker is covered by picker-e2e.test.mjs.
 //
 //   node test/picker.test.mjs
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
 import { eligible, runPass } from "../src/picker.mjs";
@@ -276,6 +279,15 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const board = new FakeBoard([item()]);
   const outcome = await runPass({ client: board, config: baseConfig, executor: new RecordExecutor(), state: state(6) });
   check("the daily cap stops the pass before any board call", outcome.kind === "capped" && board.calls.length === 0, JSON.stringify(outcome));
+}
+
+// --- the entry point runs when started as a script ---------------------
+// (On Windows the script path and import.meta.url differ in form; a plain
+// string comparison made `node src/main.mjs` exit 0 without doing anything.)
+{
+  const main = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "main.mjs");
+  const run = spawnSync(process.execPath, [main], { encoding: "utf8" });
+  check("main.mjs without a mode prints the usage and exits 2", run.status === 2 && run.stderr.includes("usage:"), JSON.stringify({ status: run.status, stderr: run.stderr }));
 }
 
 console.log(`picker.test: ${passed} passed, ${failures.length} failed`);

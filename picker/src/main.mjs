@@ -10,7 +10,8 @@
 // few minutes is the intended deployment, and every pass is safe to
 // repeat — the board, not this process, decides who took what.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
 import { runPass } from "./picker.mjs";
@@ -132,7 +133,18 @@ async function main(argv) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Started as a script (not imported)? Compare real paths: the script path
+// and import.meta.url differ in form on Windows and when the checkout is
+// reached through a symlink or junction.
+function startedAsScript() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (startedAsScript()) {
   process.exitCode = await main(process.argv.slice(2));
 }
 
