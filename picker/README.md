@@ -38,6 +38,8 @@ cron の例（5 分おきに 1 回）:
 */5 * * * * cd /path/to/many-iris/picker && PICKER_BOARD_URL=... PICKER_KEY_FILE=... PICKER_WRITER=muse node src/main.mjs --once
 ```
 
+状態ファイルの隣に置く鍵（ロックファイル）で同時に動くのは 1 つだけに保たれ、前の回が終わっていなければ後の回は何もせず終わるので、間隔は 1 分おき（`* * * * *`）にしてもかまいません。
+
 ## 設定（環境変数）
 
 | 名前 | 必須 | 既定 | 意味 |
