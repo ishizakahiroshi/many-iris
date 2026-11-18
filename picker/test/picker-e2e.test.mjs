@@ -119,7 +119,10 @@ try {
     JSON.stringify(texts));
 } finally {
   stop();
-  rmSync(temp, { recursive: true, force: true });
+  // Windows keeps the state directory locked for a moment after wrangler dev is killed
+  // (same wait as board-worker/test/board.test.mjs).
+  await new Promise((r) => setTimeout(r, 1000));
+  if (existsSync(temp)) rmSync(temp, { recursive: true, force: true });
 }
 
 console.log(`picker-e2e.test: ${passed} passed, ${failures.length} failed`);
