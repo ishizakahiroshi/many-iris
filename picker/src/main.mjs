@@ -10,7 +10,7 @@
 // few minutes is the intended deployment, and every pass is safe to
 // repeat — the board, not this process, decides who took what.
 
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
@@ -81,6 +81,39 @@ export function fileState(path, now = () => Date.now()) {
   };
 }
 
+/**
+ * One picker per state file at a time. The board lets the same writer
+ * accept the same request again with the same generation (so a lost
+ * reply can be repeated), which means two passes started at the same
+ * moment would both run the work. The lock file holds the pid of the
+ * pass that owns it; a lock whose process is gone is taken over.
+ * Returns a release function, or null when another pass is running.
+ */
+export function acquireLock(path) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = openSync(path, "wx");
+      writeFileSync(fd, `${process.pid}\n`);
+      closeSync(fd);
+      return () => { try { rmSync(path, { force: true }); } catch {} };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let owner = NaN;
+      try { owner = Number(readFileSync(path, "utf8").trim()); } catch {}
+      if (Number.isSafeInteger(owner) && owner > 0) {
+        try {
+          process.kill(owner, 0);
+          return null; // the owner is alive
+        } catch (probe) {
+          if (probe?.code === "EPERM") return null; // alive, another user
+        }
+      }
+      try { rmSync(path, { force: true }); } catch {}
+    }
+  }
+  return null;
+}
+
 export function makeExecutor(config) {
   if (config.executorKind === "command") {
     return new CommandExecutor({
@@ -98,7 +131,16 @@ async function pass(config, executor) {
   const key = readFileSync(config.keyFile, "utf8").trim();
   const client = new BoardClient({ url: config.boardUrl, key });
   const log = (message) => console.log(`[picker ${new Date().toISOString()}] ${message}`);
-  return runPass({ client, config, executor, state: fileState(config.stateFile), log });
+  const release = acquireLock(`${config.stateFile}.lock`);
+  if (release === null) {
+    log("another pass of this picker is running; not looking");
+    return { kind: "busy" };
+  }
+  try {
+    return await runPass({ client, config, executor, state: fileState(config.stateFile), log });
+  } finally {
+    release();
+  }
 }
 
 async function main(argv) {

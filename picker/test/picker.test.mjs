@@ -5,10 +5,13 @@
 //
 //   node test/picker.test.mjs
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
+import { acquireLock } from "../src/main.mjs";
 import { eligible, runPass } from "../src/picker.mjs";
 
 let passed = 0;
@@ -288,6 +291,23 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const main = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "main.mjs");
   const run = spawnSync(process.execPath, [main], { encoding: "utf8" });
   check("main.mjs without a mode prints the usage and exits 2", run.status === 2 && run.stderr.includes("usage:"), JSON.stringify({ status: run.status, stderr: run.stderr }));
+}
+
+// --- one pass at a time per state file ---------------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "iris-picker-lock-"));
+  const path = join(dir, "picker-state.json.lock");
+  const first = acquireLock(path);
+  check("the first pass gets the lock", typeof first === "function" && existsSync(path));
+  check("a second pass while the first runs gets nothing", acquireLock(path) === null);
+  first();
+  check("releasing removes the lock", !existsSync(path));
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  writeFileSync(path, `${dead}\n`);
+  const taken = acquireLock(path);
+  check("a lock left by a process that is gone is taken over", typeof taken === "function");
+  taken?.();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(`picker.test: ${passed} passed, ${failures.length} failed`);
