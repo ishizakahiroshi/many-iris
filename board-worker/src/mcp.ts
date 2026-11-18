@@ -19,7 +19,7 @@ const clearable = (description: string) => ({ type: ["string", "null"], descript
 export const TOOLS: Json[] = [
   tool(
     "board_upsert_item",
-    "Create an item (project, kind, title and state are required) or update the given fields of an existing one. The writer is taken from the key, not from the request.",
+    "Create an item (project, kind, title and state are required) or update the given fields of an existing one. The writer is taken from the key, not from the request. While an item is being run (handoff.state accepted), a write by the writer running it must carry that run's request_id and generation (or use the fenced handoff tools); a stale run of the same writer is refused (FENCE_REQUIRED / STALE_GENERATION). Other writers are not affected.",
     {
       item_id: text("Stable id, ^[A-Za-z0-9._:/-]{1,128}$"),
       project: text("Project name, 1 to 80 characters"),
@@ -32,17 +32,21 @@ export const TOOLS: Json[] = [
       planned_start: clearable("YYYY-MM-DD; null clears"),
       planned_end: clearable("YYYY-MM-DD, not before planned_start; null clears"),
       expected_revision: { type: "integer", description: "Refuses the write when the item is at another revision (0 = must not exist)" },
+      request_id: text("The run's handoff.request_id: with generation, the fence of the run writing this (required for the running writer's own writes while the item is accepted)"),
+      generation: { type: "integer", description: "The run's handoff.generation: with request_id, the fence of the run writing this" },
     },
     ["item_id"],
   ),
   tool(
     "board_add_event",
-    "Append an event to an item. The writer is taken from the key.",
+    "Append an event to an item. The writer is taken from the key. The same fencing as board_upsert_item applies: the running writer's own events on an accepted item must carry the run's request_id and generation (or use board_progress_handoff).",
     {
       item_id: text("An existing item"),
       kind: { type: "string", enum: WRITER_EVENT_KINDS },
       text: text("1 to 2000 characters"),
       ref: text("Optional https URL"),
+      request_id: text("The run's handoff.request_id: with generation, the fence of the run writing this"),
+      generation: { type: "integer", description: "The run's handoff.generation: with request_id, the fence of the run writing this" },
     },
     ["item_id", "kind", "text"],
   ),
@@ -92,6 +96,80 @@ export const TOOLS: Json[] = [
     },
     ["item_id"],
   ),
+  tool(
+    "board_heartbeat_handoff",
+    "Say the run that took a request is still working, and extend its lease (handoff.lease_until). Send the item's handoff.request_id and the handoff.generation the accept returned. A stale generation is refused (STALE_GENERATION): a replaced run must stop. Writes no event.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+    },
+    ["item_id", "request_id", "generation"],
+  ),
+  tool(
+    "board_progress_handoff",
+    "Append an event as the current run (progress or a result), fenced by request_id and generation: a late write from an old run is refused instead of landing on work somebody else took over. Also extends the lease, like a heartbeat.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+      kind: { type: "string", enum: WRITER_EVENT_KINDS },
+      text: text("1 to 2000 characters"),
+      ref: text("Optional https URL"),
+    },
+    ["item_id", "request_id", "generation", "kind", "text"],
+  ),
+  tool(
+    "board_complete_handoff",
+    "Finish the work as the current run, fenced by request_id and generation. outcome done closes the item as done; outcome stopped closes it as stopped. The handoff stays on the item as completed, for the record.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
+      outcome: { type: "string", enum: ["done", "stopped"], description: "done or stopped" },
+      text: text("Optional result note (1 to 2000 characters)"),
+    },
+    ["item_id", "request_id", "generation", "outcome"],
+  ),
+  tool(
+    "board_mark_handoff_unknown",
+    "Record that a taken run's outcome is unknown: only for a run whose lease (handoff.lease_until) has expired without a report. Nothing restarts or re-queues the work; it waits in handoff.state unknown until a person releases it (board_release_handoff with stopped_confirmed) or resumes the same run (board_resume_handoff).",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+    },
+    ["item_id", "request_id"],
+  ),
+  tool(
+    "board_release_handoff",
+    "Put work back on the pile. Two safe ways: the run itself gives it back (send its request_id and generation), or work marked unknown is released with stopped_confirmed true — a person has confirmed the old run has stopped and its outcome was checked. An unconfirmed run is never re-queued by this tool.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+      generation: { type: "integer", description: "handoff.generation (required when the run itself gives the work back)" },
+      stopped_confirmed: { type: "boolean", description: "Required true when releasing work marked unknown" },
+    },
+    ["item_id", "request_id"],
+  ),
+  tool(
+    "board_resume_handoff",
+    "Resume a run that was marked unknown, as the same run (same request and generation), after it was confirmed still working. Only the writer that took the request can call this; the owner can do the same from the board page.",
+    {
+      item_id: text("The item that was handed over"),
+      request_id: text("handoff.request_id of that item"),
+    },
+    ["item_id", "request_id"],
+  ),
+  tool(
+    "board_resolve_dispatch",
+    "Settle a Devin dispatch whose outcome is unknown (the dispatcher claimed the request, started a session, and the answer was lost; it never retries such a start on its own). Call this only after a person has looked at the Devin side: resolution retry states no session is running, so the dispatcher may start one again; resolution started, with the session's id, states a session is running and will take the work itself. Refused when no dispatch of the request is waiting to be settled.",
+    {
+      request_id: text("handoff.request_id of the dispatched work"),
+      resolution: { type: "string", enum: ["retry", "started"], description: "retry: no session is running; started: a session is running" },
+      session_id: text("The running session's id (required for resolution started)"),
+    },
+    ["request_id", "resolution"],
+  )
 ];
 
 const validId = (v: unknown) => typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));
@@ -148,7 +226,7 @@ export async function handle(request: unknown, run: ToolRunner): Promise<{ statu
         protocolVersion: version,
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
-        instructions: "Many Iris board. Write progress with board_upsert_item and board_add_event; read with board_list. Your name on the board comes from your key.",
+        instructions: "Many Iris board. Read with board_list. Work you take with board_accept_handoff is reported with the fenced tools (board_progress_handoff, board_complete_handoff); plain writes with board_upsert_item and board_add_event stay for everything else, and for your own writes on an item you are running they must carry the run's request_id and generation. Your name on the board comes from your key.",
       });
     }
     case "server/discover":

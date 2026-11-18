@@ -3,7 +3,7 @@
 //
 //   node test/route.test.mjs
 import { decideRoute, estimateNeurons, routeAllowed, routeRequest, utcDay, ROUTE_DAILY_NEURON_CAP } from "../src/route.ts";
-import { runDispatcher, DISPATCH_MAX_PER_DAY } from "../src/dispatch.ts";
+import { runDispatcher, spawnDevinSession, DISPATCH_MAX_PER_DAY, DISPATCH_MAX_PER_REQUEST } from "../src/dispatch.ts";
 
 let passed = 0;
 const failures = [];
@@ -34,13 +34,64 @@ check("the title is one short line of data", req.model === "clef-flash" && req.s
   req.state.reference === "https://example.com/x" && Object.keys(req.questions.to.criteria).join(",") === "devin,owner,hold");
 
 // --- the dispatcher with stand-ins
+// The fake's dispatch rows follow the real store's claim rules (store.ts
+// claimDispatch): a claim is written before the start, an unknown outcome
+// blocks the request until a person resolves it, and a confirmed start
+// dedupes. claimDispatch's body runs without awaiting, like the real one's
+// single transaction, so two ticks racing in these tests interleave the
+// same way they would against the Durable Object.
 function fakeBoard(items, { neurons = 0, dispatched = 0 } = {}) {
-  const log = { routed: [], usage: [], dispatched: [], events: [] };
+  const log = { routed: [], usage: [], dispatched: [], events: [], claims: [] };
   let used = neurons;
+  const rows = [];
+  for (let i = 0; i < dispatched; i++) rows.push({ request: "REQ-seed", at: Date.now(), status: "started", id: rows.length + 1 });
+  const stateOf = (request, since) => {
+    const mine = rows.filter((r) => r.request === request);
+    const startedRows = mine.filter((r) => r.status === "started");
+    return {
+      ok: true,
+      at: startedRows.length ? Math.max(...startedRows.map((r) => r.at)) : null,
+      count: mine.length,
+      total_since: rows.filter((r) => r.at >= since).length,
+      blocked: mine.some((r) => r.status === "claimed" || r.status === "unknown"),
+    };
+  };
   const board = {
     async pendingHandoffs() { return { ok: true, items: items.map((i) => ({ ...i })) }; },
-    async dispatchState() { return { ok: true, at: null, count: 0, total_since: dispatched + log.dispatched.length }; },
-    async recordDispatch(request) { log.dispatched.push(request); return { ok: true }; },
+    async dispatchState(request, since) { return stateOf(request, since); },
+    async claimDispatch(request, at, lim) {
+      const mine = rows.filter((r) => r.request === request);
+      if (mine.some((r) => r.status === "claimed" || r.status === "unknown")) return { ok: true, claimed: false, reason: "blocked" };
+      if (mine.length >= lim.maxPerRequest) return { ok: true, claimed: false, reason: "per_request_cap" };
+      const startedRows = mine.filter((r) => r.status === "started");
+      if (startedRows.length && at - Math.max(...startedRows.map((r) => r.at)) < lim.dedupeMs) return { ok: true, claimed: false, reason: "dedupe" };
+      if (rows.filter((r) => r.at >= lim.daySince).length >= lim.maxPerDay) return { ok: true, claimed: false, reason: "day_cap" };
+      const row = { request, at, status: "claimed", id: rows.length + 1 };
+      rows.push(row);
+      log.claims.push(request);
+      return { ok: true, claimed: true, claim_id: row.id };
+    },
+    async confirmDispatch(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "started"; log.dispatched.push(row.request); return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async markDispatchUnknown(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "unknown"; return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async refuseDispatch(claimId) {
+      const row = rows.find((r) => r.id === claimId);
+      if (row?.status === "claimed") { row.status = "refused"; return { ok: true, changed: true }; }
+      return { ok: true, changed: false };
+    },
+    async resolveDispatch(request, resolution) {
+      const row = rows.find((r) => r.request === request && r.status === "unknown");
+      if (!row) return { ok: false };
+      row.status = resolution === "retry" ? "resolved" : "started";
+      return { ok: true, changed: true };
+    },
     async run(tool, actor, args) { log.events.push(args.text); return { ok: true }; },
     async routeUsage(day) { return { ok: true, day, neurons: used }; },
     async recordRouteUse(day, n, fromUsage) { used += n; log.usage.push({ day, n, fromUsage }); return { ok: true }; },
@@ -109,6 +160,80 @@ const startDevin = async () => { devinStarts++; return { session_id: `s${devinSt
   devinStarts = 0;
   await runDispatcher({ board, ai: ai({ answers: { to: { choice: "devin", probabilities: { devin: 0.9 }, confidence: 0.3 } } }), startDevin: null });
   check("without a Devin key the work is still routed", log.routed[0]?.to === "devin" && devinStarts === 0);
+}
+
+// --- the claim before the start: races, lost answers, a person's settlement
+{
+  const { board, log } = fakeBoard([item("race", "devin")]);
+  let starts = 0;
+  const slowStart = async () => { starts++; await new Promise((r) => setTimeout(r, 50)); return { session_id: `sr${starts}` }; };
+  await Promise.all([
+    runDispatcher({ board, ai: null, startDevin: slowStart }),
+    runDispatcher({ board, ai: null, startDevin: slowStart }),
+  ]);
+  check("two ticks racing claim once and start Devin once", starts === 1 && log.claims.length === 1 && log.dispatched.length === 1, JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("lost", "devin")]);
+  let starts = 0;
+  const lostStart = async () => { starts++; throw new Error("the answer was lost"); };
+  await runDispatcher({ board, ai: null, startDevin: lostStart });
+  check("a lost start was claimed once and tried once", starts === 1 && log.claims.length === 1 && log.dispatched.length === 0, JSON.stringify(log));
+  check("the lost start is left unknown and blocks the dispatcher", (await board.dispatchState("REQ-lost", 0)).blocked === true);
+  check("the board was told the outcome is unknown", log.events.some((t) => t.includes("REQ-lost") && t.includes("unknown")), JSON.stringify(log.events));
+  await runDispatcher({ board, ai: null, startDevin: lostStart });
+  check("an unknown start is never retried on its own", starts === 1, `starts=${starts}`);
+  const settled = await board.resolveDispatch("REQ-lost", "retry");
+  check("a person settles the unknown start as not running", settled.ok === true && (await board.dispatchState("REQ-lost", 0)).blocked === false);
+  let okStarts = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { okStarts++; return { session_id: "s-ok" }; } });
+  check("after the settlement the dispatcher may start it again", okStarts === 1 && log.dispatched[0] === "REQ-lost", JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("found", "devin")]);
+  let starts = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { starts++; return null; } });
+  check("a start that answers nothing is unknown too, not a silent retry", starts === 1 && (await board.dispatchState("REQ-found", 0)).blocked === true);
+  const settled = await board.resolveDispatch("REQ-found", "started");
+  let more = 0;
+  await runDispatcher({ board, ai: null, startDevin: async () => { more++; return { session_id: "s-more" }; } });
+  check("settled as started, the session is left to take the work itself", settled.ok === true && more === 0 && log.dispatched.length === 0, JSON.stringify(log));
+}
+{
+  // Devin answered and said no (a 4xx, e.g. a revoked key): no session was
+  // started, so nothing is unknown and no person has to settle it. The
+  // attempt still counts, so a key that stays wrong stops at the per-request cap.
+  const { board, log } = fakeBoard([item("refused", "devin")]);
+  let starts = 0;
+  const refusing = async () => { starts++; return { refused: 401 }; };
+  await runDispatcher({ board, ai: null, startDevin: refusing });
+  check("a refused start is not unknown and does not wait for a person", starts === 1 && (await board.dispatchState("REQ-refused", 0)).blocked === false, JSON.stringify(log));
+  check("the board is told the start was refused, with the status", log.events.some((t) => t.includes("REQ-refused") && t.includes("refused (HTTP 401)") && !t.includes("unknown")), JSON.stringify(log.events));
+  for (let i = 0; i < DISPATCH_MAX_PER_REQUEST + 2; i++) await runDispatcher({ board, ai: null, startDevin: refusing });
+  check("refused starts stop at the per-request cap", starts === DISPATCH_MAX_PER_REQUEST && log.dispatched.length === 0, `starts=${starts}`);
+}
+
+// --- what a Devin answer means (spawnDevinSession), with a stand-in fetch
+{
+  const answer = (status, body) => async () => new Response(body, { status, headers: { "content-type": "application/json" } });
+  const started = await spawnDevinSession(answer(200, JSON.stringify({ session_id: "devin-1", url: "https://app.devin.ai/sessions/1" })), "https://devin.test/sessions", "k", "p");
+  check("a 2xx answer with a session is a start", started?.session_id === "devin-1" && started?.url === "https://app.devin.ai/sessions/1", JSON.stringify(started));
+  for (const status of [400, 401, 403, 429]) {
+    const refused = await spawnDevinSession(answer(status, "{}"), "https://devin.test/sessions", "k", "p");
+    check(`a ${status} answer is a refusal, not an unknown start`, refused?.refused === status, JSON.stringify(refused));
+  }
+  for (const status of [500, 502, 504]) {
+    const unknown = await spawnDevinSession(answer(status, "{}"), "https://devin.test/sessions", "k", "p");
+    check(`a ${status} answer is unknown (the start may have happened)`, unknown === null, JSON.stringify(unknown));
+  }
+  const lost = await spawnDevinSession(async () => { throw new Error("connection reset"); }, "https://devin.test/sessions", "k", "p");
+  check("a lost answer is unknown", lost === null);
+  const garbled = await spawnDevinSession(answer(200, "not json"), "https://devin.test/sessions", "k", "p");
+  check("a 2xx answer that cannot be read is unknown", garbled === null, JSON.stringify(garbled));
+  let sent = null;
+  await spawnDevinSession(async (url, init) => { sent = { url, init }; return new Response("{}", { status: 200 }); }, "https://devin.test/sessions", "key-1", "the prompt");
+  check("the start posts the prompt with the key", sent?.url === "https://devin.test/sessions" && sent.init.method === "POST" &&
+    sent.init.headers.authorization === "Bearer key-1" && JSON.parse(sent.init.body).prompt === "the prompt", JSON.stringify(sent?.init?.headers));
 }
 
 console.log(`passed ${passed}, failed ${failures.length}`);

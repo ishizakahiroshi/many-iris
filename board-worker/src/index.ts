@@ -15,12 +15,13 @@ import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
 import { accessUser, type AccessResult } from "./access";
-import { runDispatcher } from "./dispatch.ts";
+import { runDispatcher, spawnDevinSession } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
 import { validActor } from "./rules";
 import { DEFAULT_LIMITS, Store, guarded, type Limits } from "./store";
+import { HANDOFF_LEASE_MS } from "./resume";
 
 export interface Env {
   BOARD: DurableObjectNamespace<BoardStore>;
@@ -39,6 +40,8 @@ export interface Env {
   /** Test-only overrides of the item and event limits. */
   BOARD_LIMIT_ITEMS?: string;
   BOARD_LIMIT_EVENTS?: string;
+  /** Test-only override of the handoff lease, in milliseconds. */
+  BOARD_LEASE_MS?: string;
   /** Devin API key for the scheduled dispatcher (wrangler secret put DEVIN_API_KEY). */
   DEVIN_API_KEY?: string;
   /** Override of the sessions endpoint (defaults to https://api.devin.ai/v1/sessions).
@@ -59,7 +62,11 @@ function limitsFrom(env: Env): Limits {
     const n = Number(raw);
     return raw !== undefined && Number.isSafeInteger(n) && n > 0 ? n : fallback;
   };
-  return { items: pick(env.BOARD_LIMIT_ITEMS, DEFAULT_LIMITS.items), events: pick(env.BOARD_LIMIT_EVENTS, DEFAULT_LIMITS.events) };
+  return {
+    items: pick(env.BOARD_LIMIT_ITEMS, DEFAULT_LIMITS.items),
+    events: pick(env.BOARD_LIMIT_EVENTS, DEFAULT_LIMITS.events),
+    leaseMs: pick(env.BOARD_LEASE_MS, HANDOFF_LEASE_MS),
+  };
 }
 
 export class BoardStore extends DurableObject<Env> {
@@ -86,6 +93,20 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.routeForTool(actor, args);
         case "board_take_back_handoff":
           return this.store.takeBackForTool(actor, args);
+        case "board_heartbeat_handoff":
+          return this.store.heartbeatHandoff(actor, args);
+        case "board_progress_handoff":
+          return this.store.progressHandoff(actor, args);
+        case "board_complete_handoff":
+          return this.store.completeHandoff(actor, args);
+        case "board_mark_handoff_unknown":
+          return this.store.markUnknownForTool(actor, args);
+        case "board_release_handoff":
+          return this.store.releaseHandoff(actor, args);
+        case "board_resume_handoff":
+          return this.store.resumeHandoff(actor, args);
+        case "board_resolve_dispatch":
+          return this.store.resolveDispatch(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
@@ -105,8 +126,20 @@ export class BoardStore extends DurableObject<Env> {
   async dispatchState(request: string, since: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.dispatchState(request, since));
   }
-  async recordDispatch(request: string, at: number): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.recordDispatch(request, at));
+  async claimDispatch(
+    request: string, at: number,
+    limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number },
+  ): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.claimDispatch(request, at, limits));
+  }
+  async confirmDispatch(claimId: number, sessionId: string | null): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.confirmDispatch(claimId, sessionId));
+  }
+  async markDispatchUnknown(claimId: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.markDispatchUnknown(claimId));
+  }
+  async refuseDispatch(claimId: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.refuseDispatch(claimId));
   }
   async routeUsage(day: string): Promise<Record<string, unknown>> {
     return guarded(() => this.store.routeUsage(day));
@@ -147,6 +180,8 @@ function ownerWriteStatus(code: unknown): number {
       return 403;
     case "REVISION_CONFLICT":
     case "HANDOFF_CONFLICT":
+    case "STALE_GENERATION":
+    case "FENCE_REQUIRED":
     case "BOARD_ITEM_LIMIT":
     case "BOARD_EVENT_LIMIT":
       return 409;
@@ -331,21 +366,6 @@ function providerFor(origin: string): OAuthProvider<Env> {
 
 const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
 
-async function spawnDevinSession(env: Env, key: string, prompt: string): Promise<{ session_id?: string; url?: string } | null> {
-  const endpoint = env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL;
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "authorization": `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({ prompt }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as { session_id?: string; url?: string };
-  } catch {
-    return null;
-  }
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = publicOrigin(env.BOARD_PUBLIC_ORIGIN);
@@ -358,7 +378,9 @@ export default {
     ctx.waitUntil(runDispatcher({
       board: boardStub(env),
       ai: env.AI ?? null,
-      startDevin: devinKey ? (prompt) => spawnDevinSession(env, devinKey, prompt) : null,
+      startDevin: devinKey
+        ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
+        : null,
     }));
   },
 } satisfies ExportedHandler<Env>;

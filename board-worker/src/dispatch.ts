@@ -4,9 +4,16 @@
 //      reached, the call fails, or the answer is not confident enough, the work
 //      goes to `hold` and the owner decides (route.ts).
 //   2. Work for `devin` is handed to a new Devin session, which takes it with
-//      board_accept_handoff, does the work and writes the result back. A request
-//      already dispatched within DISPATCH_DEDUPE_MS is skipped so the gap
-//      between spawn and accept cannot fire the same work twice.
+//      board_accept_handoff, does the work and writes the result back. The
+//      start is claimed on the board BEFORE the session is started (one
+//      atomic claim per request, store.ts claimDispatch), so two ticks
+//      racing each other cannot both start it, and a start whose answer is
+//      lost leaves the claim `unknown` — never retried on its own, only
+//      settled by a person (board_resolve_dispatch). A start Devin answered
+//      with a refusal (4xx) started nothing: it is recorded as `refused`,
+//      counts toward the caps, and needs nobody. A request already
+//      dispatched within DISPATCH_DEDUPE_MS is skipped so the gap between
+//      spawn and accept cannot fire the same work twice.
 // Work for any other destination is left for that writer to pick up.
 // The board, Workers AI and the Devin start come in as `DispatchDeps`, so
 // test/route.test.mjs runs this with stand-ins under Node.
@@ -30,7 +37,10 @@ type Result = Record<string, unknown>;
 export interface BoardCalls {
   pendingHandoffs(): Promise<Result>;
   dispatchState(request: string, since: number): Promise<Result>;
-  recordDispatch(request: string, at: number): Promise<Result>;
+  claimDispatch(request: string, at: number, limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number }): Promise<Result>;
+  confirmDispatch(claimId: number, sessionId: string | null): Promise<Result>;
+  markDispatchUnknown(claimId: number): Promise<Result>;
+  refuseDispatch(claimId: number): Promise<Result>;
   run(tool: string, actor: string, args: Record<string, unknown>): Promise<Result>;
   routeUsage(day: string): Promise<Result>;
   recordRouteUse(day: string, neurons: number, fromUsage: boolean): Promise<Result>;
@@ -41,8 +51,38 @@ export interface DispatchDeps {
   /** The Workers AI binding; absent when it is not set up (then work goes to hold). */
   ai?: { run(model: string, input: Record<string, unknown>): Promise<unknown> } | null;
   /** Starts a Devin session; absent when no Devin key is set up. */
-  startDevin?: ((prompt: string) => Promise<{ session_id?: string; url?: string } | null>) | null;
+  startDevin?: ((prompt: string) => Promise<DevinStart>) | null;
   now?: () => number;
+}
+
+/** What one start of a Devin session came to:
+ *   - the session (a 2xx answer);
+ *   - `{ refused: status }`: Devin answered with a 4xx (a wrong or revoked
+ *     key, a malformed request, a rate limit). It said no, so no session was
+ *     started, and nobody has to check the Devin side;
+ *   - `null`: the outcome is unknown (no answer, a 5xx, or a 2xx that cannot
+ *     be read). The session may have been started, so it is never retried
+ *     on its own (store.ts markDispatchUnknown). */
+export type DevinStart = { session_id?: string; url?: string } | { refused: number } | null;
+
+/** Starts a Devin session (POST to the sessions endpoint). `fetchFn` is the
+ * Worker's fetch; the tests pass a stand-in. */
+export async function spawnDevinSession(
+  fetchFn: (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<Response>,
+  endpoint: string, key: string, prompt: string,
+): Promise<DevinStart> {
+  try {
+    const res = await fetchFn(endpoint, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (res.status >= 400 && res.status < 500) return { refused: res.status };
+    if (!res.ok) return null;
+    return (await res.json()) as { session_id?: string; url?: string };
+  } catch {
+    return null;
+  }
 }
 
 export function dispatchPrompt(item: Record<string, unknown>): string {
@@ -54,10 +94,10 @@ export function dispatchPrompt(item: Record<string, unknown>): string {
     ref ? `参照: ${JSON.stringify(plainLine(ref))}` : null,
     "",
     "手順:",
-    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領",
-    "2. タイトルの作業を実行",
-    "3. board_add_event({item_id, kind: 'note', text}) で結果を報告",
-    "4. board_upsert_item({item_id, state: 'done'}) で締める",
+    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領し、返ってきた handoff.generation を控える",
+    "2. タイトルの作業を実行する。長くかかるときは board_heartbeat_handoff({item_id, request_id, generation}) で連絡を続け、進み具合は board_progress_handoff({item_id, request_id, generation, kind: 'note', text}) で報告する",
+    "3. board_complete_handoff({item_id, request_id, generation, outcome: 'done', text}) で結果を報告して締める（終われなければ outcome: 'stopped'）",
+    "STALE_GENERATION や HANDOFF_CONFLICT が返ったら、あなたの実行は差し替えられたか状態が変わっています。それ以上書かず、そのまま終了してください。",
     "受領に失敗したら別の作業には移らず、そのまま終了してください。",
   ].filter((line): line is string => line !== null).join("\n");
 }
@@ -117,18 +157,55 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     const state = await deps.board.dispatchState(request, now - DAY_MS);
     if (state.ok !== true) continue;
     if (typeof state.total_since === "number" && state.total_since >= DISPATCH_MAX_PER_DAY) return;
+    if (state.blocked === true) continue;
     if (typeof state.count === "number" && state.count >= DISPATCH_MAX_PER_REQUEST) continue;
     if (typeof state.at === "number" && now - state.at < DISPATCH_DEDUPE_MS) continue;
-    const session = await deps.startDevin(dispatchPrompt(item));
-    if (session === null) continue;
-    const at = clock();
+    // Claim first, atomically, and only then start anything: a second tick
+    // racing this one loses the claim, and a crash or a lost answer from
+    // here on leaves the claim behind as the record of the attempt.
+    const claim = await deps.board.claimDispatch(request, clock(), {
+      dedupeMs: DISPATCH_DEDUPE_MS, maxPerRequest: DISPATCH_MAX_PER_REQUEST,
+      daySince: now - DAY_MS, maxPerDay: DISPATCH_MAX_PER_DAY,
+    });
+    if (claim.ok !== true || claim.claimed !== true || typeof claim.claim_id !== "number") continue;
     started += 1;
-    await deps.board.recordDispatch(request, at);
+    let session: DevinStart = null;
+    try {
+      session = await deps.startDevin(dispatchPrompt(item));
+    } catch {
+      session = null;
+    }
+    if (session !== null && "refused" in session) {
+      // Devin answered no: nothing was started, so there is nothing for a
+      // person to check. The attempt counts toward the caps (a key that stays
+      // wrong stops at DISPATCH_MAX_PER_REQUEST), and a later tick may try again.
+      await deps.board.refuseDispatch(claim.claim_id);
+      await deps.board.run("board_add_event", DISPATCH_ACTOR, {
+        item_id: item.item_id,
+        kind: "note",
+        text: `dispatch of ${request} to devin was refused (HTTP ${session.refused}): no session was started. A later tick tries again, at most ${DISPATCH_MAX_PER_REQUEST} times per request`,
+      });
+      continue;
+    }
+    if (session === null) {
+      // The start may or may not have happened — its answer never arrived.
+      // Marking the claim unknown is the whole response: no automatic
+      // retry, ever. A person settles it with board_resolve_dispatch.
+      await deps.board.markDispatchUnknown(claim.claim_id);
+      await deps.board.run("board_add_event", DISPATCH_ACTOR, {
+        item_id: item.item_id,
+        kind: "note",
+        text: `dispatch of ${request} to devin is unknown: the start's answer was lost, so it will not be retried automatically. Check the Devin side, then settle it with board_resolve_dispatch`,
+      });
+      continue;
+    }
+    await deps.board.confirmDispatch(claim.claim_id, session.session_id ?? null);
     await deps.board.run("board_add_event", DISPATCH_ACTOR, {
       item_id: item.item_id,
       kind: "note",
       text: `dispatched ${request} to devin session ${session.session_id ?? "unknown"}`,
-      ref: session.url ?? null,
+      // board_add_event takes no null ref; the field is simply left out.
+      ...(typeof session.url === "string" ? { ref: session.url } : {}),
     });
   }
 }

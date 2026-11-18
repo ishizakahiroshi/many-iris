@@ -7,10 +7,16 @@ import {
   nonNegativeInteger, onlyKeys, optionalStr, requiredStr, sameContent, validHttpsUrl,
   validItemId, validLine, validateItem, type Item,
 } from "./rules";
+import {
+  HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
+  checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
+} from "./resume";
 
 export interface Limits {
   items: number;
   events: number;
+  /** Test-only override of the handoff lease (resume.ts HANDOFF_LEASE_MS). */
+  leaseMs?: number;
 }
 export const DEFAULT_LIMITS: Limits = { items: MAX_ITEMS, events: MAX_EVENTS };
 
@@ -110,6 +116,9 @@ export class Store {
   private get sql() {
     return this.storage.sql;
   }
+  private get leaseMs(): number {
+    return this.limits.leaseMs ?? HANDOFF_LEASE_MS;
+  }
 
   init(): void {
     for (const statement of SCHEMA) this.sql.exec(statement);
@@ -134,6 +143,30 @@ export class Store {
     this.addColumn("handoff_by", "TEXT");
     this.addColumn("handoff_to_by", "TEXT");
     this.addColumn("handoff_title", "TEXT");
+    // Safe resumption of an accepted run (resume.ts): a fencing generation that
+    // only grows, and a lease the run keeps alive by heartbeating. The
+    // generation is never cleared, not even when the handoff itself is, so a
+    // token from an earlier run can never match a later one.
+    this.addColumn("handoff_generation", "INTEGER");
+    this.addColumn("handoff_heartbeat_at", "INTEGER");
+    this.addColumn("handoff_lease_until", "INTEGER");
+    // The dispatcher's claim on a start (dispatch.ts): a row is written
+    // BEFORE the session is started, with its outcome as the status —
+    // claimed, started, unknown (the start's answer was lost; never retried
+    // on its own), refused (Devin answered no, so nothing started) or
+    // resolved (a person cleared an unknown claim). Rows
+    // written before claims existed have no status and count as started:
+    // recording used to happen after the start, so that is what they were.
+    this.addDispatchColumn("status", "TEXT");
+    this.addDispatchColumn("session_id", "TEXT");
+  }
+  /** Adds a column to `dispatch_log` when an older board does not have it yet. */
+  private addDispatchColumn(name: string, type: "INTEGER" | "TEXT"): void {
+    try {
+      this.sql.exec(`SELECT ${name} FROM dispatch_log LIMIT 0`);
+    } catch {
+      this.sql.exec(`ALTER TABLE dispatch_log ADD COLUMN ${name} ${type}`);
+    }
   }
   /** Adds a column to `board_items` when an older board does not have it yet. */
   private addColumn(name: string, type: "INTEGER" | "TEXT"): void {
@@ -156,17 +189,131 @@ export class Store {
     return { ok: true, items };
   }
 
-  /** What the dispatcher already did for a request: when it last started a session, how many times, and how many starts happened since `since` in total. */
-  dispatchState(request: string, since: number): Record<string, unknown> {
-    const mine = this.sql.exec("SELECT MAX(at) AS at, COUNT(*) AS n FROM dispatch_log WHERE request_id=?", request).toArray() as Row[];
-    const all = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", since).toArray() as Row[];
-    return { ok: true, at: mine[0]?.at == null ? null : num(mine[0].at), count: num(mine[0]?.n ?? 0), total_since: num(all[0]?.n ?? 0) };
+  /** One dispatch_log row, with the pre-claim rows (status NULL) read as started. */
+  private dispatchRows(request: string): { at: number; status: string }[] {
+    return (this.sql.exec("SELECT at,status FROM dispatch_log WHERE request_id=?", request).toArray() as Row[])
+      .map((r) => ({ at: num(r.at), status: r.status === null ? "started" : str(r.status) }));
   }
 
-  /** Record that a session was started for a request at `at`. */
-  recordDispatch(request: string, at: number): Record<string, unknown> {
-    this.sql.exec("INSERT INTO dispatch_log(request_id,at) VALUES(?,?)", request, at);
-    return { ok: true, changed: true };
+  /** What the dispatcher already did for a request: when a session was last
+   * confirmed started, how many attempts were made, how many rows were
+   * written since `since` in total, and whether a claim is in flight or an
+   * outcome is unknown (either one blocks any new start). */
+  dispatchState(request: string, since: number): Record<string, unknown> {
+    const rows = this.dispatchRows(request);
+    const started = rows.filter((r) => r.status === "started");
+    const all = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", since).toArray() as Row[];
+    return {
+      ok: true,
+      at: started.length ? Math.max(...started.map((r) => r.at)) : null,
+      count: rows.length,
+      total_since: num(all[0]?.n ?? 0),
+      blocked: rows.some((r) => r.status === "claimed" || r.status === "unknown"),
+    };
+  }
+
+  /**
+   * Claims a request for one start, atomically: the check and the insert run
+   * in one transaction inside the Durable Object, so two dispatcher ticks
+   * racing each other cannot both claim the same request. The claim is
+   * written BEFORE anything is started; what happens next is recorded on
+   * the same row (confirmDispatch / markDispatchUnknown). A request with a
+   * claim in flight or an unknown outcome is never claimed again on its
+   * own — an unknown outcome waits for a person (resolveDispatch).
+   */
+  claimDispatch(
+    request: string, at: number,
+    limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number },
+  ): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.dispatchRows(request);
+      if (rows.some((r) => r.status === "claimed" || r.status === "unknown"))
+        return { ok: true, claimed: false, reason: "blocked" };
+      if (rows.length >= limits.maxPerRequest) return { ok: true, claimed: false, reason: "per_request_cap" };
+      const started = rows.filter((r) => r.status === "started");
+      if (started.length && at - Math.max(...started.map((r) => r.at)) < limits.dedupeMs)
+        return { ok: true, claimed: false, reason: "dedupe" };
+      const day = this.sql.exec("SELECT COUNT(*) AS n FROM dispatch_log WHERE at>=?", limits.daySince).toArray() as Row[];
+      if (num(day[0]?.n ?? 0) >= limits.maxPerDay) return { ok: true, claimed: false, reason: "day_cap" };
+      const row = this.sql.exec(
+        "INSERT INTO dispatch_log(request_id,at,status) VALUES(?,?,?) RETURNING seq", request, at, "claimed",
+      ).one() as Row;
+      return { ok: true, claimed: true, claim_id: num(row.seq) };
+    });
+  }
+
+  /** Records the claim's session: the start answered, with its session id. */
+  confirmDispatch(claimId: number, sessionId: string | null): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='started',session_id=? WHERE seq=?", sessionId, claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /** Records that the start's outcome is unknown (the call failed or its
+   * answer was lost after the claim). Nothing retries this on its own; the
+   * claim blocks the dispatcher until a person resolves it. */
+  markDispatchUnknown(claimId: number): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='unknown' WHERE seq=?", claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /** Records that Devin refused the start (it answered with a 4xx), so no
+   * session exists. Unlike an unknown outcome this blocks nothing and needs
+   * no person; the row still counts toward the per-request and day caps. */
+  refuseDispatch(claimId: number): Record<string, unknown> {
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT status FROM dispatch_log WHERE seq=?", claimId).toArray() as Row[];
+      if (!rows.length || rows[0].status !== "claimed") return { ok: true, changed: false };
+      this.sql.exec("UPDATE dispatch_log SET status='refused' WHERE seq=?", claimId);
+      return { ok: true, changed: true };
+    });
+  }
+
+  /**
+   * The `board_resolve_dispatch` tool: a person settles a dispatch whose
+   * outcome was unknown, after looking at the Devin side themselves.
+   * `retry` states that no session is running for the request, so the
+   * dispatcher may claim it again (the settled attempt still counts toward
+   * the per-request cap). `started` states that a session IS running, with
+   * its id: it will take the work itself with board_accept_handoff, and the
+   * dispatcher leaves the request alone. Only an `unknown` row can be
+   * resolved; anything else means there is nothing waiting for a person.
+   */
+  resolveDispatch(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["request_id", "resolution", "session_id"]);
+    const request = requiredStr(obj, "request_id");
+    const resolution = requiredStr(obj, "resolution");
+    if (resolution !== "retry" && resolution !== "started") throw invalid("resolution must be retry or started");
+    const sessionId = optionalStr(obj, "session_id");
+    if (resolution === "started" && (sessionId === null || !validLine(sessionId, 200, false)))
+      throw invalid("session_id is required when the resolution is started");
+    if (resolution === "retry" && sessionId !== null) throw invalid("session_id is only for the started resolution");
+    return this.tx(() => {
+      const rows = this.sql.exec(
+        "SELECT seq FROM dispatch_log WHERE request_id=? AND status='unknown' ORDER BY seq DESC", request,
+      ).toArray() as Row[];
+      if (!rows.length)
+        throw new BoardError("HANDOFF_CONFLICT", "No dispatch of this request is waiting for a person: its outcome is not unknown");
+      const seq = num(rows[0].seq);
+      if (resolution === "retry") this.sql.exec("UPDATE dispatch_log SET status='resolved' WHERE seq=?", seq);
+      else this.sql.exec("UPDATE dispatch_log SET status='started',session_id=? WHERE seq=?", sessionId, seq);
+      const items = this.sql.exec("SELECT item_id FROM board_items WHERE handoff_request=?", request).toArray() as Row[];
+      if (items.length) {
+        this.insertEvent(str(items[0].item_id), Date.now(), actor, "note",
+          resolution === "retry"
+            ? `dispatch of ${request} settled by ${actor}: no session is running, so the dispatcher may start one again`
+            : `dispatch of ${request} settled by ${actor}: session ${sessionId} is running and will take the work itself`, null);
+      }
+      return { ok: true, changed: true, request_id: request, resolution };
+    });
   }
 
   /** The router's use on one UTC day (`YYYY-MM-DD`). */
@@ -207,22 +354,60 @@ export class Store {
     if (state === null) return null;
     const at = r[prefix + "handoff_at"] ?? null;
     const acceptedAt = r[prefix + "handoff_accepted_at"] ?? null;
-    return {
+    const generation = r[prefix + "handoff_generation"] ?? null;
+    const heartbeatAt = r[prefix + "handoff_heartbeat_at"] ?? null;
+    const leaseUntil = r[prefix + "handoff_lease_until"] ?? null;
+    const view: HandoffView = {
       state: str(state), request_id: strOrNull(r[prefix + "handoff_request"] ?? null),
-      requested_at: at === null ? null : num(at),
       accepted_by: strOrNull(r[prefix + "handoff_actor"] ?? null),
+      generation: generation === null ? null : num(generation),
+      lease_until: leaseUntil === null ? null : num(leaseUntil),
+    };
+    return {
+      state: view.state, request_id: view.request_id,
+      requested_at: at === null ? null : num(at),
+      accepted_by: view.accepted_by,
       accepted_at: acceptedAt === null ? null : num(acceptedAt),
       to: strOrNull(r[prefix + "handoff_to"] ?? null),
       requested_by: strOrNull(r[prefix + "handoff_by"] ?? null),
       to_set_by: strOrNull(r[prefix + "handoff_to_by"] ?? null),
       title: strOrNull(r[prefix + "handoff_title"] ?? null),
+      generation: view.generation,
+      heartbeat_at: heartbeatAt === null ? null : num(heartbeatAt),
+      lease_until: view.lease_until,
+      lease_expired: leaseExpired(view, Date.now()),
+      legacy_run: isLegacyRun(view),
     };
   }
   private loadHandoff(id: string): Record<string, unknown> | null {
     const rows = this.sql.exec(
-      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at,handoff_to,handoff_by,handoff_to_by,handoff_title FROM board_items WHERE item_id=?", id,
+      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at,handoff_to,handoff_by,handoff_to_by,handoff_title,handoff_generation,handoff_heartbeat_at,handoff_lease_until FROM board_items WHERE item_id=?", id,
     ).toArray() as Row[];
     return rows.length ? this.handoffOf(rows[0]) : null;
+  }
+  /** The typed view of one item's handoff for the resume.ts decisions. */
+  private handoffView(id: string): HandoffView | null {
+    const h = this.loadHandoff(id);
+    if (h === null) return null;
+    return {
+      state: h.state as string, request_id: h.request_id as string | null,
+      accepted_by: h.accepted_by as string | null,
+      generation: h.generation as number | null, lease_until: h.lease_until as number | null,
+    };
+  }
+  /** The last generation ever used on this item (kept after a handoff ends). */
+  private loadGeneration(id: string): number | null {
+    const rows = this.sql.exec("SELECT handoff_generation FROM board_items WHERE item_id=?", id).toArray() as Row[];
+    if (!rows.length) return null;
+    const g = rows[0].handoff_generation ?? null;
+    return g === null ? null : num(g);
+  }
+  /** Clears a handoff back to the pile. The generation stays, on purpose. */
+  private clearHandoff(itemId: string): void {
+    this.sql.exec(
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL WHERE item_id=?",
+      itemId,
+    );
   }
 
   private loadItem(id: string): Item | null {
@@ -239,13 +424,39 @@ export class Store {
     return this.storage.transactionSync(fn);
   }
 
-  /** Creates or updates one item. `actor` comes from the writer's key. */
-  upsertItem(actor: string, input: unknown): Record<string, unknown> {
+  /** The optional fence a plain write carries (see checkGenericWrite). The
+   * two fields come together or not at all. */
+  private parseFence(obj: Record<string, unknown>): GenericFence {
+    if (!has(obj, "request_id") && !has(obj, "generation")) return null;
+    if (!has(obj, "request_id") || !has(obj, "generation"))
+      throw invalid("request_id and generation must be sent together (the fence of the run writing this)");
+    const request = requiredStr(obj, "request_id");
+    if (!nonNegativeInteger(obj.generation) || (obj.generation as number) < 1)
+      throw invalid("generation must be the positive integer the accept returned (handoff.generation)");
+    return { request_id: request, generation: obj.generation as number };
+  }
+  /** Refuses a plain write that a stale run could hide behind (resume.ts
+   * checkGenericWrite decides; only the run writer's own plain writes to an
+   * item it is running are fenced). Runs inside the write's transaction. */
+  private guardGenericWrite(actor: string, itemId: string, fence: GenericFence): void {
+    const view = this.handoffView(itemId);
+    if (view === null) return;
+    const verdict = checkGenericWrite(view, actor, fence);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+  }
+
+  /** Creates or updates one item. `actor` comes from the writer's key.
+   * `internal` marks the store's own follow-up writes (the accept flipping
+   * the item to in progress), which are part of a fenced operation already
+   * and must not be fenced a second time. */
+  upsertItem(actor: string, input: unknown, internal = false): Record<string, unknown> {
     const obj = asObject(input);
     onlyKeys(obj, [
       "item_id", "project", "kind", "title", "source_ref", "parent_id", "state",
       "waiting_reason", "planned_start", "planned_end", "expected_revision",
+      "request_id", "generation",
     ]);
+    const fence = this.parseFence(obj);
     const itemId = requiredStr(obj, "item_id");
     if (!validItemId(itemId)) throw invalid("item_id must match ^[A-Za-z0-9._:/-]{1,128}$");
     const project = optionalStr(obj, "project");
@@ -265,6 +476,7 @@ export class Store {
     const now = Date.now();
     return this.tx(() => {
       const existing = this.loadItem(itemId);
+      if (!internal && existing !== null) this.guardGenericWrite(actor, itemId, fence);
       const current = existing ? existing.revision : 0;
       if (expected !== null && expected !== current)
         throw new BoardError("REVISION_CONFLICT", `expected_revision ${expected} does not match the current revision ${current}`);
@@ -330,7 +542,8 @@ export class Store {
   /** Appends one event to an existing item. `actor` comes from the writer's key. */
   addEvent(actor: string, input: unknown): Record<string, unknown> {
     const obj = asObject(input);
-    onlyKeys(obj, ["item_id", "kind", "text", "ref"]);
+    onlyKeys(obj, ["item_id", "kind", "text", "ref", "request_id", "generation"]);
+    const fence = this.parseFence(obj);
     const itemId = requiredStr(obj, "item_id");
     const kind = requiredStr(obj, "kind");
     const text = requiredStr(obj, "text");
@@ -341,6 +554,7 @@ export class Store {
     if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
     return this.tx(() => {
       if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+      this.guardGenericWrite(actor, itemId, fence);
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
       return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference } };
@@ -358,9 +572,27 @@ export class Store {
     const itemId = requiredStr(obj, "item_id");
     const request = requiredStr(obj, "request_id");
     const now = Date.now();
+    let again = false;
     this.tx(() => {
       if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
       const handoff = this.loadHandoff(itemId);
+      // Idempotent retry: the same writer asking again for the request it
+      // already took (its first answer may have been lost on the wire) gets
+      // the same handoff back, not a conflict and never a second run.
+      if (handoff !== null && handoff.state === "accepted" && handoff.request_id === request && handoff.accepted_by === actor) {
+        again = true;
+        // A run taken before generations existed has none on record: give
+        // it one now, and a lease, so from here on it is fenced and timed
+        // like any other run. The retrying writer learns both from this
+        // very answer, so nothing is stranded by the upgrade.
+        if (handoff.generation === null) {
+          this.sql.exec(
+            "UPDATE board_items SET handoff_generation=?,handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?",
+            nextGeneration(this.loadGeneration(itemId)), now, now + this.leaseMs, itemId,
+          );
+        }
+        return;
+      }
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request)
         throw new BoardError("HANDOFF_CONFLICT", "This request is not open: it was taken, taken back, or the id is another one");
       // A request with a destination is only for that writer, so another one cannot pick it up by mistake.
@@ -369,16 +601,229 @@ export class Store {
         throw new BoardError("FORBIDDEN", UNTAKEN_TARGETS.has(to)
           ? `This request is on ${to}: nobody takes it until the owner routes it to someone`
           : `This request is for ${to}, not for ${actor}`);
+      // COALESCE: a request made before generations existed has none yet;
+      // the accept is where its run begins, so it gets the first one here.
       this.sql.exec(
-        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=? WHERE item_id=?",
-        actor, now, itemId,
+        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=?,handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?) WHERE item_id=?",
+        actor, now, now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)), itemId,
       );
       this.insertEvent(itemId, now, actor, "note", `accepted ${request}`, null);
     });
-    // The request is this writer's now; the state follows as an ordinary write.
+    if (again) return { ok: true, changed: false, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
+    // The request is this writer's now; the state follows as an internal
+    // write (the accept itself is the fenced operation; see upsertItem).
     const item = this.loadItem(itemId);
-    const written = item !== null && item.state === "planned" ? this.upsertItem(actor, { item_id: itemId, state: "in_progress" }) : { item };
+    const written = item !== null && item.state === "planned" ? this.upsertItem(actor, { item_id: itemId, state: "in_progress" }, true) : { item };
     return { ok: true, changed: true, item: written.item, handoff: this.loadHandoff(itemId) };
+  }
+
+  /** The fencing fields every run-scoped tool sends, checked by resume.ts. */
+  private fenced(obj: Record<string, unknown>): { itemId: string; request: string; generation: number } {
+    const itemId = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    if (!has(obj, "generation") || !nonNegativeInteger(obj.generation) || (obj.generation as number) < 1)
+      throw invalid("generation must be the positive integer the accept returned (handoff.generation)");
+    return { itemId, request, generation: obj.generation as number };
+  }
+  private checkRun(itemId: string, actor: string, request: string, generation: number): HandoffView {
+    if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+    const view = this.handoffView(itemId) ?? { state: null, request_id: null, accepted_by: null, generation: null, lease_until: null };
+    const verdict = checkFence(view, actor, request, generation);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+    return view;
+  }
+
+  /**
+   * The `board_heartbeat_handoff` tool: the run that took a request says it
+   * is still working, and its lease is extended. No event is written (a
+   * heartbeat every few minutes would fill the board); the times are on the
+   * handoff itself. A stale generation is refused, so a replaced run learns
+   * here, at the latest, that it must stop writing.
+   */
+  heartbeatHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id", "generation"]);
+    const { itemId, request, generation } = this.fenced(obj);
+    const now = Date.now();
+    return this.tx(() => {
+      this.checkRun(itemId, actor, request, generation);
+      this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", now, now + this.leaseMs, itemId);
+      return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
+    });
+  }
+
+  /**
+   * The `board_progress_handoff` tool: an event written as the current run.
+   * Same fields as board_add_event, plus the fence. This is the write a cloud
+   * worker uses for progress and results, so a late write from an old run is
+   * refused instead of landing on work somebody else has taken over.
+   */
+  progressHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id", "generation", "kind", "text", "ref"]);
+    const { itemId, request, generation } = this.fenced(obj);
+    const kind = requiredStr(obj, "kind");
+    const text = requiredStr(obj, "text");
+    const reference = optionalStr(obj, "ref");
+    if (!(WRITER_EVENT_KINDS as readonly string[]).includes(kind))
+      throw invalid("kind must be session_start, session_end or note (state_change is recorded by the board)");
+    if (!validLine(text, 2000, true)) throw invalid("text must be 1 to 2000 characters");
+    if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
+    return this.tx(() => {
+      this.checkRun(itemId, actor, request, generation);
+      const at = Date.now();
+      const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
+      this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", at, at + this.leaseMs, itemId);
+      return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference }, handoff: this.loadHandoff(itemId) };
+    });
+  }
+
+  /**
+   * The `board_complete_handoff` tool: the current run finishes the work.
+   * The handoff stays on the item as `completed` (who ran it, which
+   * generation, when) for the record; the work itself is done (or stopped,
+   * when the run reports it could not finish). After completion the item can
+   * be handed over again only as new work on the pile — it is no longer
+   * planned, so in practice a person re-piles it first.
+   */
+  completeHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id", "generation", "outcome", "text"]);
+    const { itemId, request, generation } = this.fenced(obj);
+    const outcome = requiredStr(obj, "outcome");
+    if (outcome !== "done" && outcome !== "stopped") throw invalid("outcome must be done or stopped");
+    const text = optionalStr(obj, "text");
+    if (text !== null && !validLine(text, 2000, true)) throw invalid("text must be 1 to 2000 characters");
+    const now = Date.now();
+    this.tx(() => {
+      this.checkRun(itemId, actor, request, generation);
+      this.sql.exec("UPDATE board_items SET handoff_state='completed',handoff_lease_until=NULL WHERE item_id=?", itemId);
+      this.insertEvent(itemId, now, actor, "note", text ?? `completed ${request} (${outcome})`, null);
+    });
+    const item = this.loadItem(itemId);
+    const written = item !== null && item.state !== outcome ? this.upsertItem(actor, { item_id: itemId, state: outcome }) : { item };
+    return { ok: true, changed: true, item: written.item, handoff: this.loadHandoff(itemId) };
+  }
+
+  /** Marks an accepted run `unknown`. Shared by the tool and the page. */
+  private markUnknown(actor: string, itemId: string, request: string, now: number): void {
+    if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+    const view = this.handoffView(itemId) ?? { state: null, request_id: null, accepted_by: null, generation: null, lease_until: null };
+    if (view.request_id !== request)
+      throw new BoardError("HANDOFF_CONFLICT", "This request is not the current one");
+    const verdict = canMarkUnknown(view, now);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+    this.sql.exec("UPDATE board_items SET handoff_state='unknown' WHERE item_id=?", itemId);
+    this.insertEvent(itemId, now, actor, "note", `marked unknown ${request}: the run's lease expired and its outcome is unconfirmed; nothing restarts it automatically`, null);
+  }
+
+  /**
+   * The `board_mark_handoff_unknown` tool: a writer (for the owner) records
+   * that an accepted run's outcome is unknown — its lease expired and it has
+   * not reported. Nothing is restarted or re-queued by this; the work waits
+   * in `unknown` until a person releases it (stopped confirmed) or resumes
+   * the same run (still working confirmed).
+   */
+  markUnknownForTool(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id"]);
+    const itemId = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    return this.tx(() => {
+      this.markUnknown(actor, itemId, request, Date.now());
+      return { ok: true, changed: true, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
+    });
+  }
+
+  /** Releases `unknown` work back to the pile. Shared by the tool and the page. */
+  private releaseUnknown(actor: string, itemId: string, request: string, now: number): void {
+    if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+    const view = this.handoffView(itemId) ?? { state: null, request_id: null, accepted_by: null, generation: null, lease_until: null };
+    if (view.request_id !== request)
+      throw new BoardError("HANDOFF_CONFLICT", "This request is not the current one");
+    const verdict = canReleaseUnknown(view);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+    this.clearHandoff(itemId);
+    this.insertEvent(itemId, now, actor, "note", `released ${request}: the old run was confirmed stopped, so the work is back on the pile`, null);
+  }
+
+  /** Resumes an `unknown` run as the same run. Shared by the tool and the page. */
+  private resumeUnknown(actor: string, itemId: string, request: string, now: number, byOwner: boolean): void {
+    if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+    const view = this.handoffView(itemId) ?? { state: null, request_id: null, accepted_by: null, generation: null, lease_until: null };
+    if (view.request_id !== request)
+      throw new BoardError("HANDOFF_CONFLICT", "This request is not the current one");
+    const verdict = canResumeUnknown(view);
+    if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+    if (!byOwner && view.accepted_by !== actor)
+      throw new BoardError("FORBIDDEN", `This run was taken by ${view.accepted_by ?? "another writer"}: only that writer, or the owner from the page, can resume it`);
+    // A run taken before generations existed has none: resuming is where it
+    // rejoins the fenced world, so it gets the next generation here and the
+    // caller learns it from the answer. Its plain writes were the only ones
+    // it could make until now; from here on it is fenced like any run.
+    this.sql.exec(
+      "UPDATE board_items SET handoff_state='accepted',handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?) WHERE item_id=?",
+      now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)), itemId,
+    );
+    this.insertEvent(itemId, now, actor, "note", `resumed ${request}: the same run was confirmed still working`, null);
+  }
+
+  /**
+   * The `board_release_handoff` tool, two safe ways back to the pile:
+   *   - the run itself gives the work back (state accepted, fenced by its
+   *     request and generation): it is the one actor that knows it stopped;
+   *   - work in `unknown`, with `stopped_confirmed: true`: the caller states
+   *     a person confirmed the old run has stopped and its outcome was
+   *     checked. Without that confirmation the release is refused — an
+   *     unconfirmed run is never re-queued by a bare call.
+   */
+  releaseHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id", "generation", "stopped_confirmed"]);
+    const itemId = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    const now = Date.now();
+    let backToPile = false;
+    this.tx(() => {
+      const view = this.handoffView(itemId);
+      if (view === null) {
+        if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+        throw new BoardError("HANDOFF_CONFLICT", "This work is not handed over");
+      }
+      if (view.state === "accepted") {
+        const { generation } = this.fenced(obj);
+        const verdict = checkFence(view, actor, request, generation);
+        if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+        this.clearHandoff(itemId);
+        this.insertEvent(itemId, now, actor, "note", `released ${request} by the run itself: the work is back on the pile`, null);
+        backToPile = true;
+      } else if (view.state === "unknown") {
+        if (obj.stopped_confirmed !== true)
+          throw invalid("stopped_confirmed: true is required: a person must confirm the old run has stopped and its outcome was checked");
+        this.releaseUnknown(actor, itemId, request, now);
+        backToPile = true;
+      } else {
+        throw new BoardError("HANDOFF_CONFLICT", "Only a run in progress, or work marked unknown, can be released");
+      }
+    });
+    if (backToPile) {
+      const item = this.loadItem(itemId);
+      if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" });
+    }
+    return { ok: true, changed: true, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
+  }
+
+  /** The `board_resume_handoff` tool: the run that went unknown is confirmed
+   * still working (by itself, reappearing) and continues as the same run. */
+  resumeHandoff(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id"]);
+    const itemId = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    return this.tx(() => {
+      this.resumeUnknown(actor, itemId, request, Date.now(), false);
+      return { ok: true, changed: true, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
+    });
   }
 
   /**
@@ -406,12 +851,13 @@ export class Store {
   private handOver(actor: string, item: Item, day: string | null, to: string | null, newId: (day: string | null, prefix?: string) => string): void {
     if (item.kind !== "task" || item.state !== "planned")
       throw new BoardError("FORBIDDEN", "Only work on the pile (kind task, state planned) can be handed over");
-    if (this.loadHandoff(item.item_id) !== null) throw new BoardError("HANDOFF_CONFLICT", "This work is handed over already");
+    const prior = this.loadHandoff(item.item_id);
+    if (prior !== null && prior.state !== "completed") throw new BoardError("HANDOFF_CONFLICT", "This work is handed over already");
     const request = newId(day, "REQ-");
     const now = Date.now();
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=? WHERE item_id=?",
-      request, now, to, actor, to === null ? null : actor, item.title, item.item_id,
+      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL WHERE item_id=?",
+      request, now, to, actor, to === null ? null : actor, item.title, nextGeneration(this.loadGeneration(item.item_id)), item.item_id,
     );
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
   }
@@ -420,10 +866,7 @@ export class Store {
   private withdraw(actor: string, itemId: string, handoff: Record<string, unknown> | null, now: number): void {
     if (handoff === null || handoff.state !== "requested")
       throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be taken back");
-    this.sql.exec(
-      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL WHERE item_id=?",
-      itemId,
-    );
+    this.clearHandoff(itemId);
     this.insertEvent(itemId, now, actor, "note", `taken back ${String(handoff.request_id)}`, null);
   }
 
@@ -509,6 +952,8 @@ export class Store {
    *   {op:"move", item_id, direction:"up"|"down"}   change the order of the
    *     pile (planned work of one project under one parent). The order is the
    *     owner's: it does not touch an item's revision or `updated_by`.
+   *   {op:"mark_unknown"|"release"|"resume", item_id, request_id}   the
+   *     owner's recovery for a run whose outcome is unknown (see above).
    *   {op:"hand", item_id, day?, to?}   ask for a piece of work on the pile to
    *     be done: it gets a request id and waits for one writer to take it
    *     (`acceptHandoff`); `to` is its destination (HANDOFF_TARGETS, absent or
@@ -521,6 +966,34 @@ export class Store {
   ownerWrite(actor: string, input: unknown, newId: (day: string | null, prefix?: string) => string): Record<string, unknown> {
     const obj = asObject(input);
     const op = requiredStr(obj, "op");
+    // The owner's recovery path from the page, for a run whose outcome is
+    // unknown: {op:"mark_unknown", item_id, request_id} quarantines an
+    // accepted run whose lease expired; then {op:"release", item_id,
+    // request_id} (the owner confirming the old run has stopped) puts the
+    // work back on the pile, or {op:"resume", item_id, request_id} (the
+    // owner confirming it is still working) resumes the same run. Release
+    // also returns the item to planned, as the writer-side release does.
+    if (op === "mark_unknown" || op === "release" || op === "resume") {
+      onlyKeys(obj, ["op", "item_id", "request_id"]);
+      const itemId = requiredStr(obj, "item_id");
+      const request = requiredStr(obj, "request_id");
+      const now = Date.now();
+      let backToPile = false;
+      const result = this.tx(() => {
+        const item = this.loadItem(itemId);
+        if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+        if (op === "mark_unknown") this.markUnknown(actor, itemId, request, now);
+        else if (op === "resume") this.resumeUnknown(actor, itemId, request, now, true);
+        else { this.releaseUnknown(actor, itemId, request, now); backToPile = true; }
+        return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
+      });
+      if (backToPile) {
+        const item = this.loadItem(itemId);
+        if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" });
+        result.item = this.loadItem(itemId);
+      }
+      return result;
+    }
     if (op === "hand" || op === "take_back" || op === "route") {
       onlyKeys(obj, op === "hand" ? ["op", "item_id", "day", "to"] : op === "route" ? ["op", "item_id", "to"] : ["op", "item_id"]);
       const itemId = requiredStr(obj, "item_id");
@@ -590,7 +1063,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, route or take_back");
+    throw invalid("op must be add, attach, move, hand, route, take_back, mark_unknown, release or resume");
   }
 
   /** All items of the project (or of every project), each with its latest
@@ -600,7 +1073,7 @@ export class Store {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
       `SELECT ${itemCols},i.pile_rank AS i_pile_rank,i.handoff_state AS i_handoff_state,i.handoff_request AS i_handoff_request,
-              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,i.handoff_generation AS i_handoff_generation,i.handoff_heartbeat_at AS i_handoff_heartbeat_at,i.handoff_lease_until AS i_handoff_lease_until,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
        WHERE (? IS NULL OR i.project=?) ORDER BY i.project,

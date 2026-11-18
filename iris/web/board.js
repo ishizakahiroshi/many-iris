@@ -13,11 +13,14 @@
     if (item.handoff && item.handoff.state === 'requested' && item.handoff.to === 'hold') return '任せた・保留中';
     if (item.handoff && item.handoff.state === 'requested') return '任せた・まだ受けていない';
     if (item.handoff && item.handoff.state === 'accepted') return '任せた・受けた';
+    if (item.handoff && item.handoff.state === 'unknown') return '任せた・状態不明';
+    if (item.handoff && item.handoff.state === 'completed') return '任せた・終わった';
     return item.state === 'planned' ? '積んである' : '記録だけ';
   };
   const writeErrors = {
     REVISION_CONFLICT: 'ほかの書き込みで変わっていました。読み直してから、もう一度お試しください。',
     HANDOFF_CONFLICT: '任せた状態が変わっていました。読み直してから、もう一度お試しください。',
+    STALE_GENERATION: '古い実行からの書き込みでした。新しい実行が進んでいます。',
     CYCLE: 'その仕事の下にある仕事の下へは入れられません。',
     DEPTH: '段が深くなりすぎます（6 段まで）。',
     PARENT_NOT_FOUND: '入れる先が見つかりません。読み直してください。',
@@ -198,6 +201,33 @@
     row.append(status);
     return row;
   }
+  // Recovery for a run whose outcome is unknown. Nothing here restarts work
+  // on its own: marking unknown only quarantines it, and the work goes back
+  // to the pile only when the owner presses the button that says the old run
+  // was confirmed stopped.
+  function recoveryControl(item) {
+    const row = el('div', 'board-order');
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    const add = (label, op, aria) => {
+      const button = el('button', 'quiet', label);
+      button.type = 'button';
+      button.setAttribute('aria-label', aria);
+      button.addEventListener('click', async () => {
+        const done = await write({ op, item_id: item.item_id, request_id: item.handoff.request_id }, status, button);
+        if (done) load(true);
+      });
+      row.append(button);
+    };
+    if (item.handoff.state === 'accepted' && item.handoff.lease_expired)
+      add('状態不明にする', 'mark_unknown', '「' + short(item.title) + '」の実行を状態不明にする');
+    if (item.handoff.state === 'unknown') {
+      add('停止を確認したので戻す', 'release', '「' + short(item.title) + '」を、担当の停止を確認したうえで積み直す');
+      add('まだ作業中なので続ける', 'resume', '「' + short(item.title) + '」の実行を、まだ作業中と確認して続ける');
+    }
+    row.append(status);
+    return row;
+  }
   function addControl(project, peers) {
     const box = el('div', 'board-add');
     box.append(el('h3', null, '仕事を積む'));
@@ -259,8 +289,14 @@
       box.append(last);
     }
     if (canWrite && item.kind === 'task' && item.state === 'planned') box.append(orderControl(item));
-    if (item.handoff && item.handoff.state === 'accepted')
+    if (item.handoff && item.handoff.state === 'accepted') {
       box.append(el('p', 'board-wait', '受けた担当：' + item.handoff.accepted_by + '（' + when(item.handoff.accepted_at) + '、依頼の番号 ' + item.handoff.request_id + '）'));
+      if (item.handoff.generation) box.append(el('p', 'board-wait', '実行の世代：' + item.handoff.generation + '　最後の連絡：' + when(item.handoff.heartbeat_at) + '　連絡の期限：' + when(item.handoff.lease_until)));
+      if (item.handoff.lease_expired) box.append(el('p', 'board-wait', '連絡の期限を過ぎています。自動では再実行されません。担当の状態を確かめてから「状態不明にする」を押してください。'));
+    }
+    if (item.handoff && item.handoff.state === 'unknown')
+      box.append(el('p', 'board-wait', '状態不明：担当（' + item.handoff.accepted_by + '）の結果が確認できていません。勝手には再実行されません。停止を確認できたら「停止を確認したので戻す」、まだ作業中と確認できたら「まだ作業中なので続ける」を押してください。'));
+    if (canWrite && item.kind === 'task' && item.handoff && (item.handoff.state === 'unknown' || (item.handoff.state === 'accepted' && item.handoff.lease_expired))) box.append(recoveryControl(item));
     if (canWrite && item.kind === 'task' && (item.handoff ? item.handoff.state === 'requested' : item.state === 'planned')) box.append(handControl(item));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;

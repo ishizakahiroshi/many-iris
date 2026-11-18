@@ -114,7 +114,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=14\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=14\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -161,7 +161,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("seven tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff",
+  check("fourteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -507,11 +507,72 @@ async function main() {
   console.log(`(router in this run: ${routedNote?.text ?? "no event"})`);
   check("the cron leaves work with a destination alone", (await handoffOf("pile3"))?.to === "muse");
 
-  check("the same request cannot be accepted twice", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
+  const acceptedAgain = await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: request });
+  check("accepting again as the same writer answers the same handoff, not a second run",
+    acceptedAgain.ok === true && acceptedAgain.changed === false && acceptedAgain.handoff?.state === "accepted" && Number.isInteger(acceptedAgain.handoff?.generation), JSON.stringify(acceptedAgain));
+  check("the same request cannot be accepted by another writer", code(await call(K.muse, "board_accept_handoff", { item_id: piled.item_id, request_id: request })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
   check("the page data carries the hand-off", (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items
     .find((i) => i.item_id === piled.item_id)?.handoff?.state === "accepted");
-  check("a writer still writes after the owner", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })).item?.updated_by === "alpha");
+  const piledGen = acceptedAgain.handoff?.generation;
+  check("the run's own plain write now needs its fence", code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress" })) === "FENCE_REQUIRED");
+  check("the run still writes plainly with its fence", (await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, state: "in_progress", request_id: request, generation: piledGen })).item?.updated_by === "alpha");
+  check("another writer still writes after the owner", (await call(K.muse, "board_add_event", { item_id: piled.item_id, kind: "note", text: "a note from another writer" })).event?.actor === "muse");
+
+  // --- safe resumption: lease, fencing, unknown, release and resume (pile4)
+  await call(K.alpha, "board_take_back_handoff", { item_id: "pile4" });
+  const reHand = await call(K.alpha, "board_request_handoff", { item_id: "pile4", to: "muse" });
+  const reRequest = reHand.handoff?.request_id ?? "";
+  const gen1 = reHand.handoff?.generation;
+  check("a new request gets the next generation", Number.isInteger(gen1) && gen1 >= 1, JSON.stringify(reHand.handoff));
+  const took = await call(K.muse, "board_accept_handoff", { item_id: "pile4", request_id: reRequest });
+  check("accepting starts a lease", took.handoff?.state === "accepted" && took.handoff?.generation === gen1 &&
+    typeof took.handoff?.lease_until === "number" && took.handoff.lease_until > Date.now() && took.handoff?.lease_expired === false, JSON.stringify(took.handoff));
+  check("a heartbeat needs the current generation", code(await call(K.muse, "board_heartbeat_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1 + 9 })) === "STALE_GENERATION");
+  check("a heartbeat from the run extends the lease", (await call(K.muse, "board_heartbeat_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1 })).ok === true);
+  check("progress from another writer is refused", code(await call(K.alpha, "board_progress_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1, kind: "note", text: "not my run" })) === "FORBIDDEN");
+  check("progress from the run is written", (await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1, kind: "note", text: "halfway" })).event?.text === "halfway");
+  check("the run's plain event without its fence is refused", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain, no fence" })) === "FENCE_REQUIRED");
+  check("the run's plain update without its fence is refused", code(await call(K.muse, "board_upsert_item", { item_id: "pile4", title: "plain rename" })) === "FENCE_REQUIRED");
+  check("the run's plain event with a wrong generation is stale", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain, wrong fence", request_id: reRequest, generation: gen1 + 9 })) === "STALE_GENERATION");
+  check("the run's plain event with its fence is written", (await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain, fenced", request_id: reRequest, generation: gen1 })).event?.text === "plain, fenced");
+  check("another writer's plain event needs no fence", (await call(K.alpha, "board_add_event", { item_id: "pile4", kind: "note", text: "from another writer" })).event?.actor === "alpha");
+  check("a run in its lease cannot be marked unknown", code(await call(K.alpha, "board_mark_handoff_unknown", { item_id: "pile4", request_id: reRequest })) === "HANDOFF_CONFLICT");
+  await new Promise((r) => setTimeout(r, 2300));
+  check("the board shows the lease has expired, and changes nothing by itself",
+    (await handoffOf("pile4"))?.lease_expired === true && (await handoffOf("pile4"))?.state === "accepted");
+  check("an expired run can be marked unknown", (await call(K.alpha, "board_mark_handoff_unknown", { item_id: "pile4", request_id: reRequest })).handoff?.state === "unknown");
+  check("an unknown run cannot write progress", code(await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1, kind: "note", text: "still here?" })) === "HANDOFF_CONFLICT");
+  check("an unknown run's plain writes are refused too", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain while unknown", request_id: reRequest, generation: gen1 })) === "HANDOFF_CONFLICT");
+  // pendingHandoffs selects exactly the items whose handoff.state is
+  // "requested"; that state is what is measured here.
+  check("unknown work is not pending for the dispatcher", (await handoffOf("pile4"))?.state === "unknown");
+  check("release without the stopped confirmation is refused", code(await call(K.alpha, "board_release_handoff", { item_id: "pile4", request_id: reRequest })) === "INVALID");
+  check("another writer cannot resume somebody else's run", code(await call(K.alpha, "board_resume_handoff", { item_id: "pile4", request_id: reRequest })) === "FORBIDDEN");
+  check("the run itself resumes as the same run", (await call(K.muse, "board_resume_handoff", { item_id: "pile4", request_id: reRequest })).handoff?.state === "accepted" &&
+    (await handoffOf("pile4"))?.generation === gen1);
+  await new Promise((r) => setTimeout(r, 2300));
+  await call(K.alpha, "board_mark_handoff_unknown", { item_id: "pile4", request_id: reRequest });
+  const released = await call(K.alpha, "board_release_handoff", { item_id: "pile4", request_id: reRequest, stopped_confirmed: true });
+  check("confirmed release puts the work back on the pile", released.handoff === null && released.item?.state === "planned", JSON.stringify(released));
+  const hand2 = await call(K.alpha, "board_request_handoff", { item_id: "pile4", to: "muse" });
+  const request2 = hand2.handoff?.request_id ?? "";
+  check("the next request's generation is higher", hand2.handoff?.generation === gen1 + 1, JSON.stringify(hand2.handoff));
+  await call(K.muse, "board_accept_handoff", { item_id: "pile4", request_id: request2 });
+  check("a write with the old generation is stale", code(await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: request2, generation: gen1, kind: "note", text: "old run" })) === "STALE_GENERATION");
+  check("a plain write with the old generation is stale too", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "old run, plain", request_id: request2, generation: gen1 })) === "STALE_GENERATION");
+  check("a plain write from the old run without a fence is refused", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "old run, no fence" })) === "FENCE_REQUIRED");
+  const completed = await call(K.muse, "board_complete_handoff", { item_id: "pile4", request_id: request2, generation: gen1 + 1, outcome: "done", text: "finished" });
+  check("the current run completes the work", completed.item?.state === "done" && completed.handoff?.state === "completed", JSON.stringify(completed));
+  check("a completed run cannot write again", code(await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: request2, generation: gen1 + 1, kind: "note", text: "late" })) === "HANDOFF_CONFLICT");
+  check("settling a dispatch that is not unknown is refused", code(await call(K.alpha, "board_resolve_dispatch", { request_id: request2, resolution: "retry" })) === "HANDOFF_CONFLICT");
+  check("settling a dispatch needs a known resolution", code(await call(K.alpha, "board_resolve_dispatch", { request_id: request2, resolution: "maybe" })) === "INVALID");
+
+  // --- the owner's recovery from the page (pile3, taken by muse, lease long expired)
+  check("the owner marks an expired run unknown from the page", (await ownerCode({ op: "mark_unknown", item_id: "pile3", request_id: museRequest })) === "200 OK" &&
+    (await handoffOf("pile3"))?.state === "unknown");
+  check("the owner releases it back to the pile from the page", (await ownerCode({ op: "release", item_id: "pile3", request_id: museRequest })) === "200 OK" &&
+    (await handoffOf("pile3")) === null);
 
   // --- the item limit (14 in this run)
   let lastCode = "OK";
