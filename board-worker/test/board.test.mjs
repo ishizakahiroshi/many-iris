@@ -114,7 +114,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=17\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=18\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -161,7 +161,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("fourteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_resolve_dispatch",
+  check("fifteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -431,6 +431,31 @@ async function main() {
   check("a writer cannot write the hand-off fields directly", code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff: { state: "requested" } })) === -32602 &&
     code(await call(K.alpha, "board_upsert_item", { item_id: piled.item_id, handoff_state: null })) === -32602);
 
+  // --- board_request_status: saved, handed over, taken and running are kept apart, and asking writes nothing
+  await call(K.alpha, "board_upsert_item", { item_id: "status1", project: "demo", kind: "task", title: "status case", state: "planned" });
+  let st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("a saved-only item reports not_handed_over, with no request and no taker", st.lifecycle?.stage === "not_handed_over" && st.request_id === null && st.lifecycle?.accepted_by === null, JSON.stringify(st));
+  check("asking for the status of an unknown item is not found", code(await call(K.alpha, "board_request_status", { item_id: "nope" })) === "NOT_FOUND");
+  check("status takes no other argument", code(await call(K.alpha, "board_request_status", { item_id: "status1", extra: 1 })) === -32602);
+  check("no key, no status", (await mcpRaw(null, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_request_status", arguments: { item_id: "status1" } } })).status === 401);
+  const handed = await call(K.alpha, "board_request_handoff", { item_id: "status1", to: "muse" });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("a handed-over item reports requested, not accepted", st.lifecycle?.stage === "requested" && st.request_id === handed.handoff?.request_id && st.lifecycle?.accepted_by === null, JSON.stringify(st));
+  const eventsAfterAsk = (await call(K.alpha, "board_list", { project: "demo" })).events?.length;
+  await call(K.alpha, "board_request_status", { item_id: "status1" });
+  await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("asking for the status writes nothing", (await call(K.alpha, "board_list", { project: "demo" })).events?.length === eventsAfterAsk && (await call(K.alpha, "board_request_status", { item_id: "status1" })).lifecycle?.stage === "requested");
+  const statusRun = await call(K.muse, "board_accept_handoff", { item_id: "status1", request_id: handed.handoff.request_id });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("a taken item reports accepted, with who and when, and no sign of work yet", st.lifecycle?.stage === "accepted" && st.lifecycle?.accepted_by === "muse" && typeof st.lifecycle?.times?.accepted_at === "number", JSON.stringify(st));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await call(K.muse, "board_progress_handoff", { item_id: "status1", request_id: handed.handoff.request_id, generation: statusRun.handoff.generation, kind: "note", text: "working", ref: "https://github.com/example/repo/issues/1" });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("a report after taking it makes it running, and its result link is carried", st.lifecycle?.stage === "running" && st.lifecycle?.result_refs?.[0]?.ref === "https://github.com/example/repo/issues/1", JSON.stringify(st));
+  await call(K.muse, "board_complete_handoff", { item_id: "status1", request_id: handed.handoff.request_id, generation: statusRun.handoff.generation, outcome: "done" });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("a closed run reports completed/done", st.lifecycle?.stage === "completed" && st.lifecycle?.outcome === "done", JSON.stringify(st));
+
   // --- a writer hands work over without the page (board_request_handoff)
   await call(K.alpha, "board_upsert_item", { item_id: "pile2", project: "demo", kind: "task", title: "writer-handed work", state: "planned" });
   check("requesting a hand-off on unknown work is not found", code(await call(K.alpha, "board_request_handoff", { item_id: "nope" })) === "NOT_FOUND");
@@ -603,14 +628,14 @@ async function main() {
   check("taking the continuation back allows another one", (await ownerCode({ op: "take_back", item_id: continuation })) === "200 OK" &&
     (await ownerCode({ op: "continue", item_id: "session/77", to: "vps-claude" })) === "200 OK");
 
-  // --- the item limit (17 in this run)
+  // --- the item limit (18 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 17 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 18 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 17, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 18, String(list.counts.items));
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();

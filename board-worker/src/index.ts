@@ -85,6 +85,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.addEvent(actor, args);
         case "board_list":
           return this.store.listForTool(args);
+        case "board_request_status":
+          return this.store.requestStatus(args);
         case "board_request_handoff":
           return this.store.requestHandoff(actor, args, newBacklogId);
         case "board_accept_handoff":
