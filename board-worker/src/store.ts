@@ -32,6 +32,8 @@ function handoffTarget(obj: Record<string, unknown>): string | null {
     throw invalid(`to must be one of ${HANDOFF_TARGETS.join(", ")} (or null for the board to choose)`);
   return obj.to;
 }
+/** The item of a session on the owner's PC (many-ai-cli's board sync names them so). */
+const SESSION_ITEM = /^session\/\d+(?:\/\d+)?$/;
 const handedText = (request: string, to: string | null) => (to === null ? `handed over ${request}` : `handed over ${request} to ${to}`);
 
 const SCHEMA = [
@@ -961,6 +963,10 @@ export class Store {
    *     destination of a request that nobody has taken yet (a request on
    *     `hold` gets one this way). {op:"take_back", item_id} withdraws a
    *     request that nobody has taken yet.
+   *   {op:"continue", item_id, day?, to?}   hand over the continuation of a
+   *     session that stopped (item_id is its `session/<number>` item): a new
+   *     piece of work "<item_id> の続き" under it, handed over at once. One
+   *     open continuation per session.
    * Titles, states and plans stay with the writers that own them.
    */
   ownerWrite(actor: string, input: unknown, newId: (day: string | null, prefix?: string) => string): Record<string, unknown> {
@@ -1015,6 +1021,37 @@ export class Store {
         return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
       });
     }
+    if (op === "continue") {
+      // {op:"continue", item_id, day?, to?}: a session on the owner's PC
+      // stopped; hand its continuation to an AI. The board puts a piece of
+      // work titled "<session item> の続き" under the session's item and
+      // hands it over at once, exactly as "add" then "hand" would. Takers
+      // read the session item from the title (picker/src/takeover.mjs); the
+      // session's own item stays the session's (its writer keeps writing it).
+      onlyKeys(obj, ["op", "item_id", "day", "to"]);
+      const itemId = requiredStr(obj, "item_id");
+      const day = optionalStr(obj, "day");
+      const to = handoffTarget(obj);
+      const session = this.loadItem(itemId);
+      if (session === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (session.kind !== "task" || !SESSION_ITEM.test(itemId))
+        throw new BoardError("FORBIDDEN", "Only the item of a session (session/<number>) can be continued");
+      const open = num((this.sql.exec(
+        "SELECT COUNT(*) AS n FROM board_items WHERE parent_id=? AND handoff_state IN ('requested','accepted','unknown')", itemId,
+      ).one() as Row).n);
+      if (open > 0) throw new BoardError("HANDOFF_CONFLICT", "A continuation of this session is handed over already");
+      const created = this.upsertItem(actor, {
+        item_id: newId(day), project: session.project, kind: "task", title: `${itemId} の続き`, state: "planned",
+        parent_id: itemId, expected_revision: 0,
+      });
+      const workId = (created.item as Item).item_id;
+      return this.tx(() => {
+        const work = this.loadItem(workId);
+        if (work === null) throw new BoardError("NOT_FOUND", "No such item");
+        this.handOver(actor, work, day, to, newId);
+        return { ok: true, changed: true, item: this.loadItem(workId), handoff: this.loadHandoff(workId) };
+      });
+    }
     if (op === "add") {
       onlyKeys(obj, ["op", "project", "title", "parent_id", "day"]);
       const project = requiredStr(obj, "project");
@@ -1063,7 +1100,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, route, take_back, mark_unknown, release or resume");
+    throw invalid("op must be add, attach, move, hand, continue, route, take_back, mark_unknown, release or resume");
   }
 
   /** All items of the project (or of every project), each with its latest

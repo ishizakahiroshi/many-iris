@@ -201,6 +201,36 @@
     row.append(status);
     return row;
   }
+  // A session on the PC that stopped: hand its continuation to an AI in one
+  // press. The board puts "<session> の続き" under the session and hands it
+  // over; the taker reads the session's progress record and goes on from it.
+  // One open continuation per session, so the button gives way to its state.
+  const sessionItem = /^session\/\d+(?:\/\d+)?$/;
+  function continueControl(item, peers) {
+    const row = el('div', 'board-order');
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    const open = peers.find((p) => p.parent_id === item.item_id && p.handoff && ['requested', 'accepted', 'unknown'].includes(p.handoff.state));
+    if (open) {
+      row.append(el('span', 'board-write-note', '続きを任せています：' + targetLabel(open.handoff.to) + '　依頼の番号：' + open.handoff.request_id));
+      return row;
+    }
+    const select = targetSelect(item, 'vps-claude');
+    select.setAttribute('aria-label', '「' + short(item.title) + '」の続きの行き先');
+    const button = el('button', 'quiet', '続きを任せる');
+    button.type = 'button';
+    button.setAttribute('aria-label', '「' + short(item.title) + '」の続きを、選んだ行き先へ任せる');
+    button.addEventListener('click', async () => {
+      const day = new Date();
+      const local = String(day.getFullYear()) + String(day.getMonth() + 1).padStart(2, '0') + String(day.getDate()).padStart(2, '0');
+      const body = { op: 'continue', item_id: item.item_id, day: local };
+      if (select.value) body.to = select.value;
+      const done = await write(body, status, button);
+      if (done) load(true);
+    });
+    row.append(select, button, status);
+    return row;
+  }
   // Recovery for a run whose outcome is unknown. Nothing here restarts work
   // on its own: marking unknown only quarantines it, and the work goes back
   // to the pile only when the owner presses the button that says the old run
@@ -298,6 +328,7 @@
       box.append(el('p', 'board-wait', '状態不明：担当（' + item.handoff.accepted_by + '）の結果が確認できていません。勝手には再実行されません。停止を確認できたら「停止を確認したので戻す」、まだ作業中と確認できたら「まだ作業中なので続ける」を押してください。'));
     if (canWrite && item.kind === 'task' && item.handoff && (item.handoff.state === 'unknown' || (item.handoff.state === 'accepted' && item.handoff.lease_expired))) box.append(recoveryControl(item));
     if (canWrite && item.kind === 'task' && (item.handoff ? item.handoff.state === 'requested' : item.state === 'planned')) box.append(handControl(item));
+    if (canWrite && item.kind === 'task' && sessionItem.test(item.item_id)) box.append(continueControl(item, peers));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;
   }
