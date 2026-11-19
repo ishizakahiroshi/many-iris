@@ -36,6 +36,7 @@
 //   picker can do before a person looks.
 
 import { BoardRefusal, BoardUnreachable } from "./board-client.mjs";
+import { takeoverRef } from "./takeover.mjs";
 
 /** The board page's writer name: the only hander trusted by default. */
 export const OWNER_ACTOR = "page:owner";
@@ -70,6 +71,28 @@ export function eligible(item, config) {
   return { itemId: item.item_id, project: item.project ?? null, requestId: handoff.request_id, title };
 }
 
+/**
+ * For work that continues a session (see takeover.mjs): the session
+ * item's identity as the board has it — { itemId, project, createdAt,
+ * title } — or { itemId, missing: true } when the board has no such
+ * item or could not be read. Null for ordinary work. The executor
+ * decides what to do with a missing one (it should stop and say so).
+ */
+export async function lookUpTakeover(client, job, listed = []) {
+  const ref = takeoverRef(job);
+  if (ref === null) return null;
+  let found = listed.find((i) => i?.item_id === ref) ?? null;
+  if (found === null) {
+    try {
+      found = (await client.listItems()).find((i) => i?.item_id === ref) ?? null;
+    } catch (error) {
+      if (!(error instanceof BoardUnreachable)) throw error;
+    }
+  }
+  if (found === null || !Number.isFinite(found.created_at)) return { itemId: ref, missing: true };
+  return { itemId: ref, project: found.project ?? null, createdAt: found.created_at, title: truncate(found.title ?? "", 200) };
+}
+
 /** Fence refusals: the board has moved on; this run stops, no retry. */
 export function isFenceRefusal(error) {
   return error instanceof BoardRefusal
@@ -96,6 +119,7 @@ export async function runPass({ client, config, executor, state, log = () => {},
 
   const projects = config.projects.length > 0 ? config.projects : [null];
   let chosen = null;
+  let listed = [];
   for (const project of projects) {
     let items;
     try {
@@ -108,7 +132,10 @@ export async function runPass({ client, config, executor, state, log = () => {},
       throw error;
     }
     chosen = items.map((item) => eligible(item, config)).find((run) => run !== null) ?? null;
-    if (chosen !== null) break;
+    if (chosen !== null) {
+      listed = items;
+      break;
+    }
   }
   if (chosen === null) return { kind: "nothing" };
 
@@ -166,10 +193,10 @@ export async function runPass({ client, config, executor, state, log = () => {},
   let result;
   try {
     await progress(`開始（picker、${config.writer}。任された仕事 ${chosen.requestId} を受けた）`);
-    result = await executor.run(
-      { itemId: chosen.itemId, project: chosen.project, requestId: chosen.requestId, title: chosen.title },
-      { signal: abort.signal, progress },
-    );
+    const job = { itemId: chosen.itemId, project: chosen.project, requestId: chosen.requestId, title: chosen.title };
+    const takeover = await lookUpTakeover(client, job, listed);
+    if (takeover !== null) job.takeover = takeover;
+    result = await executor.run(job, { signal: abort.signal, progress });
   } catch (error) {
     result = { outcome: "stopped", text: `executor failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
