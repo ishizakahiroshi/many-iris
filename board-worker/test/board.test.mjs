@@ -408,9 +408,18 @@ async function main() {
     out.handoff?.accepted_by === null, JSON.stringify(out));
   check("the same work cannot be handed over twice", (await ownerCode({ op: "hand", item_id: piled.item_id })) === "409 HANDOFF_CONFLICT");
   check("a writer sees the request", (await handoffOf(piled.item_id))?.request_id === firstRequest);
+  // Handing over from the page starts a dispatcher pass at once (no cron tick is asked for here).
+  let routedAtOnce = null;
+  for (let i = 0; i < 60 && (routedAtOnce?.to ?? null) === null; i++) {
+    routedAtOnce = await handoffOf(piled.item_id);
+    if ((routedAtOnce?.to ?? null) === null) await new Promise((r) => setTimeout(r, 500));
+  }
+  check("work the owner hands over without a destination is routed right away, without a cron tick",
+    routedAtOnce?.to === "hold" && routedAtOnce?.to_set_by === "dispatcher" && routedAtOnce?.request_id === firstRequest, JSON.stringify(routedAtOnce));
   check("the owner takes the request back", (await ownerCode({ op: "take_back", item_id: piled.item_id })) === "200 OK" && (await handoffOf(piled.item_id)) === null);
   check("a request that was taken back cannot be accepted", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: firstRequest })) === "HANDOFF_CONFLICT");
-  out = await (await ownerPost({ op: "hand", item_id: piled.item_id })).json();
+  // Handed over by a writer this time: the pass after the page's hand would send it to hold before alpha takes it.
+  out = await call(K.alpha, "board_request_handoff", { item_id: piled.item_id });
   const request = out.handoff?.request_id ?? "";
   check("a new request gets a new id", request !== "" && request !== firstRequest);
   check("accepting needs the id of the open request", code(await call(K.alpha, "board_accept_handoff", { item_id: piled.item_id, request_id: firstRequest })) === "HANDOFF_CONFLICT");

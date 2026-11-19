@@ -15,7 +15,7 @@ import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
 import { accessUser, type AccessResult } from "./access";
-import { runDispatcher, spawnDevinSession } from "./dispatch.ts";
+import { runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
@@ -267,8 +267,22 @@ const mcpHandler = {
 };
 
 /** Everything that is not the protected resource or the library's own OAuth endpoints. */
+const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
+
+/** What one dispatcher pass works with (the cron tick, and the pass right after the owner hands work over). */
+function dispatcherDeps(env: Env): DispatchDeps {
+  const devinKey = env.DEVIN_API_KEY;
+  return {
+    board: boardStub(env),
+    ai: env.AI ?? null,
+    startDevin: devinKey
+      ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
+      : null,
+  };
+}
+
 const siteHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -304,6 +318,12 @@ const siteHandler = {
         const error = (result.error ?? {}) as { code?: unknown; detail?: unknown };
         return failure(ownerWriteStatus(error.code), String(error.code ?? "STORAGE"), String(error.detail ?? "Board unavailable"));
       }
+      // Work handed over (or sent back to the board's choice) is looked at
+      // right away instead of at the next cron tick: the same dispatcher
+      // pass, after the answer is on its way. Its claims are atomic, so a
+      // tick running at the same moment cannot start anything twice.
+      const op = (body.value as { op?: unknown } | null)?.op;
+      if (op === "hand" || op === "route" || op === "continue") ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
       return json(200, result);
     }
 
@@ -364,7 +384,6 @@ function providerFor(origin: string): OAuthProvider<Env> {
   return provider;
 }
 
-const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -374,13 +393,6 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const devinKey = env.DEVIN_API_KEY;
-    ctx.waitUntil(runDispatcher({
-      board: boardStub(env),
-      ai: env.AI ?? null,
-      startDevin: devinKey
-        ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
-        : null,
-    }));
+    ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
   },
 } satisfies ExportedHandler<Env>;
