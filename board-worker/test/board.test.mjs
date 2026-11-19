@@ -114,7 +114,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=14\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=17\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -574,14 +574,34 @@ async function main() {
   check("the owner releases it back to the pile from the page", (await ownerCode({ op: "release", item_id: "pile3", request_id: museRequest })) === "200 OK" &&
     (await handoffOf("pile3")) === null);
 
-  // --- the item limit (14 in this run)
+  // --- continuing a session that stopped (op continue)
+  const sessionMade = code(await call(K.alpha, "board_upsert_item", { item_id: "session/77", project: "demo", kind: "task", title: "11-19 claude: stopped work", state: "in_progress" }));
+  check("a writer makes a session's item", sessionMade === "OK", String(sessionMade));
+  r = await ownerPost({ op: "continue", item_id: "session/77", day: dayOf(0), to: "vps-claude" });
+  out = await r.json();
+  check("the owner hands over the continuation of a session", r.status === 200 && out.item?.title === "session/77 の続き" && out.item?.parent_id === "session/77" &&
+    out.item?.project === "demo" && out.item?.kind === "task" && out.handoff?.state === "requested" && out.handoff?.to === "vps-claude", JSON.stringify(out));
+  const continuation = out.item?.item_id ?? "";
+  const continued = await handoffOf(continuation);
+  check("the continuation counts as handed over by the owner (a picker's owner-only gate lets it through)",
+    continued?.requested_by === "page:owner" && continued?.to_set_by === "page:owner" && continued?.title === "session/77 の続き", JSON.stringify(continued));
+  const sessionAfter = (await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === "session/77");
+  check("the session's own item is left as its writer had it", sessionAfter?.state === "in_progress" && sessionAfter?.handoff === null && sessionAfter?.updated_by === "alpha", JSON.stringify(sessionAfter));
+  check("one open continuation per session", (await ownerCode({ op: "continue", item_id: "session/77", to: "vps-claude" })) === "409 HANDOFF_CONFLICT");
+  check("only a session's item can be continued", (await ownerCode({ op: "continue", item_id: "pile3", to: "vps-claude" })) === "403 FORBIDDEN");
+  check("continuing an unknown item is not found", (await ownerCode({ op: "continue", item_id: "session/78" })) === "404 NOT_FOUND");
+  check("the continuation's destination must be on the list", (await ownerCode({ op: "continue", item_id: "session/77", to: "someone" })) === "400 INVALID");
+  check("taking the continuation back allows another one", (await ownerCode({ op: "take_back", item_id: continuation })) === "200 OK" &&
+    (await ownerCode({ op: "continue", item_id: "session/77", to: "vps-claude" })) === "200 OK");
+
+  // --- the item limit (17 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 14 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 17 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 14, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 17, String(list.counts.items));
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
