@@ -60,6 +60,12 @@ export const TOOLS: Json[] = [
     [],
   ),
   tool(
+    "board_request_status",
+    "Read-only: where one request really is. Separates saved on the board (board_upsert_item) from handed over, taken by a writer, running (the run reported in after taking it), silent (lease expired), unknown and completed, with the evidence, what the board cannot confirm, whether it is stalled, result links, and the options a person has. Never starts, retries or re-queues anything, so asking for progress cannot run the work twice. An open GitHub Issue is not evidence of anything here.",
+    { item_id: text("The item to look at") },
+    ["item_id"],
+  ),
+  tool(
     "board_request_handoff",
     "Mark work on the pile (kind task, state planned) as handed over — the writer-side form of the page's \"hand\", so delegating work does not need the owner to open the board. Returns the item with its new handoff.request_id; whoever takes the work sends that id to board_accept_handoff. With `to`, only that writer can take it (owner and hold: nobody, until the owner routes it); without `to`, the board chooses.",
     {

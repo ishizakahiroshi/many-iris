@@ -7,6 +7,7 @@ import {
   nonNegativeInteger, onlyKeys, optionalStr, requiredStr, sameContent, validHttpsUrl,
   validItemId, validLine, validateItem, type Item,
 } from "./rules";
+import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
@@ -923,6 +924,40 @@ export class Store {
       this.withdraw(actor, itemId, handoff, Date.now());
       return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
     });
+  }
+
+  /**
+   * The `board_request_status` tool: where one request really is, read off the
+   * item's handoff, the dispatcher's newest row and the item's linked events
+   * (lifecycle.ts). Read-only: it writes nothing and starts nothing, so asking
+   * for progress can never run the work twice.
+   */
+  requestStatus(input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id"]);
+    const itemId = requiredStr(obj, "item_id");
+    const item = this.loadItem(itemId);
+    if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+    const handoff = this.loadHandoff(itemId) as LifecycleInput["handoff"];
+    let dispatch: LifecycleInput["dispatch"] = null;
+    if (handoff !== null && handoff.request_id !== null) {
+      const rows = this.sql.exec(
+        "SELECT at,status,session_id FROM dispatch_log WHERE request_id=? ORDER BY seq DESC", handoff.request_id,
+      ).toArray() as Row[];
+      if (rows.length)
+        dispatch = {
+          status: rows[0].status === null ? "started" : str(rows[0].status), at: num(rows[0].at),
+          session_id: strOrNull(rows[0].session_id ?? null), attempts: rows.length,
+        };
+    }
+    const refs = (this.sql.exec(
+      "SELECT at,actor,ref FROM board_events WHERE item_id=? AND ref IS NOT NULL ORDER BY seq DESC LIMIT 10", itemId,
+    ).toArray() as Row[]).map((r) => ({ at: num(r.at), actor: str(r.actor), ref: str(r.ref) }));
+    const lifecycle = deriveLifecycle(
+      { item: { item_id: item.item_id, state: item.state, updated_at: item.updated_at, updated_by: item.updated_by }, handoff, dispatch, refs },
+      Date.now(),
+    );
+    return { ok: true, item_id: itemId, request_id: handoff?.request_id ?? null, lifecycle };
   }
 
   /** The `board_list` tool: arguments `project` and `since_seq`. */
