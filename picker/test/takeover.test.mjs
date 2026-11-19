@@ -3,7 +3,7 @@
 //
 //   node test/takeover.test.mjs
 import {
-  continuationBranch, folderMatchesProject, matchRecord, parseRecord, recordExcerpt, takeoverInstructions, takeoverRef,
+  continuationBranch, folderMatchesProject, matchRecord, parseRecord, parseWorkPatch, recordExcerpt, takeoverInstructions, takeoverRef,
 } from "../src/takeover.mjs";
 
 let passed = 0;
@@ -111,6 +111,27 @@ check("a different project does not", !folderMatchesProject("X--src-other", "dem
   check("the record sits between markers as data", /record start -----\n[\s\S]*依頼: 一覧の並び順を直して[\s\S]*\n----- record end/.test(text));
   const fromDefault = takeoverInstructions({ ref: "session/1933", record: r, branch: null });
   check("without a branch the AI is told the PC's changes are not there", fromDefault.includes("never pushed"));
+}
+
+// --- the PC's unpushed work -------------------------------------------
+{
+  const base = "08f2f69bb3ac2da32a97112b28fe7efd3a8d5d71";
+  const diff = "diff --git a/docs/x.md b/docs/x.md\nnew file mode 100644\n--- /dev/null\n+++ b/docs/x.md\n@@ -0,0 +1 @@\n+hello\n";
+  const ok = parseWorkPatch(`base: ${base}\n${diff}`);
+  check("a work patch gives its base and the patch", ok?.base === base && ok?.patch === diff, JSON.stringify(ok));
+  check("CRLF after the base line is accepted", parseWorkPatch(`base: ${base}\r\n${diff}`)?.base === base);
+  check("a short base is refused", parseWorkPatch(`base: 08f2f69b\n${diff}`) === null);
+  check("text without a diff is refused", parseWorkPatch(`base: ${base}\nnot a patch`) === null);
+  check("an empty file is refused", parseWorkPatch("") === null);
+
+  const created = Date.parse("2026-11-19T06:37:35.656Z");
+  const a = { ...parseRecord(recordText()), file: "2026-11/X--src-demo__aaaa1111.md" };
+  const b = { ...parseRecord(recordText({ body: ["- 00:10 区切り: 続き"] })), file: "2026-12/X--src-demo__aaaa1111.md" };
+  const m = matchRecord([a, b], { createdAt: created, project: "demo" });
+  check("the matched record lists its files, newest last", JSON.stringify(m.record?.files) === JSON.stringify([a.file, b.file]), JSON.stringify(m.record?.files));
+
+  const text = takeoverInstructions({ ref: "session/1934", record: parseRecord(recordText()), branch: null, applied: true });
+  check("with the work applied, the AI is told to continue from it", text.includes("already holds the session's unfinished work") && !text.includes("never pushed and are not here"));
 }
 
 console.log(`takeover.test: ${passed} passed, ${failures.length} failed`);
