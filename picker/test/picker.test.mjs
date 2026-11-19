@@ -310,6 +310,34 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- takeover: the executor learns which session it continues --------
+{
+  const session = { item_id: "session/1933", project: "demo", kind: "task", title: "11-19 claude: stopped work", state: "in_progress", created_at: 1795000000000, handoff: null };
+  const board = new FakeBoard([item({}, { title: "session/1933 の続き" }), session]);
+  const executor = new RecordExecutor();
+  const outcome = await runPass({ client: board, config: baseConfig, executor, state: state() });
+  const takeover = executor.jobs[0]?.takeover;
+  check("a takeover round still runs and finishes", outcome.kind === "ran" && outcome.finished === true, JSON.stringify(outcome));
+  check("the executor gets the session item's creation time and project",
+    takeover?.itemId === "session/1933" && takeover?.createdAt === 1795000000000 && takeover?.project === "demo" && takeover?.missing === undefined,
+    JSON.stringify(takeover));
+  check("the session item was found in the list already read (no second list)", board.callsOf("board_list").length === 1);
+}
+{
+  const board = new FakeBoard([item({}, { title: "session/42 の続き" })]);
+  const executor = new RecordExecutor();
+  await runPass({ client: board, config: baseConfig, executor, state: state() });
+  check("a session the board does not have is passed on as missing",
+    executor.jobs[0]?.takeover?.itemId === "session/42" && executor.jobs[0]?.takeover?.missing === true,
+    JSON.stringify(executor.jobs[0]?.takeover));
+}
+{
+  const board = new FakeBoard([item()]);
+  const executor = new RecordExecutor();
+  await runPass({ client: board, config: baseConfig, executor, state: state() });
+  check("ordinary work carries no takeover", executor.jobs[0] !== undefined && !("takeover" in executor.jobs[0]));
+}
+
 console.log(`picker.test: ${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);
 process.exitCode = failures.length === 0 ? 0 : 1;
