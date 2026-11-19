@@ -74,12 +74,17 @@ function parsePlace(text) {
  * Does a transcript folder name (the PC's path with every non-alphanumeric
  * character turned into "-") belong to this board project? The checkout
  * itself ends with "-<project>"; a linked worktree sits under
- * "-worktrees-<project>-<task>".
+ * "-worktrees-<project>-<task>" or, with one grouping folder,
+ * "-worktrees-<group>-<project>-<task>" (the transcript has the real path,
+ * so a worktree reached through a link shows where it really is).
+ * A project whose name ends another project's name can match both; the
+ * start-time match then finds two sessions and stops rather than guess.
  */
 export function folderMatchesProject(folder, project) {
   if (typeof folder !== "string" || typeof project !== "string" || project.length === 0) return false;
   const p = project.replace(/[^A-Za-z0-9]/g, "-");
-  return folder.endsWith(`-${p}`) || folder.includes(`-worktrees-${p}-`);
+  if (folder.endsWith(`-${p}`)) return true;
+  return new RegExp(`(?:^|-)worktrees-(?:[A-Za-z0-9]+-)?${p.replace(/-/g, "\\-")}-`).test(folder);
 }
 
 /**

@@ -56,6 +56,9 @@ check("a path that merely contains session/ is not", takeoverRef({ itemId: "t", 
 // --- folder ↔ project --------------------------------------------------
 check("the checkout folder matches its project", folderMatchesProject("X--src-demo", "demo"));
 check("a linked worktree matches its project", folderMatchesProject("X--src-worktrees-demo-list-order", "demo"));
+check("a worktree under one grouping folder matches its project", folderMatchesProject("F--worktrees-public-demo-list-order", "demo"));
+check("a hyphenated project in a grouped worktree matches", folderMatchesProject("F--worktrees-public-many-demo-trial", "many-demo"));
+check("a grouped worktree of another project does not", !folderMatchesProject("F--worktrees-public-other-trial", "demo"));
 check("another project ending in the same word does not", !folderMatchesProject("X--src-demo-old", "demo"));
 check("a different project does not", !folderMatchesProject("X--src-other", "demo"));
 
