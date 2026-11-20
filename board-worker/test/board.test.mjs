@@ -19,11 +19,12 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key(), muse: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
   { actor: "muse", token_sha256: sha(K.muse), enabled: true },
+  { actor: "vps-claude", token_sha256: sha(K.vps), enabled: true },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -114,7 +115,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=18\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=22\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -519,8 +520,9 @@ async function main() {
   check("an accepted request cannot be routed by a writer", code(await call(K.alpha, "board_route_handoff", { item_id: "pile3", to: "devin" })) === "HANDOFF_CONFLICT");
   check("an accepted request cannot be taken back by a writer", code(await call(K.alpha, "board_take_back_handoff", { item_id: "pile3" })) === "HANDOFF_CONFLICT");
 
-  // --- the cron gives a destination to work handed over without one (Clef, or hold
-  // when the router cannot answer). The test has no Devin key, so nobody is started.
+  // --- the cron gives a destination to work handed over without one (the
+  // owner's order; nobody in it is picking up yet, and the test has no Devin
+  // key, so it is hold). Nobody is started.
   await call(K.alpha, "board_upsert_item", { item_id: "pile4", project: "demo", kind: "task", title: "write the release notes", state: "planned" });
   await call(K.alpha, "board_request_handoff", { item_id: "pile4" });
   check("a writer must name the item to take back", code(await call(K.alpha, "board_take_back_handoff", {})) === -32602);
@@ -628,14 +630,57 @@ async function main() {
   check("taking the continuation back allows another one", (await ownerCode({ op: "take_back", item_id: continuation })) === "200 OK" &&
     (await ownerCode({ op: "continue", item_id: "session/77", to: "vps-claude" })) === "200 OK");
 
-  // --- the item limit (18 in this run)
+  // --- the owner's order for "おまかせ" (op order) and who is picking up
+  const routeOf = async () => (await (await fetch(`${base}/api/board`, { headers: jar })).json()).route;
+  let route = await routeOf();
+  check("the page shows the default order until the owner sets one", route?.order?.join(",") === "vps-claude,local-claude,devin" && route?.set_by_owner === false, JSON.stringify(route));
+  check("the page lists every destination that can be in the order, with tool and place apart",
+    ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot"].every((t) => route?.targets?.some((x) => x.target === t)) &&
+    !route?.targets?.some((x) => x.target === "owner" || x.target === "hold"), JSON.stringify(route?.targets));
+  check("without a Devin key, Devin in the cloud is not picking up", route?.targets?.find((x) => x.target === "devin")?.alive === false);
+  for (const bad of [{ op: "order" }, { op: "order", order: ["owner"] }, { op: "order", order: ["devin", "devin"] }, { op: "order", order: ["someone"] }, { op: "order", order: "devin" }, { op: "order", order: [], extra: 1 }])
+    check(`a bad order is refused: ${JSON.stringify(bad.order)}`, (await ownerCode(bad)) === "400 INVALID");
+  check("the owner sets the order", (await ownerCode({ op: "order", order: ["vps-claude", "devin"] })) === "200 OK");
+  route = await routeOf();
+  check("the page shows the owner's order", route?.order?.join(",") === "vps-claude,devin" && route?.set_by_owner === true && typeof route?.updated_at === "number", JSON.stringify(route));
+  check("a taker that never came is not picking up", route?.targets?.find((x) => x.target === "vps-claude")?.alive === false);
+  await call(K.vps, "board_list", { since_seq: 999999 });
+  route = await routeOf();
+  check("a taker that came to the board is picking up", route?.targets?.find((x) => x.target === "vps-claude")?.alive === true && typeof route?.targets?.find((x) => x.target === "vps-claude")?.seen_at === "number", JSON.stringify(route?.targets));
+  r = await ownerPost({ op: "add", project: "demo", title: "work for the order", day: dayOf(0) });
+  const orderWork = (await r.json()).item?.item_id ?? "";
+  r = await ownerPost({ op: "hand", item_id: orderWork, day: dayOf(0) });
+  const orderRequest = (await r.json()).handoff?.request_id ?? "";
+  let ordered = null;
+  for (let i = 0; i < 60 && (ordered?.to ?? null) === null; i++) {
+    ordered = await handoffOf(orderWork);
+    if ((ordered?.to ?? null) === null) await new Promise((r) => setTimeout(r, 500));
+  }
+  check("おまかせ goes to the first in the owner's order that is picking up, as the owner's choice",
+    ordered?.to === "vps-claude" && ordered?.to_set_by === "page:owner" && ordered?.requested_by === "page:owner", JSON.stringify(ordered));
+  check("the event says it came from the order", (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === orderWork && e.actor === "dispatcher" && e.text === "routed to vps-claude: number 1 in the owner's order"));
+  const vpsTook = await call(K.vps, "board_accept_handoff", { item_id: orderWork, request_id: orderRequest });
+  check("the taker of that destination takes it", vpsTook.handoff?.state === "accepted" && vpsTook.handoff?.accepted_by === "vps-claude", JSON.stringify(vpsTook));
+  check("the owner empties the order", (await ownerCode({ op: "order", order: [] })) === "200 OK" && (await routeOf())?.order?.length === 0);
+  r = await ownerPost({ op: "add", project: "demo", title: "work with an empty order", day: dayOf(0) });
+  const emptyWork = (await r.json()).item?.item_id ?? "";
+  await ownerPost({ op: "hand", item_id: emptyWork, day: dayOf(0) });
+  let held = null;
+  for (let i = 0; i < 60 && (held?.to ?? null) === null; i++) {
+    held = await handoffOf(emptyWork);
+    if ((held?.to ?? null) === null) await new Promise((r) => setTimeout(r, 500));
+  }
+  check("with an empty order, おまかせ goes to hold", held?.to === "hold" && held?.to_set_by === "dispatcher", JSON.stringify(held));
+  check("a writer can name the new destinations", code(await call(K.alpha, "board_route_handoff", { item_id: emptyWork, to: "vps-devin" })) === "OK" && (await handoffOf(emptyWork))?.to === "vps-devin");
+
+  // --- the item limit (22 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 18 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 22 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 18, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 22, String(list.counts.items));
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
