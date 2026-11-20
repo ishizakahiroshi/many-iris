@@ -52,7 +52,7 @@ many-ai-cli リポジトリ内にはありませんでした（`scripts/` は検
 ### many-iris（main 時点）の現行実装
 
 - **board-worker の dispatcher**（`src/dispatch.ts`）: cron で山を見て、
-  行き先なしを Clef-flash で振り分け、`devin` 宛てだけ Devin
+  行き先なしを持ち主の順番で振り分け（2026-11-21 までは Clef-flash）、`devin` 宛てだけ Devin
   セッションを起こす。拾い手は Devin 専用で、看板の内側の仕組み。
 - **Rust 本体 `iris/`**: `src/board.rs` は Rust 版の看板サーバそのもの
   （handoff は無い）。`executor` 系はローカル実行の抽象で、看板の

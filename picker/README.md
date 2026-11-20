@@ -6,7 +6,7 @@ Many Iris の看板（board-worker）で自分宛てに任された仕事を拾�
 
 看板の行き先のうち、`devin` は看板自身の cron dispatcher が、
 `local-claude` は many-ai-cli の Hub（手元 PC）が拾います。この
-picker はそれ以外の行き先（`vps-claude`・`muse`・`grokbot` など、
+picker はそれ以外の行き先（`vps-claude`・`vps-devin`・`muse`・`grokbot` など、
 鍵の担当者名で決まります）を、PC の常時稼働に頼らずに拾うための
 ものです。VPS の cron から数分おきに `--once` を叩く運用を想定
 しています。

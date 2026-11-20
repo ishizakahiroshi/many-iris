@@ -15,7 +15,7 @@ import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
 import { accessUser, type AccessResult } from "./access";
-import { runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
+import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
@@ -48,9 +48,6 @@ export interface Env {
    * A service-user key targets the org-scoped v3 endpoint instead:
    *   https://api.devin.ai/v3/organizations/<org>/sessions */
   DEVIN_SESSIONS_URL?: string;
-  /** Workers AI (wrangler.toml [ai]): the router's Clef-flash calls. Without it,
-   * work handed over without a destination goes to hold. */
-  AI?: { run(model: string, input: Record<string, unknown>): Promise<unknown> };
 }
 
 const MCP_PATH = "/board/mcp";
@@ -77,6 +74,12 @@ export class BoardStore extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => this.store.init());
   }
   async run(tool: string, actor: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    // Every call with a writer's key says that writer is running (the owner's
+    // order passes over takers that stopped coming). A failure here must not
+    // cost the call itself.
+    if (actor !== DISPATCH_ACTOR) {
+      try { this.store.noteSeen(actor, Date.now()); } catch { /* the call goes on */ }
+    }
     return guarded(() => {
       switch (tool) {
         case "board_upsert_item":
@@ -115,7 +118,7 @@ export class BoardStore extends DurableObject<Env> {
     });
   }
   async page(): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.pageData());
+    return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY)));
   }
   /** A write by the signed-in owner from the page (see Store.ownerWrite). */
   async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
@@ -143,14 +146,11 @@ export class BoardStore extends DurableObject<Env> {
   async refuseDispatch(claimId: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.refuseDispatch(claimId));
   }
-  async routeUsage(day: string): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.routeUsage(day));
+  async routeOrder(): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.routeOrder());
   }
-  async recordRouteUse(day: string, neurons: number, fromUsage: boolean): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.recordRouteUse(day, neurons, fromUsage));
-  }
-  async routeHandoff(actor: string, itemId: string, request: string, to: string, text: string): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.routeHandoff(actor, itemId, request, to, text));
+  async routeHandoff(actor: string, itemId: string, request: string, to: string, text: string, toSetBy: string): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.routeHandoff(actor, itemId, request, to, text, toSetBy));
   }
 }
 
@@ -276,7 +276,6 @@ function dispatcherDeps(env: Env): DispatchDeps {
   const devinKey = env.DEVIN_API_KEY;
   return {
     board: boardStub(env),
-    ai: env.AI ?? null,
     startDevin: devinKey
       ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
       : null,
@@ -325,7 +324,7 @@ const siteHandler = {
       // pass, after the answer is on its way. Its claims are atomic, so a
       // tick running at the same moment cannot start anything twice.
       const op = (body.value as { op?: unknown } | null)?.op;
-      if (op === "hand" || op === "route" || op === "continue") ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
+      if (op === "hand" || op === "route" || op === "continue" || op === "order") ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
       return json(200, result);
     }
 

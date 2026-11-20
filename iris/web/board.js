@@ -152,12 +152,23 @@
     row.append(status);
     return row;
   }
-  // Where handed-over work goes (handoff.to). '' = the board chooses.
+  // Where handed-over work goes (handoff.to): a tool and the place it runs.
+  // '' = おまかせ (the board goes down the owner's order).
   const targets = [
-    ['', 'おまかせ'], ['devin', 'Devin'], ['vps-claude', 'VPS の claude -p'], ['local-claude', '手元 PC の claude -p'],
+    ['', 'おまかせ'], ['vps-claude', 'VPS の claude -p'], ['local-claude', '手元 PC の claude -p'],
+    ['devin', 'Devin（クラウド）'], ['vps-devin', 'Devin（VPS）'], ['local-devin', 'Devin（手元 PC）'],
     ['muse', 'Muse'], ['grokbot', 'GrokBot'], ['owner', '自分'], ['hold', '保留'],
   ];
   const targetLabel = (to) => (targets.find(([value]) => value === (to || '')) || [null, to])[1];
+  // Where おまかせ sent a request, read off the dispatcher's event on it.
+  function routedNote(item) {
+    const event = item.last_event;
+    if (!event || event.actor !== 'dispatcher' || typeof event.text !== 'string') return null;
+    const placed = /^routed to ([a-z-]+): number (\d+) in the owner's order/.exec(event.text);
+    if (placed && placed[1] === item.handoff.to) return 'おまかせ → ' + targetLabel(placed[1]) + '（順番の ' + placed[2] + ' 番目）';
+    if (item.handoff.to === 'hold' && /^routed to hold: /.test(event.text)) return 'おまかせ → 保留（順番の相手が、だれも拾っていませんでした）';
+    return null;
+  }
   function targetSelect(item, current) {
     const select = el('select');
     select.setAttribute('aria-label', '「' + short(item.title) + '」の行き先');
@@ -185,7 +196,7 @@
       if (done) load(true);
     });
     if (asked) {
-      row.append(el('span', 'board-write-note', '行き先：' + targetLabel(item.handoff.to) + '　依頼の番号：' + item.handoff.request_id + '（' + when(item.handoff.requested_at) + '）'));
+      row.append(el('span', 'board-write-note', '行き先：' + (routedNote(item) || targetLabel(item.handoff.to)) + '　依頼の番号：' + item.handoff.request_id + '（' + when(item.handoff.requested_at) + '）'));
       // Changing the destination; a request on hold or on the owner waits for this.
       const reroute = el('button', 'quiet', '行き先を変える');
       reroute.type = 'button';
@@ -291,8 +302,81 @@
     box.append(row);
     return box;
   }
+  // The owner's order for おまかせ (the board's own data: the Rust board has
+  // none, and then nothing is shown). One line on top; 変える opens the list,
+  // where each change is saved at once.
+  let routeOpen = false;
+  function routeSection(route) {
+    const host = $('board-route');
+    host.replaceChildren();
+    if (!route || !Array.isArray(route.order) || !Array.isArray(route.targets)) { host.hidden = true; return; }
+    host.hidden = false;
+    const alive = new Map(route.targets.map((t) => [t.target, t.alive === true]));
+    const order = route.order.filter((t) => alive.has(t));
+    const line = el('p', 'board-route-line');
+    line.append(el('strong', null, 'おまかせの順番：'));
+    if (!order.length) line.append(el('span', null, '保留だけ'));
+    order.forEach((t) => {
+      line.append(el('span', null, targetLabel(t)));
+      if (!alive.get(t)) line.append(el('span', 'board-route-off', '（拾い手なし）'));
+      line.append(el('span', null, '→'));
+    });
+    if (order.length) line.append(el('span', null, '保留'));
+    host.append(line);
+    if (!canWrite) return;
+    const box = el('details', 'board-write board-route-edit');
+    box.open = routeOpen;
+    box.addEventListener('toggle', () => { routeOpen = box.open; });
+    box.append(el('summary', null, '変える'));
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    const save = async (next, button) => {
+      const done = await write({ op: 'order', order: next }, status, button);
+      if (done) load(true);
+    };
+    const list = el('ol', 'board-route-list');
+    const rows = [...order, ...route.targets.map((t) => t.target).filter((t) => !order.includes(t))];
+    rows.forEach((t) => {
+      const used = order.includes(t);
+      const at = order.indexOf(t);
+      const li = el('li', 'board-route-row');
+      li.append(el('span', 'board-route-rank', used ? String(at + 1) : '—'));
+      li.append(el('span', 'board-route-name', targetLabel(t)));
+      li.append(el('span', alive.get(t) ? 'badge good' : 'badge off', alive.get(t) ? '拾っています' : '拾い手なし'));
+      const label = el('label');
+      const box2 = el('input');
+      box2.type = 'checkbox';
+      box2.checked = used;
+      box2.setAttribute('aria-label', targetLabel(t) + 'をおまかせで使う');
+      box2.addEventListener('change', () => save(used ? order.filter((x) => x !== t) : [...order, t], box2));
+      label.append(box2, el('span', null, 'おまかせで使う'));
+      li.append(label);
+      if (used) {
+        for (const [shift, text] of [[-1, '上へ'], [1, '下へ']]) {
+          const button = el('button', 'quiet', text);
+          button.type = 'button';
+          button.setAttribute('aria-label', targetLabel(t) + 'を' + text);
+          button.disabled = at + shift < 0 || at + shift >= order.length;
+          button.addEventListener('click', () => {
+            const next = [...order];
+            [next[at], next[at + shift]] = [next[at + shift], next[at]];
+            save(next, button);
+          });
+          li.append(button);
+        }
+      }
+      list.append(li);
+    });
+    const last = el('li', 'board-route-row');
+    last.append(el('span', 'board-route-rank', '末'), el('span', 'board-route-name', '保留（だれも拾っていないとき）'), el('span', 'board-route-off', 'いつも最後です。動かせません'));
+    list.append(last);
+    box.append(el('p', 'board-hint', '上から順に、いま拾っている最初の相手へ渡します。押した時点で保存されます。拾い手なしの相手は、印が付いていても飛ばします。'));
+    box.append(list, status);
+    host.append(box);
+  }
   // Someone is in the middle of typing or choosing: a timed reload would wipe it.
   function editing() {
+    if ($('board-route').querySelector('details[open]')) return true;
     const host = $('board-projects');
     if (host.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return true;
     if (host.querySelector('details.board-write[open]')) return true;
@@ -369,6 +453,7 @@
     $('board-mode').textContent = canWrite ? '積む・付け替えができます' : '読み取り専用';
     $('board-mode-note').textContent = canWrite ? '題名や状態は、書いた担当だけが直せます' : 'この画面から書き込むことはできません';
     $('board-foot').textContent = canWrite ? 'Many Iris / 看板' : 'Many Iris / 看板（読み取り専用）';
+    routeSection(data.route);
     const host = $('board-projects');
     host.replaceChildren();
     if (!items.length) host.append(el('p', 'empty', 'まだ項目がありません。'));

@@ -8,6 +8,7 @@ import {
   validItemId, validLine, validateItem, type Item,
 } from "./rules";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
+import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, parseOrder } from "./route";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
@@ -81,17 +82,33 @@ const SCHEMA = [
     request_id TEXT NOT NULL,
     at INTEGER NOT NULL
   )`,
-  // The router's calls per UTC day and the neurons they are counted as, so the
-  // board stops calling before the free allowance runs out (route.ts).
-  // `counted_calls` is how many of them had no token count in the answer and
-  // were counted from the characters sent instead.
+  // The calls of the Clef-flash router the board used until 2026-11-21 (the
+  // owner's order replaced it). Nothing writes it any more; it stays as the
+  // record of those calls.
   `CREATE TABLE IF NOT EXISTS route_usage(
     day TEXT PRIMARY KEY NOT NULL,
     calls INTEGER NOT NULL,
     neurons REAL NOT NULL,
     counted_calls INTEGER NOT NULL
   )`,
+  // The owner's settings from the page, one JSON value per key. Today one key:
+  // `route_order`, the order "おまかせ" goes down (route.ts).
+  `CREATE TABLE IF NOT EXISTS board_settings(
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+  )`,
+  // When each writer last came to the board (any tool call with its key), so
+  // the owner's order can pass over a taker that is not running (route.ts isAlive).
+  `CREATE TABLE IF NOT EXISTS writer_seen(
+    actor TEXT PRIMARY KEY NOT NULL,
+    at INTEGER NOT NULL
+  )`,
 ];
+
+/** writer_seen is written at most this often per writer, not on every call. */
+const SEEN_EVERY_MS = 30 * 1000;
 
 type Row = Record<string, SqlStorageValue>;
 const str = (v: SqlStorageValue) => v as string;
@@ -182,12 +199,12 @@ export class Store {
   /** Items whose handoff is still waiting to be taken (dispatcher's view). */
   pendingHandoffs(): Record<string, unknown> {
     const rows = this.sql.exec(
-      "SELECT item_id,project,title,source_ref,handoff_request,handoff_at,handoff_to FROM board_items WHERE handoff_state='requested' ORDER BY handoff_at",
+      "SELECT item_id,project,title,source_ref,handoff_request,handoff_at,handoff_to,handoff_by FROM board_items WHERE handoff_state='requested' ORDER BY handoff_at",
     ).toArray() as Row[];
     const items = rows.map((r) => ({
       item_id: str(r.item_id), project: str(r.project), title: str(r.title),
       source_ref: strOrNull(r.source_ref), request_id: strOrNull(r.handoff_request), requested_at: num(r.handoff_at),
-      to: strOrNull(r.handoff_to ?? null),
+      to: strOrNull(r.handoff_to ?? null), requested_by: strOrNull(r.handoff_by ?? null),
     }));
     return { ok: true, items };
   }
@@ -319,34 +336,51 @@ export class Store {
     });
   }
 
-  /** The router's use on one UTC day (`YYYY-MM-DD`). */
-  routeUsage(day: string): Record<string, unknown> {
-    const rows = this.sql.exec("SELECT calls,neurons,counted_calls FROM route_usage WHERE day=?", day).toArray() as Row[];
-    const r = rows[0];
-    return { ok: true, day, calls: r ? num(r.calls) : 0, neurons: r ? num(r.neurons) : 0, counted_calls: r ? num(r.counted_calls) : 0 };
+  /** Notes that a writer came to the board (at most every SEEN_EVERY_MS). */
+  noteSeen(actor: string, now: number): void {
+    this.sql.exec(
+      `INSERT INTO writer_seen(actor,at) VALUES(?,?)
+       ON CONFLICT(actor) DO UPDATE SET at=excluded.at WHERE excluded.at - writer_seen.at >= ?`,
+      actor, now, SEEN_EVERY_MS,
+    );
   }
 
-  /** Adds one router call to the day. `fromUsage` is false when the neurons were counted from the characters sent. */
-  recordRouteUse(day: string, neurons: number, fromUsage: boolean): Record<string, unknown> {
-    this.sql.exec(
-      `INSERT INTO route_usage(day,calls,neurons,counted_calls) VALUES(?,1,?,?)
-       ON CONFLICT(day) DO UPDATE SET calls=calls+1,neurons=neurons+excluded.neurons,counted_calls=counted_calls+excluded.counted_calls`,
-      day, neurons, fromUsage ? 0 : 1,
-    );
-    return this.routeUsage(day);
+  /** The owner's order (or the default until one is set) and when each writer last came. */
+  routeOrder(): Record<string, unknown> {
+    const rows = this.sql.exec("SELECT value,updated_at FROM board_settings WHERE key='route_order'").toArray() as Row[];
+    let order: string[] | null = null;
+    if (rows.length) {
+      try { order = parseOrder(JSON.parse(str(rows[0].value))); } catch { order = null; }
+    }
+    const seen: Record<string, number> = {};
+    for (const r of this.sql.exec("SELECT actor,at FROM writer_seen").toArray() as Row[]) seen[str(r.actor)] = num(r.at);
+    return {
+      ok: true, order: order ?? [...DEFAULT_ORDER], set_by_owner: order !== null,
+      updated_at: rows.length ? num(rows[0].updated_at) : null, seen,
+    };
+  }
+
+  /** The order and, for every destination that can be in it, whether it is picking up now (for the page). */
+  routeView(devinReady: boolean, now: number): Record<string, unknown> {
+    const route = this.routeOrder();
+    const seen = route.seen as Record<string, number>;
+    const targets = ORDERABLE.map((target) => ({
+      target, alive: isAlive(target, seen, now, devinReady), seen_at: target === "devin" ? null : (seen[target] ?? null),
+    }));
+    return { order: route.order, set_by_owner: route.set_by_owner, updated_at: route.updated_at, alive_ms: ALIVE_MS, targets };
   }
 
   /**
    * The router's answer for a request without a destination: sets it, unless the
    * request was taken, taken back or given a destination by the owner meanwhile.
    */
-  routeHandoff(actor: string, itemId: string, request: string, to: string, text: string): Record<string, unknown> {
+  routeHandoff(actor: string, itemId: string, request: string, to: string, text: string, toSetBy: string = actor): Record<string, unknown> {
     if (!(HANDOFF_TARGETS as readonly string[]).includes(to)) throw invalid("unknown destination");
     return this.tx(() => {
       const handoff = this.loadHandoff(itemId);
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request || handoff.to !== null)
         return { ok: true, changed: false, handoff };
-      this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, actor, itemId);
+      this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, toSetBy, itemId);
       this.insertEvent(itemId, Date.now(), actor, "note", text, null);
       return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
     });
@@ -975,8 +1009,9 @@ export class Store {
 
   /** The data of the page. `can_write` tells the page that this board takes
    * the owner's own writes (`ownerWrite`); the Rust board does not send it. */
-  pageData(): Record<string, unknown> {
-    return { ...this.list(null, 0, PAGE_EVENT_LIMIT, true), generated_at: Date.now(), can_write: true };
+  pageData(devinReady = false): Record<string, unknown> {
+    const now = Date.now();
+    return { ...this.list(null, 0, PAGE_EVENT_LIMIT, true), generated_at: now, can_write: true, route: this.routeView(devinReady, now) };
   }
 
   /**
@@ -998,6 +1033,8 @@ export class Store {
    *     destination of a request that nobody has taken yet (a request on
    *     `hold` gets one this way). {op:"take_back", item_id} withdraws a
    *     request that nobody has taken yet.
+   *   {op:"order", order:[...]}   the order "おまかせ" goes down: distinct
+   *     destinations from route.ts ORDERABLE, first first. Left out = not used.
    *   {op:"continue", item_id, day?, to?}   hand over the continuation of a
    *     session that stopped (item_id is its `session/<number>` item): a new
    *     piece of work "<item_id> の続き" under it, handed over at once. One
@@ -1055,6 +1092,17 @@ export class Store {
         }
         return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
       });
+    }
+    if (op === "order") {
+      onlyKeys(obj, ["op", "order"]);
+      const order = parseOrder(obj.order);
+      if (order === null) throw invalid(`order must list distinct destinations from ${ORDERABLE.join(", ")}`);
+      this.sql.exec(
+        `INSERT INTO board_settings(key,value,updated_at,updated_by) VALUES('route_order',?,?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,updated_by=excluded.updated_by`,
+        JSON.stringify(order), Date.now(), actor,
+      );
+      return { ok: true, changed: true, route: this.routeOrder() };
     }
     if (op === "continue") {
       // {op:"continue", item_id, day?, to?}: a session on the owner's PC
@@ -1135,7 +1183,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, continue, route, take_back, mark_unknown, release or resume");
+    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, mark_unknown, release or resume");
   }
 
   /** All items of the project (or of every project), each with its latest
