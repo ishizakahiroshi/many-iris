@@ -22,6 +22,15 @@
   </section>
   <main id="board-main" tabindex="-1" class="board-main">
     <section id="board-route" class="board-route" aria-label="おまかせの順番" hidden></section>
+    <section id="board-find" class="board-find" aria-label="案件で絞る・番号で探す" hidden>
+      <label class="board-find-field"><span>案件</span><select id="board-project"></select></label>
+      <form id="board-search" class="board-find-field" role="search">
+        <label for="board-search-input"><span>番号で探す</span></label>
+        <input id="board-search-input" type="search" placeholder="REQ-… や項目の名前" autocomplete="off" enterkeyhint="search">
+        <button type="submit" class="quiet">探す</button>
+      </form>
+      <p id="board-search-status" class="board-write-status" role="status"></p>
+    </section>
     <div id="board-projects"><p class="empty">看板を読み込んでいます。</p></div>
     <section class="content-section" aria-labelledby="board-events-title">
       <div class="section-heading"><h2 id="board-events-title">最近の出来事</h2><span id="board-event-count" class="count">—</span></div>
