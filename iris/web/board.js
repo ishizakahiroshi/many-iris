@@ -32,6 +32,13 @@
     FORBIDDEN: 'この操作はできません。',
   };
   let loading = false;
+  // The project the page shows ('' = every project), kept on this device, and
+  // the item the last search found (outlined until the next search).
+  const PROJECT_KEY = 'iris-board-project';
+  let shownProject = '';
+  try { shownProject = localStorage.getItem(PROJECT_KEY) || ''; } catch { shownProject = ''; }
+  let foundId = null;
+  let lastData = null;
   // True when the board says it takes the owner's writes from this page.
   let canWrite = false;
 
@@ -384,6 +391,8 @@
   }
   function card(item, peers) {
     const box = el('div', 'board-card');
+    box.dataset.itemId = item.item_id;
+    if (item.item_id === foundId) box.classList.add('found');
     const head = el('div', 'board-card-head');
     head.append(el('p', 'board-title', item.title));
     const badges = el('div', 'board-badges');
@@ -462,7 +471,9 @@
       if (!byProject.has(item.project)) byProject.set(item.project, []);
       byProject.get(item.project).push(item);
     }
+    projectChoices([...byProject.keys()]);
     for (const [project, list] of byProject) {
+      if (shownProject && project !== shownProject) continue;
       const section = el('section', 'board-project');
       const { tree, unlinked, unlinkedCount } = forest(list);
       section.append(el('h2', null, project));
@@ -493,6 +504,41 @@
     $('board-status').textContent = '項目 ' + items.length + ' 件 / 出来事の合計 ' + (data.counts?.events ?? '未確認') + ' 件';
     $('board-observed').textContent = '確認時点：' + when(data.generated_at);
   }
+  // The project list on top: choosing one shows only that project, so its
+  // "仕事を積む" is the first one on the page. A project that is gone falls
+  // back to every project.
+  function projectChoices(projects) {
+    const select = $('board-project');
+    $('board-find').hidden = false;
+    if (shownProject && !projects.includes(shownProject)) shownProject = '';
+    select.replaceChildren(option('', 'すべての案件（' + projects.length + '）'));
+    for (const p of projects) select.append(option(p, p));
+    select.value = shownProject;
+  }
+  function showProject(project) {
+    shownProject = project;
+    try { localStorage.setItem(PROJECT_KEY, project); } catch { /* private mode: not kept */ }
+    if (lastData) render(lastData);
+  }
+  // A request number (REQ-…) or an item's name; an exact match first, then the
+  // first item whose name or title contains the words.
+  function search(query) {
+    const status = $('board-search-status');
+    const q = query.trim();
+    if (!q || !lastData) { status.textContent = ''; return; }
+    const items = Array.isArray(lastData.items) ? lastData.items : [];
+    const lower = q.toLowerCase();
+    const hit = items.find((i) => i.item_id === q || (i.handoff && i.handoff.request_id === q))
+      || items.find((i) => i.item_id.toLowerCase().includes(lower) || String(i.title).toLowerCase().includes(lower));
+    if (!hit) { foundId = null; status.textContent = '「' + short(q) + '」は見つかりませんでした。'; render(lastData); return; }
+    foundId = hit.item_id;
+    status.textContent = '見つかりました：' + hit.project + ' ／ ' + short(hit.title);
+    showProject(hit.project);
+    const target = [...document.querySelectorAll('.board-card')].find((n) => n.dataset.itemId === hit.item_id);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  $('board-project').addEventListener('change', (event) => { foundId = null; $('board-search-status').textContent = ''; showProject(event.target.value); });
+  $('board-search').addEventListener('submit', (event) => { event.preventDefault(); search($('board-search-input').value); });
   // `force` is a reload the person asked for, or one that follows their own write.
   async function load(force) {
     if (loading) return;
@@ -502,7 +548,8 @@
       const response = await fetch('/api/board', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
       if (response.status === 401) { $('board-status').textContent = '本人用キーでの接続が切れています。このページを開き直してください。'; return; }
       if (!response.ok) { $('board-status').textContent = '看板を取得できませんでした。'; return; }
-      render(await response.json());
+      lastData = await response.json();
+      render(lastData);
     } catch {
       $('board-status').textContent = '接続できません。Many Irisが起動しているか確認してください。';
     } finally { loading = false; }
