@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "test": "node test/route.test.mjs && node test/resume.test.mjs && node test/lifecycle.test.mjs && node test/board.test.mjs && node test/dispatch.test.mjs"
+    "test": "node test/route.test.mjs && node test/resume.test.mjs && node test/lifecycle.test.mjs && node test/board.test.mjs && node test/dispatch.test.mjs && node test/watch.test.mjs"
   },
   "devDependencies": {
     "wrangler": "4.158.0"
