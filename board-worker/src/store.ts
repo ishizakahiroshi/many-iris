@@ -1011,7 +1011,25 @@ export class Store {
    * the owner's own writes (`ownerWrite`); the Rust board does not send it. */
   pageData(devinReady = false): Record<string, unknown> {
     const now = Date.now();
-    return { ...this.list(null, 0, PAGE_EVENT_LIMIT, true), generated_at: now, can_write: true, route: this.routeView(devinReady, now) };
+    const data = this.list(null, 0, PAGE_EVENT_LIMIT, true);
+    // A run reports its result as a note and then closes the item, so the
+    // item's last event is the state change and the result is just before
+    // it. For such items the page also gets the newest event that is not a
+    // state change (last_note), to show the result on the card. Writers'
+    // board_list is unchanged.
+    const notes = new Map<string, Record<string, unknown>>();
+    for (const r of this.sql.exec(
+      `SELECT e.seq,e.item_id,e.at,e.actor,e.kind,e.text,e.ref FROM board_events e
+       WHERE e.seq IN (SELECT MAX(seq) FROM board_events WHERE kind<>'state_change' GROUP BY item_id)`,
+    ).toArray() as Row[]) {
+      notes.set(str(r.item_id), { seq: num(r.seq), at: num(r.at), actor: str(r.actor), kind: str(r.kind), text: str(r.text), ref: strOrNull(r.ref) });
+    }
+    const items = (data.items as Record<string, unknown>[]).map((item) => {
+      const last = item.last_event as { kind?: string } | null;
+      const note = notes.get(item.item_id as string);
+      return last && last.kind === "state_change" && note ? { ...item, last_note: note } : item;
+    });
+    return { ...data, items, generated_at: now, can_write: true, route: this.routeView(devinReady, now) };
   }
 
   /**

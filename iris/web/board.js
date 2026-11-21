@@ -408,7 +408,16 @@
     box.append(meta);
     if (item.last_event) {
       const last = el('div', 'board-last');
-      last.append(eventLine(item.last_event, false));
+      // The result a run wrote comes just before it closed the item: show it,
+      // with the state change under it (the Cloudflare board sends last_note).
+      if (item.last_event.kind === 'state_change' && item.last_note) {
+        last.append(eventLine(item.last_note, false));
+        const change = eventLine(item.last_event, false);
+        change.classList.add('board-last-change');
+        last.append(change);
+      } else {
+        last.append(eventLine(item.last_event, false));
+      }
       box.append(last);
     }
     if (canWrite && item.kind === 'task' && item.state === 'planned') box.append(orderControl(item));

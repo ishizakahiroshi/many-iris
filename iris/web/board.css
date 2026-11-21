@@ -16,6 +16,7 @@
 .board-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:.76rem;color:var(--soft);margin-top:6px}
 .board-wait{font-size:.82rem;margin-top:6px;color:var(--warn)}
 .board-last{font-size:.8rem;margin-top:8px;padding-top:7px;border-top:1px dashed var(--line);color:var(--ink)}
+.board-last-change{margin-top:4px;font-size:.74rem;color:var(--soft)}
 .board-last time,.board-event time{display:block;font-size:.71rem;color:var(--soft)}
 .board-events{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:9px}
 .board-event{border-left:2px solid var(--line);padding:2px 0 5px 13px;font-size:.82rem;overflow-wrap:anywhere}
