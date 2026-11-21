@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
+  <title>Many Iris — チャット</title>
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/chat.css">
+  <script src="/chat.js" defer></script>
+</head>
+<body class="chat-page">
+  <div class="chat-app">
+    <aside id="chat-side" class="chat-side" aria-label="会話の一覧">
+      <div class="chat-side-head">
+        <a class="chat-brand" href="/board">Many Iris</a>
+        <button id="chat-side-close" type="button" class="quiet chat-only-narrow" aria-label="一覧を閉じる">×</button>
+      </div>
+      <button id="chat-new" type="button" class="chat-new">＋ 新しいチャット</button>
+      <p class="chat-side-label">最近の会話</p>
+      <ol id="chat-list" class="chat-list"><li class="chat-list-empty">読み込んでいます…</li></ol>
+      <a class="chat-side-foot" href="/board">看板を開く</a>
+    </aside>
+    <div id="chat-scrim" class="chat-scrim" hidden></div>
+    <main id="chat-main" class="chat-main">
+      <header class="chat-top">
+        <button id="chat-side-open" type="button" class="quiet chat-only-narrow" aria-label="会話の一覧を開く">☰</button>
+        <div class="chat-top-text">
+          <p id="chat-title" class="chat-title">新しいチャット</p>
+          <p id="chat-meta" class="chat-meta"></p>
+        </div>
+      </header>
+
+      <section id="chat-start" class="chat-start" aria-labelledby="chat-start-title">
+        <h1 id="chat-start-title">何を頼みますか？</h1>
+        <form id="chat-start-form" class="chat-box">
+          <label class="sr-only" for="chat-start-text">最初のひとこと</label>
+          <textarea id="chat-start-text" rows="3" maxlength="200" placeholder="例：昨日のキオクシアの終値を調べて" enterkeyhint="send"></textarea>
+          <div class="chat-box-row">
+            <label class="chat-pick"><span>案件</span><select id="chat-start-project"></select></label>
+            <label class="chat-pick"><span>相手</span><select id="chat-start-partner"></select></label>
+            <span id="chat-start-count" class="chat-count">0 / 200</span>
+            <button id="chat-start-send" type="submit" class="chat-send" aria-label="送る">↑</button>
+          </div>
+        </form>
+        <p id="chat-start-status" class="chat-status" role="status"></p>
+        <p class="chat-hint">最初のひとことが仕事の題名になり、そのまま相手に任せます（200 字まで）。詳しいことは、続けて書けます。返事は 1〜数分で届きます。</p>
+      </section>
+
+      <section id="chat-talk" class="chat-talk" aria-label="会話" hidden>
+        <div id="chat-log" class="chat-log"></div>
+        <div class="chat-foot">
+          <p id="chat-state" class="chat-state" role="status"></p>
+          <form id="chat-form" class="chat-box">
+            <label class="sr-only" for="chat-text">送る文</label>
+            <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>
+            <div class="chat-box-row">
+              <label class="chat-pick"><span>相手</span><select id="chat-partner"></select></label>
+              <span id="chat-status" class="chat-status" role="status"></span>
+              <button id="chat-send" type="submit" class="chat-send" aria-label="送る">↑</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -709,6 +709,10 @@ async function main() {
     chat.body.messages[1].text.length === 20000 && chat.body.messages[1].ref === "https://github.com/example/repo/pull/1" && chat.body.messages[0].status === "answered", JSON.stringify(chat.body.messages?.map((m) => ({ ...m, text: m.text.length }))));
   const pageChat = (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items.find((i) => i.item_id === orderWork);
   check("the card knows the conversation", pageChat?.chat?.messages === 2 && pageChat?.chat?.open === false, JSON.stringify(pageChat?.chat));
+check("the chat list knows when it last moved", typeof pageChat?.chat?.last_at === "number" && pageChat.chat.last_at > 0, JSON.stringify(pageChat?.chat));
+check("the chat page needs Access", (await fetch(`${base}/chat`)).status === 401);
+const chatPage = await fetch(`${base}/chat`, { headers: jar });
+check("the chat page is served", chatPage.status === 200 && (await chatPage.text()).includes('src="/chat.js"'));
   check("the owner can switch partners", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "Devin でも見て", to: "vps-devin" })) === "200 OK" &&
     (await chatOf(orderWork)).body.open?.to === "vps-devin");
   check("a worker cannot take a turn for the other worker", code(await call(K.vps, "board_chat_take", { item_id: orderWork, seq: (await chatOf(orderWork)).body.open.seq })) === "FORBIDDEN");

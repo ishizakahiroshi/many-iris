@@ -445,12 +445,12 @@ export class Store {
       partner: this.chatPartner(itemId, handoff), targets: [...CHAT_TARGETS], text_max: CHAT_TEXT_MAX,
     };
   }
-  /** Per item: how many messages, and whether a turn waits for an answer (for the cards). */
-  chatSummary(): Map<string, { messages: number; open: boolean }> {
-    const out = new Map<string, { messages: number; open: boolean }>();
+  /** Per item: how many messages, whether a turn waits for an answer, and the newest message's time (cards and the chat list). */
+  chatSummary(): Map<string, { messages: number; open: boolean; last_at: number }> {
+    const out = new Map<string, { messages: number; open: boolean; last_at: number }>();
     for (const r of this.sql.exec(
-      "SELECT item_id,COUNT(*) AS n,SUM(CASE WHEN status IN ('waiting','taken') THEN 1 ELSE 0 END) AS o FROM chat_messages GROUP BY item_id",
-    ).toArray() as Row[]) out.set(str(r.item_id), { messages: num(r.n), open: num(r.o) > 0 });
+      "SELECT item_id,COUNT(*) AS n,SUM(CASE WHEN status IN ('waiting','taken') THEN 1 ELSE 0 END) AS o,MAX(at) AS last_at FROM chat_messages GROUP BY item_id",
+    ).toArray() as Row[]) out.set(str(r.item_id), { messages: num(r.n), open: num(r.o) > 0, last_at: num(r.last_at) });
     return out;
   }
   /** The owner sends a message (from the page only: ownerWrite). One open turn per item. */
