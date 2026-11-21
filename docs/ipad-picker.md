@@ -73,9 +73,10 @@ many-ai-cli リポジトリ内にはありませんでした（`scripts/` は検
 - Issue #1（Handoff 機構の設計提案）: 実装依頼・統合決定では
   ありません。この PR は Issue #1 の Manifest や受領確認には
   踏み込みません。
-- 行き先（`handoff.to`）は固定の 7 値（devin / vps-claude /
-  local-claude / muse / grokbot / owner / hold）です。picker は
-  新しい行き先を作りません。担当者名はこの範囲で選びます。
+- 行き先（`handoff.to`）は固定の 9 値（devin / vps-claude /
+  local-claude / vps-devin / local-devin / muse / grokbot /
+  owner / hold）です。picker は新しい行き先を作りません。
+  担当者名はこの範囲で選びます。
 
 ## 作ったもの／作らなかったもの
 
