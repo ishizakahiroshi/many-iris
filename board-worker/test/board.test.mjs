@@ -600,6 +600,10 @@ async function main() {
   check("a plain write from the old run without a fence is refused", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "old run, no fence" })) === "FENCE_REQUIRED");
   const completed = await call(K.muse, "board_complete_handoff", { item_id: "pile4", request_id: request2, generation: gen1 + 1, outcome: "done", text: "finished" });
   check("the current run completes the work", completed.item?.state === "done" && completed.handoff?.state === "completed", JSON.stringify(completed));
+  const pageAfterDone = (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items.find((i) => i.item_id === "pile4");
+  check("the page shows a closed run's result: the newest note before the state change",
+    pageAfterDone?.last_event?.kind === "state_change" && pageAfterDone?.last_note?.kind === "note" && pageAfterDone.last_note.text.includes("finished"), JSON.stringify({ last: pageAfterDone?.last_event, note: pageAfterDone?.last_note }));
+  check("writers' board_list has no last_note", !("last_note" in ((await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === "pile4") ?? {})));
   check("a completed run cannot write again", code(await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: request2, generation: gen1 + 1, kind: "note", text: "late" })) === "HANDOFF_CONFLICT");
   check("settling a dispatch that is not unknown is refused", code(await call(K.alpha, "board_resolve_dispatch", { request_id: request2, resolution: "retry" })) === "HANDOFF_CONFLICT");
   check("settling a dispatch needs a known resolution", code(await call(K.alpha, "board_resolve_dispatch", { request_id: request2, resolution: "maybe" })) === "INVALID");
