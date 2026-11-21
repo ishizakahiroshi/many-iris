@@ -297,9 +297,12 @@
     const ask = el('button', 'board-ask', '頼む');
     ask.type = 'button';
     ask.setAttribute('aria-label', '積んで、選んだ行き先へそのまま任せる');
+    const talk = el('button', 'quiet', '話して頼む');
+    talk.type = 'button';
+    talk.setAttribute('aria-label', '積んで任せ、そのまま会話を開く');
     const status = el('span', 'board-write-status');
     status.setAttribute('role', 'status');
-    const send = async (andHand) => {
+    const send = async (andHand, andTalk) => {
       const text = title.value.trim();
       if (!text) { status.textContent = '題名を入れてください。'; return; }
       const now = new Date();
@@ -307,23 +310,25 @@
       const day = String(now.getFullYear()) + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0');
       const body = { op: 'add', project, title: text, day };
       if (select.value) body.parent_id = select.value;
-      const added = await write(body, status, andHand ? ask : button);
+      const added = await write(body, status, andTalk ? talk : andHand ? ask : button);
       if (!added) return;
       title.value = '';
       if (andHand) {
         // The work is on the pile now; hand it over as the card's 任せる would.
         const hand = { op: 'hand', item_id: added.item.item_id, day };
         if (to.value) hand.to = to.value;
-        const handed = await write(hand, status, ask);
+        const handed = await write(hand, status, andTalk ? talk : ask);
         if (!handed) status.textContent = '積みましたが、任せられませんでした。カードの「任せる」から、もう一度お試しください。';
+        else if (andTalk) openChat(added.item.item_id);
       }
       load(true);
     };
     button.addEventListener('click', () => send(false));
     ask.addEventListener('click', () => send(true));
+    talk.addEventListener('click', () => send(true, true));
     title.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) send(false); });
     const how = el('div', 'board-write-row');
-    how.append(el('span', 'board-write-note', '行き先'), to, ask, button);
+    how.append(el('span', 'board-write-note', '行き先'), to, ask, talk, button);
     row.append(title, select);
     box.append(row, how, status);
     return box;
@@ -400,6 +405,154 @@
     box.append(list, status);
     host.append(box);
   }
+  // --- 話す: a conversation with the server's AI workers about one piece of
+  // work. Messages go to the board (op chat_send); the worker on the server
+  // takes the turn within a minute, continues from the whole conversation and
+  // answers. The page asks the board again every few seconds while open.
+  const chatTargets = [['vps-claude', 'VPS の claude -p'], ['vps-devin', 'Devin（VPS）']];
+  const isTalker = (who) => chatTargets.some(([t]) => t === who);
+  function canTalk(item) {
+    if (item.kind !== 'task') return false;
+    if (item.chat) return true;
+    const h = item.handoff;
+    return Boolean(h && (isTalker(h.to) || isTalker(h.accepted_by)));
+  }
+  function talkControl(item) {
+    const row = el('div', 'board-order');
+    const button = el('button', 'quiet board-talk', '話す');
+    button.type = 'button';
+    button.setAttribute('aria-label', '「' + short(item.title) + '」について VPS の AI と話す');
+    button.addEventListener('click', () => openChat(item.item_id));
+    row.append(button);
+    if (item.chat) row.append(el('span', 'board-write-note', item.chat.open ? '返事を待っています' : '会話 ' + item.chat.messages + ' 件'));
+    return row;
+  }
+  let chatItem = null;
+  let chatTimer = null;
+  let chatBusy = false;
+  function chatShell() {
+    let host = $('board-chat');
+    if (host) return host;
+    host = el('section', 'board-chat');
+    host.id = 'board-chat';
+    host.setAttribute('aria-label', '会話');
+    host.hidden = true;
+    const head = el('div', 'board-chat-head');
+    const back = el('button', 'quiet', '← 看板へ');
+    back.type = 'button';
+    back.addEventListener('click', closeChat);
+    const title = el('p', 'board-chat-title');
+    title.id = 'board-chat-title';
+    const meta = el('div', 'board-chat-meta');
+    meta.id = 'board-chat-meta';
+    head.append(back, title, meta);
+    const list = el('div', 'board-chat-list');
+    list.id = 'board-chat-list';
+    const state = el('p', 'board-chat-state');
+    state.id = 'board-chat-state';
+    state.setAttribute('role', 'status');
+    const form = el('form', 'board-chat-form');
+    const partner = el('select');
+    partner.id = 'board-chat-partner';
+    partner.setAttribute('aria-label', '話す相手');
+    for (const [value, label] of chatTargets) partner.append(option(value, label));
+    const text = el('textarea');
+    text.id = 'board-chat-text';
+    text.rows = 3;
+    text.maxLength = 20000;
+    text.placeholder = '書いて「送る」（20,000 字まで）';
+    text.setAttribute('aria-label', '送る文');
+    const sendButton = el('button', 'board-ask', '送る');
+    sendButton.type = 'submit';
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    form.append(partner, text, sendButton, status);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const body = text.value.trim();
+      if (!body) { status.textContent = '書いてから送ってください。'; return; }
+      const done = await write({ op: 'chat_send', item_id: chatItem, text: body, to: partner.value }, status, sendButton);
+      if (done) { text.value = ''; status.textContent = ''; showChat(done); }
+    });
+    host.append(head, list, state, form);
+    document.body.append(host);
+    return host;
+  }
+  function bubble(role, who, at, text, ref) {
+    const node = el('div', 'board-msg ' + (role === 'owner' ? 'me' : 'ai'));
+    node.append(el('span', 'who', who + '　' + when(at)));
+    node.append(el('div', 'board-text', text));
+    if (typeof ref === 'string' && ref.startsWith('https://')) node.append(sourceNode(ref));
+    return node;
+  }
+  const talkerLabel = (who) => (chatTargets.find(([t]) => t === who) || [null, who])[1];
+  function showChat(data) {
+    const host = chatShell();
+    $('board-chat-title').textContent = data.item.title;
+    const meta = $('board-chat-meta');
+    meta.replaceChildren(el('span', null, data.item.project + '　/　' + (states[data.item.state] || data.item.state)));
+    const list = $('board-chat-list');
+    const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    list.replaceChildren();
+    const entries = [];
+    if (data.handoff) entries.push({ at: data.handoff.requested_at || 0, role: 'owner', who: 'あなた（任せた仕事）', text: data.handoff.title || data.item.title });
+    for (const n of data.notes || []) {
+      // The picker's own "started" line is bookkeeping, not an answer.
+      if (/^開始（picker/.test(n.text)) continue;
+      entries.push({ at: n.at, role: 'agent', who: talkerLabel(n.actor), text: n.text, ref: n.ref });
+    }
+    for (const m of data.messages || []) entries.push({ at: m.at, role: m.role, who: m.role === 'owner' ? 'あなた → ' + talkerLabel(m.to) : talkerLabel(m.actor), text: m.text, ref: m.ref });
+    entries.sort((a, b) => a.at - b.at);
+    for (const e of entries) list.append(bubble(e.role, e.who, e.at, e.text, e.ref));
+    if (!entries.length) list.append(el('p', 'empty', 'まだやり取りがありません。'));
+    const state = $('board-chat-state');
+    const open = data.open;
+    if (open && open.status === 'waiting') state.textContent = '送りました。' + talkerLabel(open.to) + ' が 1 分以内に拾います。';
+    else if (open && open.status === 'taken') state.textContent = talkerLabel(open.to) + ' が受けました。考えています（' + Math.max(1, Math.round((Date.now() - open.at) / 60000)) + ' 分）。';
+    else if (data.handoff && ['requested', 'accepted'].includes(data.handoff.state)) state.textContent = '任せた仕事を進めています。終わると、ここに結果が出ます。';
+    else state.textContent = '';
+    const partner = $('board-chat-partner');
+    if (document.activeElement !== partner) partner.value = data.partner || 'vps-claude';
+    const busy = Boolean(open);
+    $('board-chat-text').disabled = busy;
+    host.querySelector('.board-chat-form button').disabled = busy;
+    if (busy) $('board-chat-text').placeholder = '返事が来るまで待ってください';
+    else $('board-chat-text').placeholder = '書いて「送る」（20,000 字まで）';
+    host.hidden = false;
+    document.body.classList.add('chat-open');
+    if (nearBottom || !list.dataset.shown) { list.scrollTop = list.scrollHeight; list.dataset.shown = '1'; }
+  }
+  async function refreshChat() {
+    if (!chatItem || chatBusy) return;
+    chatBusy = true;
+    try {
+      const response = await fetch('/api/board/chat?item_id=' + encodeURIComponent(chatItem), { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      if (response.ok) showChat(await response.json());
+      else $('board-chat-state').textContent = response.status === 401 ? 'ログインが切れています。このページを開き直してください。' : '会話を読めませんでした。';
+    } catch {
+      $('board-chat-state').textContent = '接続できません。通信を確かめてください。';
+    } finally { chatBusy = false; }
+  }
+  function openChat(itemId) {
+    chatItem = itemId;
+    const host = chatShell();
+    $('board-chat-list').replaceChildren(el('p', 'empty', '読み込んでいます…'));
+    delete $('board-chat-list').dataset.shown;
+    host.hidden = false;
+    document.body.classList.add('chat-open');
+    refreshChat();
+    clearInterval(chatTimer);
+    chatTimer = setInterval(() => { if (!document.hidden) refreshChat(); }, 8000);
+  }
+  function closeChat() {
+    chatItem = null;
+    clearInterval(chatTimer);
+    chatTimer = null;
+    const host = $('board-chat');
+    if (host) host.hidden = true;
+    document.body.classList.remove('chat-open');
+    load(true);
+  }
   // Someone is in the middle of typing or choosing: a timed reload would wipe it.
   function editing() {
     if ($('board-route').querySelector('details[open]')) return true;
@@ -450,6 +603,7 @@
     if (canWrite && item.kind === 'task' && item.handoff && (item.handoff.state === 'unknown' || (item.handoff.state === 'accepted' && item.handoff.lease_expired))) box.append(recoveryControl(item));
     if (canWrite && item.kind === 'task' && (item.handoff ? item.handoff.state === 'requested' : item.state === 'planned')) box.append(handControl(item));
     if (canWrite && item.kind === 'task' && sessionItem.test(item.item_id)) box.append(continueControl(item, peers));
+    if (canWrite && canTalk(item)) box.append(talkControl(item));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
     return box;
   }

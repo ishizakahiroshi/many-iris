@@ -19,7 +19,7 @@ import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } f
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
-import { validActor } from "./rules";
+import { validActor, validItemId } from "./rules";
 import { DEFAULT_LIMITS, Store, guarded, type Limits } from "./store";
 import { HANDOFF_LEASE_MS } from "./resume";
 
@@ -52,7 +52,8 @@ export interface Env {
 
 const MCP_PATH = "/board/mcp";
 
-const MAX_BODY = 65536;
+// A conversation message may be 20,000 characters (store.ts CHAT_TEXT_MAX).
+const MAX_BODY = 131072;
 
 function limitsFrom(env: Env): Limits {
   const pick = (raw: string | undefined, fallback: number) => {
@@ -112,6 +113,12 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.resumeHandoff(actor, args);
         case "board_resolve_dispatch":
           return this.store.resolveDispatch(actor, args);
+        case "board_chat_pending":
+          return this.store.chatPending(actor);
+        case "board_chat_take":
+          return this.store.chatTake(actor, args);
+        case "board_chat_reply":
+          return this.store.chatReply(actor, args);
         default:
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
@@ -119,6 +126,10 @@ export class BoardStore extends DurableObject<Env> {
   }
   async page(): Promise<Record<string, unknown>> {
     return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY)));
+  }
+  /** One conversation for the page (see Store.chatView). */
+  async chat(itemId: string): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.chatView(itemId));
   }
   /** A write by the signed-in owner from the page (see Store.ownerWrite). */
   async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
@@ -303,6 +314,19 @@ const siteHandler = {
       if (!who.ok) return accessFailure(who);
       const data = await boardStub(env).page();
       return data.ok === false ? failure(503, "STORAGE", "Board unavailable") : json(200, data);
+    }
+
+    if (path === "/api/board/chat" && method === "GET") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      const itemId = url.searchParams.get("item_id") ?? "";
+      if (!validItemId(itemId)) return failure(400, "INVALID", "item_id is required");
+      const data = await boardStub(env).chat(itemId);
+      if (data.ok === false) {
+        const error = (data.error ?? {}) as { code?: unknown; detail?: unknown };
+        return failure(ownerWriteStatus(error.code), String(error.code ?? "STORAGE"), String(error.detail ?? "Board unavailable"));
+      }
+      return json(200, data);
     }
 
     // The owner's own writes from the page. Cloudflare Access proves who it is;

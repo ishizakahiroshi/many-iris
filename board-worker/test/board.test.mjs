@@ -156,13 +156,13 @@ async function main() {
     (await mcpRaw(K.alpha, { jsonrpc: "2.0", id: 1, method: "ping", params: {} }, { origin: "https://evil.example" })).status === 403);
   check("MCP GET is refused", (await fetch(`${base}/board/mcp`, { headers: { authorization: `Bearer ${K.alpha}` } })).status === 405);
   check("MCP needs JSON content", (await mcpRaw(K.alpha, "{}", { "content-type": "text/plain" })).status === 415);
-  check("MCP body over 64 KB is refused", (await mcpRaw(K.alpha, JSON.stringify({ pad: "x".repeat(70000) }))).status === 413);
+  check("MCP body over 128 KB is refused", (await mcpRaw(K.alpha, JSON.stringify({ pad: "x".repeat(140000) }))).status === 413);
   check("broken JSON is refused", (await mcpRaw(K.alpha, "{")).status === 400);
   let res = await rpc(K.alpha, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } });
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("fifteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_resolve_dispatch",
+  check("eighteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_reply,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -676,6 +676,43 @@ async function main() {
   }
   check("with an empty order, おまかせ goes to hold", held?.to === "hold" && held?.to_set_by === "dispatcher", JSON.stringify(held));
   check("a writer can name the new destinations", code(await call(K.alpha, "board_route_handoff", { item_id: emptyWork, to: "vps-devin" })) === "OK" && (await handoffOf(emptyWork))?.to === "vps-devin");
+
+  // --- conversations with the server's workers ("話す")
+  const chatOf = async (id) => { const res = await fetch(`${base}/api/board/chat?item_id=${encodeURIComponent(id)}`, { headers: jar }); return { status: res.status, body: await res.json() }; };
+  check("a conversation needs Access", (await fetch(`${base}/api/board/chat?item_id=${encodeURIComponent(orderWork)}`)).status === 401);
+  let chat = await chatOf(orderWork);
+  check("an item without messages has an empty conversation, partner from the handoff", chat.status === 200 && chat.body.messages?.length === 0 && chat.body.open === null && chat.body.partner === "vps-claude", JSON.stringify(chat.body).slice(0, 300));
+  check("a bad partner is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "hi", to: "devin" })) === "400 INVALID");
+  check("an empty message is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "  " })) === "400 INVALID");
+  check("a message over 20000 characters is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "あ".repeat(20001) })) === "400 INVALID");
+  check("the owner sends a message", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "もう少し短くして" })) === "200 OK");
+  check("one open turn per item", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "まだ?" })) === "409 HANDOFF_CONFLICT");
+  chat = await chatOf(orderWork);
+  const turnSeq = chat.body.open?.seq;
+  check("the page sees the open turn", chat.body.messages?.length === 1 && chat.body.open?.status === "waiting" && chat.body.open?.to === "vps-claude" && typeof turnSeq === "number", JSON.stringify(chat.body.open));
+  check("a writer that is not a server worker has no turns", (await call(K.alpha, "board_chat_pending", {})).turns?.length === 0);
+  check("a writer that is not a server worker cannot take a turn", code(await call(K.alpha, "board_chat_take", { item_id: orderWork, seq: turnSeq })) === "FORBIDDEN");
+  const pending = await call(K.vps, "board_chat_pending", {});
+  check("the worker sees the turn waiting for it", pending.turns?.some((x) => x.item_id === orderWork && x.seq === turnSeq), JSON.stringify(pending));
+  check("a reply before taking the turn is refused", code(await call(K.vps, "board_chat_reply", { item_id: orderWork, seq: turnSeq, text: "x" })) === "HANDOFF_CONFLICT");
+  const taken = await call(K.vps, "board_chat_take", { item_id: orderWork, seq: turnSeq });
+  check("the worker takes the turn and gets the conversation so far", taken.turn?.text === "もう少し短くして" && Array.isArray(taken.transcript) &&
+    taken.transcript.at(-1)?.who === "owner" && taken.item?.item_id === orderWork && taken.handoff?.request_id === orderRequest, JSON.stringify(taken).slice(0, 400));
+  check("taking the same turn again is the same take (a lost answer can be repeated)", (await call(K.vps, "board_chat_take", { item_id: orderWork, seq: turnSeq })).turn?.seq === turnSeq);
+  check("a taken turn is not pending any more", !(await call(K.vps, "board_chat_pending", {})).turns?.some((x) => x.seq === turnSeq));
+  check("a bad ref is refused", code(await call(K.vps, "board_chat_reply", { item_id: orderWork, seq: turnSeq, text: "ok", ref: "http://x" })) === "INVALID");
+  const long = "い".repeat(20000);
+  check("the worker answers, up to 20000 characters", (await call(K.vps, "board_chat_reply", { item_id: orderWork, seq: turnSeq, text: long, ref: "https://github.com/example/repo/pull/1" })).ok === true);
+  check("an answered turn cannot be answered again", code(await call(K.vps, "board_chat_reply", { item_id: orderWork, seq: turnSeq, text: "again" })) === "HANDOFF_CONFLICT");
+  chat = await chatOf(orderWork);
+  check("the page shows the answer and no open turn", chat.body.open === null && chat.body.messages?.length === 2 && chat.body.messages[1].role === "agent" &&
+    chat.body.messages[1].text.length === 20000 && chat.body.messages[1].ref === "https://github.com/example/repo/pull/1" && chat.body.messages[0].status === "answered", JSON.stringify(chat.body.messages?.map((m) => ({ ...m, text: m.text.length }))));
+  const pageChat = (await (await fetch(`${base}/api/board`, { headers: jar })).json()).items.find((i) => i.item_id === orderWork);
+  check("the card knows the conversation", pageChat?.chat?.messages === 2 && pageChat?.chat?.open === false, JSON.stringify(pageChat?.chat));
+  check("the owner can switch partners", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "Devin でも見て", to: "vps-devin" })) === "200 OK" &&
+    (await chatOf(orderWork)).body.open?.to === "vps-devin");
+  check("a worker cannot take a turn for the other worker", code(await call(K.vps, "board_chat_take", { item_id: orderWork, seq: (await chatOf(orderWork)).body.open.seq })) === "FORBIDDEN");
+  check("a conversation of an unknown item is not found", (await chatOf("nope")).status === 404);
 
   // --- the item limit (22 in this run)
   let lastCode = "OK";

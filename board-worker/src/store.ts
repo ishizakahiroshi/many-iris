@@ -107,6 +107,39 @@ const SCHEMA = [
   )`,
 ];
 
+/** Conversations with the server's AI workers ("話す"), kept apart from the
+ * events: a message may be far longer than an event (CHAT_TEXT_MAX), and the
+ * events keep the Rust board's limits. Owner messages are turns waiting for
+ * an answer (status waiting → taken → answered | failed); agent messages
+ * are the answers. Never deleted. */
+const CHAT_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS chat_messages(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES board_items(item_id),
+    at INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','agent')),
+    to_target TEXT,
+    text TEXT NOT NULL,
+    ref TEXT,
+    status TEXT,
+    taken_by TEXT,
+    taken_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS chat_messages_item ON chat_messages(item_id, seq)`,
+  `CREATE INDEX IF NOT EXISTS chat_messages_open ON chat_messages(status, to_target)`,
+];
+/** The longest message in a conversation (characters). */
+export const CHAT_TEXT_MAX = 20000;
+/** Who can be talked to: the server's workers (owner decision 2026-11-21). */
+export const CHAT_TARGETS = ["vps-claude", "vps-devin"] as const;
+/** A turn taken this long ago without an answer may be taken again by the same worker (its run died). */
+export const CHAT_TAKE_MS = 40 * 60 * 1000;
+const MAX_CHAT_MESSAGES = 100000;
+/** What a worker is given as the conversation so far: the newest entries up to this many characters. */
+const CHAT_TRANSCRIPT_CHARS = 120000;
+const isChatTarget = (v: unknown): v is string => typeof v === "string" && (CHAT_TARGETS as readonly string[]).includes(v);
+
 /** writer_seen is written at most this often per writer, not on every call. */
 const SEEN_EVERY_MS = 30 * 1000;
 
@@ -142,6 +175,7 @@ export class Store {
 
   init(): void {
     for (const statement of SCHEMA) this.sql.exec(statement);
+    for (const statement of CHAT_SCHEMA) this.sql.exec(statement);
     // The owner's order of the pile. Added after the first boards were made, so
     // an existing table gets the column here (NULL = not ordered yet). It is not
     // one of the writers' fields: the Rust board does not have it.
@@ -368,6 +402,163 @@ export class Store {
       target, alive: isAlive(target, seen, now, devinReady), seen_at: target === "devin" ? null : (seen[target] ?? null),
     }));
     return { order: route.order, set_by_owner: route.set_by_owner, updated_at: route.updated_at, alive_ms: ALIVE_MS, targets };
+  }
+
+  // --- conversations ("話す") ------------------------------------------
+
+  private chatRows(itemId: string): Record<string, unknown>[] {
+    return (this.sql.exec(
+      "SELECT seq,at,actor,role,to_target,text,ref,status FROM chat_messages WHERE item_id=? ORDER BY seq", itemId,
+    ).toArray() as Row[]).map((r) => ({
+      seq: num(r.seq), at: num(r.at), actor: str(r.actor), role: str(r.role), to: strOrNull(r.to_target ?? null),
+      text: str(r.text), ref: strOrNull(r.ref ?? null), status: strOrNull(r.status ?? null),
+    }));
+  }
+  /** The item's notes written by the server's workers (its runs' progress and results), oldest first. */
+  private workerNotes(itemId: string): Record<string, unknown>[] {
+    return (this.sql.exec(
+      `SELECT seq,at,actor,text,ref FROM board_events WHERE item_id=? AND kind<>'state_change' AND actor IN (${CHAT_TARGETS.map(() => "?").join(",")}) ORDER BY seq`,
+      itemId, ...CHAT_TARGETS,
+    ).toArray() as Row[]).map((r) => ({ seq: num(r.seq), at: num(r.at), actor: str(r.actor), text: str(r.text), ref: strOrNull(r.ref ?? null) }));
+  }
+  /** Who the next message goes to by default: the last one talked to, else the worker the work was handed to. */
+  private chatPartner(itemId: string, handoff: Record<string, unknown> | null): string {
+    const last = this.sql.exec(
+      "SELECT to_target FROM chat_messages WHERE item_id=? AND role='owner' ORDER BY seq DESC LIMIT 1", itemId,
+    ).toArray() as Row[];
+    if (last.length && isChatTarget(last[0].to_target)) return str(last[0].to_target);
+    if (handoff && isChatTarget(handoff.accepted_by)) return handoff.accepted_by as string;
+    if (handoff && isChatTarget(handoff.to)) return handoff.to as string;
+    return CHAT_TARGETS[0];
+  }
+  /** One conversation for the page: the work, what the workers reported, the messages, and the open turn. */
+  chatView(itemId: string): Record<string, unknown> {
+    const item = this.loadItem(itemId);
+    if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+    const handoff = this.loadHandoff(itemId);
+    const messages = this.chatRows(itemId);
+    const open = messages.find((m) => m.role === "owner" && (m.status === "waiting" || m.status === "taken")) ?? null;
+    return {
+      ok: true,
+      item: { item_id: item.item_id, project: item.project, title: item.title, state: item.state, kind: item.kind },
+      handoff, notes: this.workerNotes(itemId), messages, open,
+      partner: this.chatPartner(itemId, handoff), targets: [...CHAT_TARGETS], text_max: CHAT_TEXT_MAX,
+    };
+  }
+  /** Per item: how many messages, and whether a turn waits for an answer (for the cards). */
+  chatSummary(): Map<string, { messages: number; open: boolean }> {
+    const out = new Map<string, { messages: number; open: boolean }>();
+    for (const r of this.sql.exec(
+      "SELECT item_id,COUNT(*) AS n,SUM(CASE WHEN status IN ('waiting','taken') THEN 1 ELSE 0 END) AS o FROM chat_messages GROUP BY item_id",
+    ).toArray() as Row[]) out.set(str(r.item_id), { messages: num(r.n), open: num(r.o) > 0 });
+    return out;
+  }
+  /** The owner sends a message (from the page only: ownerWrite). One open turn per item. */
+  private chatSend(actor: string, obj: Record<string, unknown>): Record<string, unknown> {
+    onlyKeys(obj, ["op", "item_id", "text", "to"]);
+    const itemId = requiredStr(obj, "item_id");
+    const text = requiredStr(obj, "text");
+    if (!validLine(text, CHAT_TEXT_MAX, true)) throw invalid(`text must be 1 to ${CHAT_TEXT_MAX} characters`);
+    const to = has(obj, "to") ? obj.to : null;
+    if (to !== null && !isChatTarget(to)) throw invalid(`to must be one of ${CHAT_TARGETS.join(", ")}`);
+    return this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) has a conversation");
+      const open = num((this.sql.exec(
+        "SELECT COUNT(*) AS n FROM chat_messages WHERE item_id=? AND status IN ('waiting','taken')", itemId,
+      ).one() as Row).n);
+      if (open > 0) throw new BoardError("HANDOFF_CONFLICT", "The last message has not been answered yet");
+      if (num((this.sql.exec("SELECT COUNT(*) AS n FROM chat_messages").one() as Row).n) >= MAX_CHAT_MESSAGES)
+        throw new BoardError("BOARD_EVENT_LIMIT", "The conversations are full");
+      const target = (to as string | null) ?? this.chatPartner(itemId, this.loadHandoff(itemId));
+      this.sql.exec(
+        "INSERT INTO chat_messages(item_id,at,actor,role,to_target,text,status) VALUES(?,?,?,'owner',?,?,'waiting')",
+        itemId, Date.now(), actor, target, text,
+      );
+      return this.chatView(itemId);
+    });
+  }
+  /** The `board_chat_pending` tool: turns waiting for this worker, oldest first (and its own turns whose run died). */
+  chatPending(actor: string): Record<string, unknown> {
+    if (!isChatTarget(actor)) return { ok: true, turns: [] };
+    const stale = Date.now() - CHAT_TAKE_MS;
+    const turns = (this.sql.exec(
+      `SELECT c.seq,c.item_id,c.at,i.project,i.title FROM chat_messages c JOIN board_items i ON i.item_id=c.item_id
+       WHERE c.role='owner' AND c.to_target=? AND (c.status='waiting' OR (c.status='taken' AND c.taken_by=? AND c.taken_at<?))
+       ORDER BY c.seq LIMIT 20`,
+      actor, actor, stale,
+    ).toArray() as Row[]).map((r) => ({ item_id: str(r.item_id), seq: num(r.seq), at: num(r.at), project: str(r.project), title: str(r.title) }));
+    return { ok: true, turns };
+  }
+  /** The `board_chat_take` tool: take one turn (atomically) and get the conversation so far. */
+  chatTake(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "seq"]);
+    const itemId = requiredStr(obj, "item_id");
+    if (!nonNegativeInteger(obj.seq)) throw invalid("seq must be the turn's number");
+    const seq = obj.seq as number;
+    if (!isChatTarget(actor)) throw new BoardError("FORBIDDEN", "Only the server's workers answer conversations");
+    return this.tx(() => {
+      const rows = this.sql.exec(
+        "SELECT role,to_target,status,taken_by,taken_at FROM chat_messages WHERE seq=? AND item_id=?", seq, itemId,
+      ).toArray() as Row[];
+      if (!rows.length || rows[0].role !== "owner") throw new BoardError("NOT_FOUND", "No such turn");
+      const r = rows[0];
+      if (r.to_target !== actor) throw new BoardError("FORBIDDEN", `This turn is for ${String(r.to_target)}, not for ${actor}`);
+      const mine = r.status === "taken" && r.taken_by === actor;
+      if (!(r.status === "waiting" || mine)) throw new BoardError("HANDOFF_CONFLICT", "This turn is not open");
+      const now = Date.now();
+      this.sql.exec("UPDATE chat_messages SET status='taken',taken_by=?,taken_at=? WHERE seq=?", actor, now, seq);
+      const item = this.loadItem(itemId) as Item;
+      const handoff = this.loadHandoff(itemId);
+      // The conversation so far, oldest first: the work as handed over, what
+      // the workers reported on the item, and the messages. The newest
+      // entries are kept when it is longer than CHAT_TRANSCRIPT_CHARS.
+      const entries: { at: number; who: string; actor: string; text: string }[] = [];
+      for (const n of this.workerNotes(itemId)) entries.push({ at: n.at as number, who: "agent", actor: n.actor as string, text: n.text as string });
+      for (const m of this.chatRows(itemId)) entries.push({ at: m.at as number, who: m.role as string, actor: m.actor as string, text: m.text as string });
+      entries.sort((a, b) => a.at - b.at);
+      let total = 0;
+      const kept: typeof entries = [];
+      for (let i = entries.length - 1; i >= 0; i--) {
+        total += entries[i].text.length;
+        if (total > CHAT_TRANSCRIPT_CHARS && kept.length) break;
+        kept.unshift(entries[i]);
+      }
+      return {
+        ok: true,
+        turn: { item_id: itemId, seq, text: (this.sql.exec("SELECT text FROM chat_messages WHERE seq=?", seq).one() as Row).text },
+        item: { item_id: item.item_id, project: item.project, title: item.title, source_ref: item.source_ref },
+        handoff: handoff === null ? null : { request_id: handoff.request_id, title: handoff.title, accepted_by: handoff.accepted_by },
+        transcript: kept, transcript_truncated: kept.length < entries.length,
+      };
+    });
+  }
+  /** The `board_chat_reply` tool: answer the turn this worker took. */
+  chatReply(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "seq", "text", "ref", "failed"]);
+    const itemId = requiredStr(obj, "item_id");
+    if (!nonNegativeInteger(obj.seq)) throw invalid("seq must be the turn's number");
+    const seq = obj.seq as number;
+    const text = requiredStr(obj, "text");
+    if (!validLine(text, CHAT_TEXT_MAX, true)) throw invalid(`text must be 1 to ${CHAT_TEXT_MAX} characters`);
+    const ref = optionalStr(obj, "ref");
+    if (ref !== null && !validHttpsUrl(ref)) throw invalid("ref must be an https URL");
+    if (has(obj, "failed") && typeof obj.failed !== "boolean") throw invalid("failed must be true or false");
+    const failed = obj.failed === true;
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT role,status,taken_by FROM chat_messages WHERE seq=? AND item_id=?", seq, itemId).toArray() as Row[];
+      if (!rows.length || rows[0].role !== "owner") throw new BoardError("NOT_FOUND", "No such turn");
+      if (rows[0].status !== "taken" || rows[0].taken_by !== actor) throw new BoardError("HANDOFF_CONFLICT", "This worker has not taken this turn");
+      this.sql.exec("UPDATE chat_messages SET status=? WHERE seq=?", failed ? "failed" : "answered", seq);
+      this.sql.exec(
+        "INSERT INTO chat_messages(item_id,at,actor,role,text,ref) VALUES(?,?,?,'agent',?,?)",
+        itemId, Date.now(), actor, text, ref,
+      );
+      return { ok: true, changed: true, seq };
+    });
   }
 
   /**
@@ -1024,10 +1215,13 @@ export class Store {
     ).toArray() as Row[]) {
       notes.set(str(r.item_id), { seq: num(r.seq), at: num(r.at), actor: str(r.actor), kind: str(r.kind), text: str(r.text), ref: strOrNull(r.ref) });
     }
+    const chats = this.chatSummary();
     const items = (data.items as Record<string, unknown>[]).map((item) => {
       const last = item.last_event as { kind?: string } | null;
       const note = notes.get(item.item_id as string);
-      return last && last.kind === "state_change" && note ? { ...item, last_note: note } : item;
+      const withNote = last && last.kind === "state_change" && note ? { ...item, last_note: note } : item;
+      const chat = chats.get(item.item_id as string);
+      return chat ? { ...withNote, chat } : withNote;
     });
     return { ...data, items, generated_at: now, can_write: true, route: this.routeView(devinReady, now) };
   }
@@ -1111,6 +1305,7 @@ export class Store {
         return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
       });
     }
+    if (op === "chat_send") return this.chatSend(actor, obj);
     if (op === "order") {
       onlyKeys(obj, ["op", "order"]);
       const order = parseOrder(obj.order);
@@ -1201,7 +1396,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, mark_unknown, release or resume");
+    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, chat_send, mark_unknown, release or resume");
   }
 
   /** All items of the project (or of every project), each with its latest
