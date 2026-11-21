@@ -93,12 +93,13 @@
       });
       let answer = null;
       try { answer = await response.json(); } catch { answer = null; }
-      if (response.ok && answer && answer.ok === true) return true;
+      // The board's answer (truthy) on success, so a caller can go on with it.
+      if (response.ok && answer && answer.ok === true) return answer;
       status.textContent = writeErrors[answer && answer.code] || '書き込めませんでした。読み直してから、もう一度お試しください。';
-      return false;
+      return null;
     } catch {
       status.textContent = '接続できません。通信を確かめてから、もう一度お試しください。';
-      return false;
+      return null;
     } finally { button.disabled = false; }
   }
   function option(value, label) {
@@ -288,11 +289,17 @@
     const select = el('select');
     select.setAttribute('aria-label', '入れる先');
     parentChoices(select, peers, null);
+    // Where the work goes when it is asked for at once (頼む): '' = おまかせ.
+    const to = targetSelect({ title: '新しい仕事' }, '');
+    to.setAttribute('aria-label', '頼むときの行き先');
     const button = el('button', 'quiet', '積む');
     button.type = 'button';
+    const ask = el('button', 'board-ask', '頼む');
+    ask.type = 'button';
+    ask.setAttribute('aria-label', '積んで、選んだ行き先へそのまま任せる');
     const status = el('span', 'board-write-status');
     status.setAttribute('role', 'status');
-    const send = async () => {
+    const send = async (andHand) => {
       const text = title.value.trim();
       if (!text) { status.textContent = '題名を入れてください。'; return; }
       const now = new Date();
@@ -300,13 +307,25 @@
       const day = String(now.getFullYear()) + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0');
       const body = { op: 'add', project, title: text, day };
       if (select.value) body.parent_id = select.value;
-      const done = await write(body, status, button);
-      if (done) { title.value = ''; load(true); }
+      const added = await write(body, status, andHand ? ask : button);
+      if (!added) return;
+      title.value = '';
+      if (andHand) {
+        // The work is on the pile now; hand it over as the card's 任せる would.
+        const hand = { op: 'hand', item_id: added.item.item_id, day };
+        if (to.value) hand.to = to.value;
+        const handed = await write(hand, status, ask);
+        if (!handed) status.textContent = '積みましたが、任せられませんでした。カードの「任せる」から、もう一度お試しください。';
+      }
+      load(true);
     };
-    button.addEventListener('click', send);
-    title.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) send(); });
-    row.append(title, select, button, status);
-    box.append(row);
+    button.addEventListener('click', () => send(false));
+    ask.addEventListener('click', () => send(true));
+    title.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) send(false); });
+    const how = el('div', 'board-write-row');
+    how.append(el('span', 'board-write-note', '行き先'), to, ask, button);
+    row.append(title, select);
+    box.append(row, how, status);
     return box;
   }
   // The owner's order for おまかせ (the board's own data: the Rust board has
