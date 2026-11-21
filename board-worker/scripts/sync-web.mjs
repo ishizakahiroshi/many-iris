@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "public");
 const sources = [
-  [join(root, "..", "iris", "web"), ["app.css", "board.css", "board.js"]],
+  [join(root, "..", "iris", "web"), ["app.css", "board.css", "board.js", "chat.css", "chat.js"]],
   [join(root, "web"), ["_headers"]],
 ];
 

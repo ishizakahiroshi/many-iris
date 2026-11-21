@@ -77,3 +77,4 @@ body.chat-open::before{content:"";position:fixed;inset:0;background:rgba(36,31,2
 .board-chat-form button{padding:8px 18px}
 .board-chat .board-ask,.board-add .board-ask{font-weight:700;background:var(--accent,#ff7a3d);color:#fff;border-color:var(--accent,#ff7a3d)}
 @media(max-width:700px){.connection-bar,footer{width:calc(100% - 38px)}.board-main{padding:20px 19px 35px}.board-tree ul{margin-left:10px;padding-left:9px}}
+.board-chat-link{display:inline-block;margin-top:10px;font-weight:650;border:1.5px solid var(--ink);border-radius:999px;padding:6px 16px;text-decoration:none;color:var(--ink);background:var(--card)}.board-chat-link:hover{background:#fff4e7}

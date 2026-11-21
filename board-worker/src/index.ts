@@ -1,6 +1,7 @@
 // Many Iris board on Cloudflare Workers.
 //
 //   GET  /board        read-only page (people, through Cloudflare Access)
+//   GET  /chat         the conversations with the server's AI workers (through Cloudflare Access)
 //   GET  /api/board    page data (people, through Cloudflare Access)
 //   POST /board/mcp    MCP for writers: a writer key, or an OAuth access token
 //                      for this resource, as a Bearer token (Access lets this path through)
@@ -14,6 +15,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
+import chatHtml from "../../iris/web/chat.html";
 import { accessUser, type AccessResult } from "./access";
 import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
 import { authenticate } from "./keys";
@@ -307,6 +309,13 @@ const siteHandler = {
       const who = await accessUser(request, env);
       if (!who.ok) return accessFailure(who);
       return html(boardHtml.replace("__IRIS_UI_TOKEN__", ""));
+    }
+
+    // The conversations as a chat page (the same data as the board, through Access).
+    if (path === "/chat" && method === "GET") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      return html(chatHtml);
     }
 
     if (path === "/api/board" && method === "GET") {

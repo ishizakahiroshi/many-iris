@@ -319,7 +319,7 @@
         if (to.value) hand.to = to.value;
         const handed = await write(hand, status, andTalk ? talk : ask);
         if (!handed) status.textContent = '積みましたが、任せられませんでした。カードの「任せる」から、もう一度お試しください。';
-        else if (andTalk) openChat(added.item.item_id);
+        else if (andTalk) { if (lastData && lastData.route) { location.href = '/chat#' + encodeURIComponent(added.item.item_id); return; } openChat(added.item.item_id); }
       }
       load(true);
     };
@@ -422,7 +422,8 @@
     const button = el('button', 'quiet board-talk', '話す');
     button.type = 'button';
     button.setAttribute('aria-label', '「' + short(item.title) + '」について VPS の AI と話す');
-    button.addEventListener('click', () => openChat(item.item_id));
+    // The Worker board has the chat page (/chat); the Rust board opens the conversation on this page.
+    button.addEventListener('click', () => { if (lastData && lastData.route) location.href = '/chat#' + encodeURIComponent(item.item_id); else openChat(item.item_id); });
     row.append(button);
     if (item.chat) row.append(el('span', 'board-write-note', item.chat.open ? '返事を待っています' : '会話 ' + item.chat.messages + ' 件'));
     return row;
@@ -645,6 +646,8 @@
     $('board-mode-note').textContent = canWrite ? '題名や状態は、書いた担当だけが直せます' : 'この画面から書き込むことはできません';
     $('board-foot').textContent = canWrite ? 'Many Iris / 看板' : 'Many Iris / 看板（読み取り専用）';
     routeSection(data.route);
+    // The chat page exists on the Worker board only (the one with the owner's order).
+    $('board-chat-link').hidden = !(canWrite && data.route);
     const host = $('board-projects');
     host.replaceChildren();
     if (!items.length) host.append(el('p', 'empty', 'まだ項目がありません。'));
