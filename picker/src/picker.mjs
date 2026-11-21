@@ -22,6 +22,10 @@
 //   writer key alone can put a title on the board, and a run may reach
 //   local files through a command executor, so writer-handed work is
 //   not run unattended unless the operator opts out of the gate.
+//   The operator may name a few more trusted handers
+//   (PICKER_TRUSTED_REQUESTERS, e.g. the owner's own local AI writers);
+//   both who handed the work over and who chose this destination must
+//   then be the owner or one of them. Every other writer stays out.
 // - The title a run works on is the snapshot the handover kept
 //   (handoff.title), treated as data — the name of the work — never
 //   as fresh instructions.
@@ -64,7 +68,8 @@ export function eligible(item, config) {
   // Addressed to somebody else, or to nobody yet: not this picker's.
   if (handoff.to !== config.writer) return null;
   if (config.ownerOnly) {
-    if (handoff.requested_by !== OWNER_ACTOR || handoff.to_set_by !== OWNER_ACTOR) return null;
+    const trusted = new Set([OWNER_ACTOR, ...(config.trustedRequesters ?? [])]);
+    if (!trusted.has(handoff.requested_by) || !trusted.has(handoff.to_set_by)) return null;
   }
   const title = typeof handoff.title === "string" ? handoff.title.trim() : "";
   if (title.length === 0) return null;
