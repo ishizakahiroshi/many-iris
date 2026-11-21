@@ -240,3 +240,93 @@ export async function runPass({ client, config, executor, state, log = () => {},
   log(`run of ${chosen.itemId} completed (${outcome})`);
   return { kind: "ran", itemId: chosen.itemId, finished: outcome === "done" };
 }
+
+/** The longest answer the board keeps in a conversation (board-worker store.ts CHAT_TEXT_MAX). */
+export const CHAT_REPLY_MAX = 20000;
+
+/**
+ * Reads the executor's answer for a conversation turn. A worker that knows
+ * conversations prints one last line of JSON {"reply": "...", "ref": "https://..."};
+ * anything else is taken as the plain answer text.
+ */
+export function chatAnswer(result) {
+  let reply = String(result?.text ?? "");
+  let ref = null;
+  try {
+    const parsed = JSON.parse(reply);
+    if (parsed && typeof parsed.reply === "string") {
+      reply = parsed.reply;
+      if (typeof parsed.ref === "string" && parsed.ref.startsWith("https://")) ref = parsed.ref;
+    }
+  } catch { /* plain text */ }
+  reply = reply.trim();
+  if (reply.length > CHAT_REPLY_MAX) reply = `${reply.slice(0, CHAT_REPLY_MAX - 1)}…`;
+  return { reply: reply || "（返事が空でした）", ref, failed: result?.outcome !== "done" };
+}
+
+/**
+ * One conversation pass ("話す"): answer the oldest turn the owner sent to
+ * this writer, if there is one. The board only ever has owner turns from
+ * the signed-in owner's page, so no owner gate is needed here. Turns do not
+ * count toward the daily cap (owner decision 2026-11-21: no cap for
+ * conversations; each turn needs the owner to send one). A board without
+ * conversations (an older version) reads as nothing to do.
+ */
+export async function runChatPass({ client, executor, log = () => {} }) {
+  let pending;
+  try {
+    pending = await client.call("board_chat_pending", {});
+  } catch (error) {
+    if (error instanceof BoardUnreachable || error instanceof BoardRefusal) return { kind: "nothing" };
+    throw error;
+  }
+  const turn = Array.isArray(pending?.turns) ? pending.turns[0] : undefined;
+  if (!turn || typeof turn.item_id !== "string" || !Number.isSafeInteger(turn.seq)) return { kind: "nothing" };
+  let taken;
+  try {
+    taken = await client.call("board_chat_take", { item_id: turn.item_id, seq: turn.seq });
+  } catch (error) {
+    if (error instanceof BoardRefusal) {
+      log(`chat turn ${turn.seq} on ${turn.item_id} refused: ${error.code}`);
+      return { kind: "chat-refused", itemId: turn.item_id, code: error.code };
+    }
+    if (error instanceof BoardUnreachable) return { kind: "unreachable", itemId: turn.item_id };
+    throw error;
+  }
+  log(`took chat turn ${turn.seq} on ${turn.item_id}`);
+  const job = {
+    kind: "chat",
+    itemId: turn.item_id,
+    project: taken?.item?.project ?? null,
+    requestId: taken?.handoff?.request_id ?? null,
+    title: truncate(taken?.handoff?.title ?? taken?.item?.title ?? "", 200),
+    turn: { seq: turn.seq, text: String(taken?.turn?.text ?? "") },
+    transcript: Array.isArray(taken?.transcript) ? taken.transcript : [],
+  };
+  let result;
+  try {
+    result = await executor.run(job, { progress: async () => {} });
+  } catch (error) {
+    result = { outcome: "stopped", text: `[失敗] executor failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const answer = chatAnswer(result);
+  const args = { item_id: turn.item_id, seq: turn.seq, text: answer.reply };
+  if (answer.ref) args.ref = answer.ref;
+  if (answer.failed) args.failed = true;
+  try {
+    await client.call("board_chat_reply", args);
+  } catch (error) {
+    if (error instanceof BoardRefusal) {
+      log(`answer to chat turn ${turn.seq} refused: ${error.code}`);
+      return { kind: "chat-refused", itemId: turn.item_id, code: error.code };
+    }
+    if (error instanceof BoardUnreachable) {
+      // The turn stays taken; after a while this writer may take it again.
+      log(`answer to chat turn ${turn.seq} may not have reached the board`);
+      return { kind: "unreachable", itemId: turn.item_id };
+    }
+    throw error;
+  }
+  log(`answered chat turn ${turn.seq} on ${turn.item_id} (${answer.failed ? "failed" : "done"})`);
+  return { kind: "chatted", itemId: turn.item_id, finished: !answer.failed };
+}

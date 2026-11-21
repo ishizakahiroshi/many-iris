@@ -14,7 +14,7 @@ import { closeSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync 
 import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
-import { runPass } from "./picker.mjs";
+import { runChatPass, runPass } from "./picker.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -137,6 +137,9 @@ async function pass(config, executor) {
     return { kind: "busy" };
   }
   try {
+    // A conversation turn first: the owner is waiting on the other end.
+    const chat = await runChatPass({ client, executor, log });
+    if (chat.kind !== "nothing") return chat;
     return await runPass({ client, config, executor, state: fileState(config.stateFile), log });
   } finally {
     release();

@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
 import { acquireLock } from "../src/main.mjs";
-import { eligible, runPass } from "../src/picker.mjs";
+import { chatAnswer, eligible, runChatPass, runPass } from "../src/picker.mjs";
 
 let passed = 0;
 const failures = [];
@@ -338,6 +338,57 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   check("ordinary work carries no takeover", executor.jobs[0] !== undefined && !("takeover" in executor.jobs[0]));
 }
 
+// --- conversations (runChatPass)
+{
+  class ChatBoard {
+    constructor(turns, { pendingError = null } = {}) { this.turns = turns; this.calls = []; this.pendingError = pendingError; this.replies = []; }
+    async call(tool, args) {
+      this.calls.push({ tool, args });
+      if (tool === "board_chat_pending") { if (this.pendingError) throw this.pendingError; return { ok: true, turns: this.turns }; }
+      if (tool === "board_chat_take") {
+        const t = this.turns.find((x) => x.seq === args.seq);
+        if (!t || t.taken) throw new BoardRefusal("HANDOFF_CONFLICT", "not open");
+        t.taken = true;
+        return { ok: true, turn: { item_id: t.item_id, seq: t.seq, text: t.text }, item: { item_id: t.item_id, project: "demo", title: "Item title" },
+          handoff: { request_id: "REQ-9", title: "Handed title" }, transcript: [{ at: 1, who: "owner", actor: "page:owner", text: t.text }] };
+      }
+      if (tool === "board_chat_reply") { this.replies.push(args); return { ok: true }; }
+      throw new Error(`unexpected ${tool}`);
+    }
+  }
+  const executorOf = (result) => ({ jobs: [], async run(job) { this.jobs.push(job); if (result instanceof Error) throw result; return result; } });
+
+  const empty = new ChatBoard([]);
+  check("no turn: nothing to do", (await runChatPass({ client: empty, executor: executorOf({}) })).kind === "nothing");
+  const old = new ChatBoard([], { pendingError: new BoardUnreachable("old board") });
+  check("a board without conversations reads as nothing (the work pass still runs)", (await runChatPass({ client: old, executor: executorOf({}) })).kind === "nothing");
+
+  const board = new ChatBoard([{ item_id: "task1", seq: 7, text: "もう少し短くして" }]);
+  const ex = executorOf({ outcome: "done", text: JSON.stringify({ reply: "短くしました\n2 行目", ref: "https://github.com/example/repo/pull/3" }) });
+  const out = await runChatPass({ client: board, executor: ex });
+  check("a turn is taken, run as a chat job, and answered", out.kind === "chatted" && out.finished === true &&
+    board.replies[0]?.text === "短くしました\n2 行目" && board.replies[0]?.ref === "https://github.com/example/repo/pull/3" && board.replies[0]?.seq === 7 && !("failed" in board.replies[0]), JSON.stringify(board.replies));
+  const job = ex.jobs[0];
+  check("the chat job carries the turn, the handed-over title, the request and the transcript",
+    job?.kind === "chat" && job.turn.text === "もう少し短くして" && job.title === "Handed title" && job.requestId === "REQ-9" && job.transcript.length === 1, JSON.stringify(job));
+
+  const failing = new ChatBoard([{ item_id: "task1", seq: 8, text: "x" }]);
+  await runChatPass({ client: failing, executor: executorOf({ outcome: "stopped", text: "command exited with code 4: [失敗] だめだった" }) });
+  check("a failed run answers the turn as failed, with the reason", failing.replies[0]?.failed === true && failing.replies[0]?.text.includes("だめだった"), JSON.stringify(failing.replies));
+
+  const thrown = new ChatBoard([{ item_id: "task1", seq: 9, text: "x" }]);
+  await runChatPass({ client: thrown, executor: executorOf(new Error("boom")) });
+  check("an executor that throws still answers the turn as failed", thrown.replies[0]?.failed === true && thrown.replies[0]?.text.includes("boom"));
+
+  const raced = new ChatBoard([{ item_id: "task1", seq: 10, text: "x", taken: true }]);
+  const r = await runChatPass({ client: raced, executor: executorOf({ outcome: "done", text: "y" }) });
+  check("a turn someone else took is left alone", r.kind === "chat-refused" && raced.replies.length === 0);
+
+  check("plain text is the answer as it is", chatAnswer({ outcome: "done", text: "plain" }).reply === "plain");
+  check("an answer longer than the board keeps is cut", chatAnswer({ outcome: "done", text: JSON.stringify({ reply: "あ".repeat(25000) }) }).reply.length === 20000);
+  check("an empty answer says so", chatAnswer({ outcome: "done", text: "" }).reply === "（返事が空でした）");
+  check("a non-https ref is dropped", chatAnswer({ outcome: "done", text: JSON.stringify({ reply: "a", ref: "http://x" }) }).ref === null);
+}
 console.log(`picker.test: ${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);
 process.exitCode = failures.length === 0 ? 0 : 1;

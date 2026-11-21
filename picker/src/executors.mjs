@@ -36,7 +36,9 @@ export class RecordExecutor {
   }
 }
 
-const OUTPUT_MAX = 64 * 1024;
+// The tail of the output is kept: the last line is the answer, and a
+// conversation answer may be 20,000 characters long.
+const OUTPUT_MAX = 256 * 1024;
 
 export class CommandExecutor {
   /**
@@ -92,7 +94,7 @@ export class CommandExecutor {
         signal.addEventListener("abort", onAbort, { once: true });
       }
       child.stdout.on("data", (chunk) => {
-        if (output.length < OUTPUT_MAX) output += chunk.toString("utf8").slice(0, OUTPUT_MAX - output.length);
+        output = (output + chunk.toString("utf8")).slice(-OUTPUT_MAX);
       });
       child.stderr.on("data", () => {});
       child.on("error", (error) => finish({ outcome: "stopped", text: `command failed to run: ${error.message}` }));
