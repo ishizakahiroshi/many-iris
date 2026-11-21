@@ -83,7 +83,7 @@ export class BoardStore extends DurableObject<Env> {
     if (actor !== DISPATCH_ACTOR) {
       try { this.store.noteSeen(actor, Date.now()); } catch { /* the call goes on */ }
     }
-    return guarded(() => {
+    const result = guarded(() => {
       switch (tool) {
         case "board_upsert_item":
           return this.store.upsertItem(actor, args);
@@ -125,6 +125,10 @@ export class BoardStore extends DurableObject<Env> {
           return { ok: false, error: { code: "FORBIDDEN", detail: "Operation unavailable" } };
       }
     });
+    // A call that created work (or one that did not) costs two indexed reads
+    // when nobody is watching, so this runs after every tool answer.
+    this.pokeWatchers();
+    return result;
   }
   async page(): Promise<Record<string, unknown>> {
     return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY)));
@@ -135,7 +139,9 @@ export class BoardStore extends DurableObject<Env> {
   }
   /** A write by the signed-in owner from the page (see Store.ownerWrite). */
   async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.ownerWrite(OWNER_ACTOR, args, newBacklogId));
+    const result = guarded(() => this.store.ownerWrite(OWNER_ACTOR, args, newBacklogId));
+    this.pokeWatchers();
+    return result;
   }
   /** The dispatcher's reads and marks (see the scheduled handler). */
   async pendingHandoffs(): Promise<Record<string, unknown>> {
@@ -163,8 +169,72 @@ export class BoardStore extends DurableObject<Env> {
     return guarded(() => this.store.routeOrder());
   }
   async routeHandoff(actor: string, itemId: string, request: string, to: string, text: string, toSetBy: string): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.routeHandoff(actor, itemId, request, to, text, toSetBy));
+    const result = guarded(() => this.store.routeHandoff(actor, itemId, request, to, text, toSetBy));
+    this.pokeWatchers();
+    return result;
   }
+
+  /* ---- WebSocket watch -------------------------------------------------
+   * A picker holds one connection per writer and is woken when work that
+   * concerns it appears; polling stays the fallback. Hibernation-safe: the
+   * actor lives on the socket's attachment, not in memory. */
+
+  private static MAX_WATCHERS = 32;
+
+  private watchers(): { ws: WebSocket; actor: string; poked: boolean }[] {
+    const out: { ws: WebSocket; actor: string; poked: boolean }[] = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        const att = ws.deserializeAttachment() as { actor?: unknown; poked?: unknown } | null;
+        if (typeof att?.actor === "string") out.push({ ws, actor: att.actor, poked: att.poked === true });
+      } catch { /* an attachment that is not ours; skip it */ }
+    }
+    return out;
+  }
+
+  /** Wake every watcher whose actor has work waiting right now — once per
+   * pending stretch, not per mutation: while the work stays pending (the
+   * picker is stopped, at its day cap, or just slow) a pass's own board
+   * calls must not re-wake it. The flag clears when nothing is pending for
+   * the actor, so the next request wakes it again. */
+  private pokeWatchers(): void {
+    const watchers = this.watchers();
+    if (!watchers.length) return;
+    const targets = new Set(this.store.watchTargets());
+    const message = JSON.stringify({ type: "wake", at: Date.now() });
+    for (const w of watchers) {
+      const wants = targets.has(w.actor);
+      if (wants === w.poked) continue;
+      if (wants) {
+        try { w.ws.send(message); }
+        catch { try { w.ws.close(1011, "send failed"); } catch { /* already gone */ } continue; }
+      }
+      try { w.ws.serializeAttachment({ actor: w.actor, poked: wants }); } catch { /* dying socket */ }
+    }
+  }
+
+  /** The Durable Object's fetch handles the watch upgrade only; everything
+   * else goes through the RPC methods above. The caller (mcpHandler) has
+   * already authenticated the writer and passes its name in x-watch-actor. */
+  async fetch(request: Request): Promise<Response> {
+    const actor = request.headers.get("x-watch-actor");
+    if (!actor || (request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
+      return new Response("watch expects a websocket upgrade", { status: 400 });
+    }
+    if (this.ctx.getWebSockets().length >= BoardStore.MAX_WATCHERS) {
+      return new Response("too many watchers", { status: 503 });
+    }
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment({ actor });
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (message === "ping") { try { ws.send("pong"); } catch { /* closed */ } }
+  }
+  async webSocketClose(ws: WebSocket): Promise<void> { try { ws.close(); } catch { /* already gone */ } }
+  async webSocketError(ws: WebSocket): Promise<void> { try { ws.close(); } catch { /* already gone */ } }
 }
 
 /** The name the owner's own writes carry on the board. The colon keeps it apart
@@ -267,11 +337,21 @@ function boardStub(env: Env) {
 const mcpHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname !== MCP_PATH) return failure(404, "NOT_FOUND", "Not found");
-    if (request.method !== "POST") return failure(405, "METHOD", "Use POST");
+    const watchPath = url.pathname === MCP_PATH || url.pathname === `${MCP_PATH}/watch`;
+    if (!watchPath) return failure(404, "NOT_FOUND", "Not found");
     if (foreignOrigin(request, url)) return failure(403, "ORIGIN", "Requests from other sites are refused");
     const actor = (ctx as ExecutionContext & { props?: { actor?: unknown } }).props?.actor;
     if (typeof actor !== "string" || !validActor(actor)) return failure(401, "AUTH", "A valid key is required");
+
+    // A picker watching for work: GET + Upgrade on the same protected path
+    // (or /board/mcp/watch), so the same Bearer check and the same Access
+    // bypass that let the tool calls through apply unchanged.
+    if (request.method === "GET" && (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
+      const headers = new Headers(request.headers);
+      headers.set("x-watch-actor", actor);
+      return boardStub(env).fetch(new Request(url.origin + url.pathname, { headers, method: "GET" }));
+    }
+    if (request.method !== "POST") return failure(405, "METHOD", "Use POST");
     const body = await readBody(request);
     if (body instanceof Response) return body;
     const stub = boardStub(env);

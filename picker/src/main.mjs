@@ -1,7 +1,9 @@
 // The picker's entry point.
 //
-//   node src/main.mjs --once   one pass (for cron / a timer)
-//   node src/main.mjs --loop   keep passing every PICKER_INTERVAL_SECS
+//   node src/main.mjs --once    one pass (for cron / a timer)
+//   node src/main.mjs --loop    keep passing every PICKER_INTERVAL_SECS
+//   node src/main.mjs --watch   stay resident: wake on a board notification,
+//                               poll every PICKER_INTERVAL_SECS as fallback
 //
 // Configuration comes from the environment (see picker/README.md).
 // The writer key is read from PICKER_KEY_FILE on every pass (a rotated
@@ -10,11 +12,12 @@
 // few minutes is the intended deployment, and every pass is safe to
 // repeat — the board, not this process, decides who took what.
 
-import { closeSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
 import { runChatPass, runPass } from "./picker.mjs";
+import { watchBoard, watchUrl } from "./watch.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -49,6 +52,11 @@ export function configFromEnv(env) {
       return value;
     })(),
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",
+    // Optional stop files (e.g. the run directory's STOP, and STOP-devin for
+    // the devin picker): while any of them exists, a resident --watch picker
+    // takes no passes. The shell wrappers check their own stop files for the
+    // cron path; this is the same idea for the resident one.
+    stopFiles: (env.PICKER_STOP_FILE ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0),
     executorKind,
     command: env.PICKER_COMMAND ?? "",
     commandArgs: env.PICKER_COMMAND_ARGS ? JSON.parse(env.PICKER_COMMAND_ARGS) : [],
@@ -146,10 +154,56 @@ async function pass(config, executor) {
   }
 }
 
+/**
+ * The resident watch: a pass on start, on every board wake, and on every
+ * interval tick (the poll stays the fallback when the socket is down or a
+ * message is missed). Passes are serialized — a wake during a run queues
+ * one more pass — and the per-pass lock still guards against a concurrent
+ * cron --once or a second watcher for the same state file.
+ */
+export async function watchResident({ config, executor, passImpl = pass, watcherImpl = watchBoard, keyImpl = (path) => readFileSync(path, "utf8").trim(), log = (m) => console.log(`[picker ${new Date().toISOString()}] ${m}`) }) {
+  const stopped = () => config.stopFiles.some((path) => existsSync(path));
+  let running = false;
+  let queued = false;
+  const runPass = async (why) => {
+    if (running) { queued = true; return; }
+    running = true;
+    try {
+      do {
+        queued = false;
+        if (stopped()) log(`stop file present; skipping ${why} pass`);
+        else {
+          try {
+            const outcome = await passImpl(config, executor);
+            log(`${why} pass outcome: ${outcome.kind}`);
+          } catch (error) {
+            console.error(`[picker] ${why} pass failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      } while (queued);
+    } finally {
+      running = false;
+    }
+  };
+
+  const tick = () => { setTimeout(tick, config.intervalMs); void runPass("interval"); };
+  setTimeout(tick, config.intervalMs);
+
+  watcherImpl({
+    url: watchUrl(config.boardUrl),
+    key: keyImpl(config.keyFile),
+    onWake: () => void runPass("wake"),
+    onState: (state) => log(`watch ${state}`),
+  });
+
+  await runPass("startup");
+}
+
 async function main(argv) {
   const loop = argv.includes("--loop");
-  if (!loop && !argv.includes("--once")) {
-    console.error("usage: node src/main.mjs --once | --loop");
+  const watch = argv.includes("--watch");
+  if (!loop && !watch && !argv.includes("--once")) {
+    console.error("usage: node src/main.mjs --once | --loop | --watch");
     return 2;
   }
   let config;
@@ -160,9 +214,18 @@ async function main(argv) {
     return 2;
   }
   const executor = makeExecutor(config);
-  if (!loop) {
+  if (!loop && !watch) {
     const outcome = await pass(config, executor);
     console.log(`[picker] pass outcome: ${outcome.kind}`);
+    return 0;
+  }
+  if (watch) {
+    if (typeof WebSocket === "undefined") {
+      console.error("[picker] --watch needs Node.js 22 or later (the built-in WebSocket client)");
+      return 2;
+    }
+    console.log(`[picker] watching as ${config.writer} (poll fallback every ${Math.round(config.intervalMs / 1000)}s)`);
+    await watchResident({ config, executor });
     return 0;
   }
   console.log(`[picker] looping as ${config.writer} every ${Math.round(config.intervalMs / 1000)}s`);

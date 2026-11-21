@@ -19,6 +19,7 @@ picker はそれ以外の行き先（`vps-claude`・`vps-devin`・`muse`・`grok
   看板に対しては、picker は汎用書込みへフォールバックせず、
   何も実行せずに止まります。
 - Node.js 18 以上。依存パッケージはありません。
+  （`--watch` 常駐は組み込みの WebSocket を使うため Node.js 22 以上。）
 - 担当者の書き手キー（ファイルで渡す。値はログ・成果物に出ません）。
 
 ## 使い方
@@ -28,9 +29,19 @@ cd picker
 PICKER_BOARD_URL=https://iris.ishizakahiroshi.com/board/mcp \
 PICKER_KEY_FILE=/path/to/writer.key \
 PICKER_WRITER=muse \
-node src/main.mjs --once   # 1 回だけ見に行く（cron 向け）
-node src/main.mjs --loop   # 常駐して繰り返す
+node src/main.mjs --once    # 1 回だけ見に行く（cron 向け）
+node src/main.mjs --loop    # 常駐して繰り返す
+node src/main.mjs --watch   # 常駐: 看板の通知で即見に行く + ポーリング併用
 ```
+
+`--watch` は、同じ `/board/mcp` の URL へ WebSocket で接続し、自分宛ての仕事
+（手渡し・会話）が出た通知 `{"type":"wake"}` で即パスを回します。接続が
+切れた・届かなかったときのために、いままでどおり `PICKER_INTERVAL_SECS`
+おきのポーリングも常に併用し、切断中はバックオフで張り直します。鍵は
+従来どおり Authorization ヘッダだけに乗せ、URL には載せません。
+`PICKER_STOP_FILE` にファイルを指定すると、そのファイルがある間は
+通知・ポーリングのどちらのパスも止まります（VPS の `STOP` 作法の常駐版。
+カンマ区切りで複数指定でき、例えば `STOP,STOP-devin` はどちらかがあれば止まります）。
 
 cron の例（5 分おきに 1 回）:
 
@@ -60,6 +71,7 @@ cron の例（5 分おきに 1 回）:
 | `PICKER_HEARTBEAT_SECS` | | 300 | 実行中のハートビート間隔（リース 30 分より十分短く） |
 | `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限 |
 | `PICKER_STATE_FILE` | | `picker-state.json` | 1 日の実行数の記録 |
+| `PICKER_STOP_FILE` | | なし | `--watch` 用。カンマ区切りのファイルのどれかがある間は全パスを止める |
 | `PICKER_EXECUTOR` | | `record` | `record`（記録のみ）か `command`（下記） |
 | `PICKER_COMMAND` | command 時 | — | 実行するコマンド（シェルを介さず直接起動） |
 | `PICKER_COMMAND_ARGS` | | `[]` | コマンドの引数（JSON 配列） |
