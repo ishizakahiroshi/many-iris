@@ -44,6 +44,15 @@ export function configFromEnv(env) {
     writer: required("PICKER_WRITER"),
     projects: (env.PICKER_PROJECTS ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0),
     ownerOnly: env.PICKER_OWNER_ONLY !== "0",
+    // Writers trusted like the owner page while the owner gate is on (the
+    // owner's own local AI, say). Never this picker's own writer: it must
+    // not be able to hand work to itself.
+    trustedRequesters: (() => {
+      const names = (env.PICKER_TRUSTED_REQUESTERS ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      const writer = (env.PICKER_WRITER ?? "").trim();
+      if (names.includes(writer)) throw new Error("PICKER_TRUSTED_REQUESTERS must not include PICKER_WRITER itself");
+      return names;
+    })(),
     intervalMs: seconds("PICKER_INTERVAL_SECS", 300, 30),
     heartbeatMs: seconds("PICKER_HEARTBEAT_SECS", 300, 5),
     maxRunsPerDay: (() => {

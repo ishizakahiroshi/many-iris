@@ -142,6 +142,17 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     eligible(item({}, { to_set_by: "dispatcher" }), cfg) === null);
   check("writer-handed work is eligible when the operator opens the gate",
     eligible(item({}, { requested_by: "alpha", to_set_by: "alpha" }), { ...cfg, ownerOnly: false }) !== null);
+  const trustedCfg = { ...cfg, trustedRequesters: ["local-claude"] };
+  check("work handed over and routed by a trusted writer is eligible",
+    eligible(item({}, { requested_by: "local-claude", to_set_by: "local-claude" }), trustedCfg) !== null);
+  check("owner-handed work stays eligible when trusted writers are named",
+    eligible(item(), trustedCfg) !== null);
+  check("a trusted writer's request routed by the dispatcher is refused",
+    eligible(item({}, { requested_by: "local-claude", to_set_by: "dispatcher" }), trustedCfg) === null);
+  check("an untrusted writer's request is refused when trusted writers are named",
+    eligible(item({}, { requested_by: "alpha", to_set_by: "alpha" }), trustedCfg) === null);
+  check("an untrusted writer cannot route a trusted writer's request here",
+    eligible(item({}, { requested_by: "local-claude", to_set_by: "alpha" }), trustedCfg) === null);
   check("a non-task is not eligible", eligible(item({ kind: "note" }), cfg) === null);
   check("an already-taken request is not eligible",
     eligible(item({}, { state: "accepted" }), cfg) === null);
