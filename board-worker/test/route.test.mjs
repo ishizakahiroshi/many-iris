@@ -22,6 +22,7 @@ for (const bad of [null, "devin", ["devin", "devin"], ["owner"], ["hold"], ["som
   check(`a bad order is refused: ${JSON.stringify(bad)?.slice(0, 40)}`, parseOrder(bad) === null);
 const now = 1_000_000_000;
 check("a taker seen lately is alive", isAlive("vps-claude", { "vps-claude": now - 60_000 }, now, false));
+check("a taker seen exactly the limit ago is still alive", isAlive("vps-claude", { "vps-claude": now - ALIVE_MS }, now, false));
 check("a taker not seen for longer than the limit is not", !isAlive("vps-claude", { "vps-claude": now - ALIVE_MS - 1 }, now, false));
 check("a taker never seen is not", !isAlive("local-claude", {}, now, true));
 check("Devin in the cloud is alive when the board can start it", isAlive("devin", {}, now, true) && !isAlive("devin", { devin: now }, now, false));
