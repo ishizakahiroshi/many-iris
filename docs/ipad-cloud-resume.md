@@ -24,6 +24,9 @@ iPad（看板の画面）から仕事を依頼し、クラウド側の担当（M
   （`src/dispatch.ts`）。
 - 振り分け: 行き先なしの依頼は cron が Clef-flash で振り分け、失敗や
   自信不足は安全側の `hold` に倒す（`src/route.ts`）。
+  注記: 2026-11-21 から、行き先なしの依頼は Clef-flash ではなく持ち主の
+  順番で振り分ける（`board-worker/src/route.ts`。順番の先頭から生きている
+  行き先を選び、誰もいなければ `hold`）。
 - 本体（`iris/`）側には実行の世代（fence）や unknown で再送しない規律が
   合成 executor 向けにあるが、看板の handoff には無かった。Rust 版の看板に
   handoff 自体が無い（`iris/README.md`）ため、今回の変更は
