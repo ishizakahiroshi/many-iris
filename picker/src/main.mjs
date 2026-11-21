@@ -57,7 +57,9 @@ export function configFromEnv(env) {
     heartbeatMs: seconds("PICKER_HEARTBEAT_SECS", 300, 5),
     maxRunsPerDay: (() => {
       const value = Number(env.PICKER_MAX_RUNS_PER_DAY ?? "6");
-      if (!Number.isSafeInteger(value) || value < 1 || value > 50) throw new Error("PICKER_MAX_RUNS_PER_DAY must be an integer from 1 to 50");
+      // 0 = no daily cap (owner decision 2026-11-21). STOP files still stop every pass.
+      if (value === 0) return Infinity;
+      if (!Number.isSafeInteger(value) || value < 1 || value > 50) throw new Error("PICKER_MAX_RUNS_PER_DAY must be 0 (no cap) or an integer from 1 to 50");
       return value;
     })(),
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",

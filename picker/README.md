@@ -70,7 +70,7 @@ cron の例（5 分おきに 1 回）:
 | `PICKER_TRUSTED_REQUESTERS` | | なし | 門を開けたまま、持ち主と同じに扱う書き手（カンマ区切り。下記）。自分の `PICKER_WRITER` は入れられない |
 | `PICKER_INTERVAL_SECS` | | 300 | `--loop` の間隔（30 以上） |
 | `PICKER_HEARTBEAT_SECS` | | 300 | 実行中のハートビート間隔（リース 30 分より十分短く） |
-| `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限 |
+| `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限（1〜50）。`0` で上限なし（止めるときは `PICKER_STOP_FILE` か cron 側の STOP） |
 | `PICKER_STATE_FILE` | | `picker-state.json` | 1 日の実行数の記録 |
 | `PICKER_STOP_FILE` | | なし | `--watch` 用。カンマ区切りのファイルのどれかがある間は全パスを止める |
 | `PICKER_EXECUTOR` | | `record` | `record`（記録のみ）か `command`（下記） |
