@@ -245,6 +245,20 @@ export class Store {
     return { ok: true, items };
   }
 
+  /** Actors that have work waiting for them right now: a requested handoff
+   * addressed to them, or a waiting conversation turn. The board's WebSocket
+   * watch uses this to wake only the watchers it concerns. */
+  watchTargets(): string[] {
+    const actors = new Set<string>();
+    for (const r of this.sql.exec(
+      "SELECT DISTINCT handoff_to AS a FROM board_items WHERE handoff_state='requested' AND handoff_to IS NOT NULL",
+    ).toArray() as Row[]) { const a = strOrNull(r.a); if (a !== null) actors.add(a); }
+    for (const r of this.sql.exec(
+      "SELECT DISTINCT to_target AS a FROM chat_messages WHERE role='owner' AND status='waiting'",
+    ).toArray() as Row[]) { const a = strOrNull(r.a); if (a !== null) actors.add(a); }
+    return [...actors];
+  }
+
   /** One dispatch_log row, with the pre-claim rows (status NULL) read as started. */
   private dispatchRows(request: string): { at: number; status: string }[] {
     return (this.sql.exec("SELECT at,status FROM dispatch_log WHERE request_id=?", request).toArray() as Row[])
