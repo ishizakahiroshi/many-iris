@@ -24,6 +24,7 @@
 .board-text{white-space:pre-wrap}
 .badge.mark{border-style:dashed}
 .board-add{margin:0 0 14px;padding:10px 14px;border:1px dashed var(--line);border-radius:10px}
+.board-add .board-ask{font-weight:700;background:var(--accent,#ff7a3d);color:#fff;border-color:var(--accent,#ff7a3d)}
 .board-add>h3{font-size:.9rem;margin:0 0 6px}
 .board-write{margin-top:8px;font-size:.8rem}
 .board-write>summary{cursor:pointer;color:var(--soft)}
