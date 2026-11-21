@@ -215,6 +215,27 @@ export class Store {
     // recording used to happen after the start, so that is what they were.
     this.addDispatchColumn("status", "TEXT");
     this.addDispatchColumn("session_id", "TEXT");
+    // Every tool call looks for requested handoffs (watchTargets, after each
+    // answer) and the dispatcher does every ten minutes; without this index
+    // each look read the whole item table (issue #38).
+    this.sql.exec("CREATE INDEX IF NOT EXISTS board_items_handoff ON board_items(handoff_state)");
+    this.initCounts();
+  }
+  /** The item and event counts the limits are checked against, kept in
+   * `board_counts` by insert triggers (rows are never deleted, see the
+   * no-delete triggers). A board made before the table counts its rows once,
+   * here; after that a count is one row instead of the whole table. */
+  private initCounts(): void {
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS board_counts(
+      name TEXT PRIMARY KEY NOT NULL CHECK(name IN ('board_items','board_events')),
+      n INTEGER NOT NULL CHECK(n >= 0)
+    )`);
+    for (const table of ["board_items", "board_events"] as const) {
+      this.sql.exec(`CREATE TRIGGER IF NOT EXISTS ${table}_count AFTER INSERT ON ${table}
+        BEGIN UPDATE board_counts SET n=n+1 WHERE name='${table}'; END`);
+      const known = this.sql.exec("SELECT 1 FROM board_counts WHERE name=?", table).toArray().length > 0;
+      if (!known) this.sql.exec(`INSERT INTO board_counts(name,n) SELECT '${table}',COUNT(*) FROM ${table}`);
+    }
   }
   /** Adds a column to `dispatch_log` when an older board does not have it yet. */
   private addDispatchColumn(name: string, type: "INTEGER" | "TEXT"): void {
@@ -658,9 +679,10 @@ export class Store {
     const rows = this.sql.exec(`SELECT ${ITEM_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id).toArray();
     return rows.length ? rowItem(rows[0] as Row) : null;
   }
+  /** Reads the kept count (board_counts): one row, where COUNT(*) read the
+   * whole table on every list and every write (issue #38). */
   private count(table: "board_items" | "board_events"): number {
-    const sql = table === "board_items" ? "SELECT COUNT(*) AS n FROM board_items" : "SELECT COUNT(*) AS n FROM board_events";
-    return num((this.sql.exec(sql).one() as Row).n);
+    return num((this.sql.exec("SELECT n FROM board_counts WHERE name=?", table).one() as Row).n);
   }
 
   /** Runs `fn` in one transaction; a thrown error rolls everything back. */
