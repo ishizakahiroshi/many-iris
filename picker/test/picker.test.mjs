@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
-import { acquireLock } from "../src/main.mjs";
+import { acquireLock, configFromEnv } from "../src/main.mjs";
 import { chatAnswer, eligible, runChatPass, runPass } from "../src/picker.mjs";
 
 let passed = 0;
@@ -293,6 +293,17 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const board = new FakeBoard([item()]);
   const outcome = await runPass({ client: board, config: baseConfig, executor: new RecordExecutor(), state: state(6) });
   check("the daily cap stops the pass before any board call", outcome.kind === "capped" && board.calls.length === 0, JSON.stringify(outcome));
+}
+{
+  const env = { PICKER_BOARD_URL: "https://board.example.com/board/mcp", PICKER_KEY_FILE: "k", PICKER_WRITER: "muse" };
+  check("PICKER_MAX_RUNS_PER_DAY=0 means no daily cap", configFromEnv({ ...env, PICKER_MAX_RUNS_PER_DAY: "0" }).maxRunsPerDay === Infinity);
+  check("the daily cap stays 6 by default", configFromEnv(env).maxRunsPerDay === 6);
+  let threw = false;
+  try { configFromEnv({ ...env, PICKER_MAX_RUNS_PER_DAY: "-1" }); } catch { threw = true; }
+  check("a negative daily cap is refused", threw);
+  const board = new FakeBoard([item()]);
+  const outcome = await runPass({ client: board, config: { ...baseConfig, maxRunsPerDay: Infinity }, executor: new RecordExecutor(), state: state(500) });
+  check("with no daily cap, a pass still runs after many runs", outcome.kind === "ran", JSON.stringify(outcome));
 }
 
 // --- the entry point runs when started as a script ---------------------
