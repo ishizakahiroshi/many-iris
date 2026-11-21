@@ -728,6 +728,17 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
   check("item count stays at the limit", list.counts.items === 22, String(list.counts.items));
+  // The counts are kept by triggers (issue #38), not counted per call: they must
+  // still match the rows. Events are never deleted and seq is the rowid, so
+  // the newest seq is the number of events.
+  let newestSeq = 0;
+  for (let part = list; ; ) {
+    newestSeq = part.next_since_seq;
+    if (!part.events_truncated) break;
+    part = await call(K.alpha, "board_list", { since_seq: newestSeq });
+  }
+  check("kept counts match the rows", list.items.length === list.counts.items && newestSeq === list.counts.events,
+    `${list.items.length}/${list.counts.items} items, seq ${newestSeq}/${list.counts.events} events`);
 
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
