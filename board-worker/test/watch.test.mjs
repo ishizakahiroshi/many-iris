@@ -156,9 +156,21 @@ async function main() {
   await wait(300);
   check("no re-wake while the same work is pending", w1.messages.length === countAfterWake, w1.messages.join("|"));
 
-  // Take it back and request again: the new request wakes it again.
+  // Another request to the same watcher inside the same pending stretch is
+  // still one stretch: the connection gets exactly one wake, not a second.
+  out = await call(K.alpha, "board_upsert_item", { item_id: "task-vps-more", project: "demo", kind: "task", title: "More for vps", state: "planned" });
+  check("a second item for vps-claude is made", out.ok === true, JSON.stringify(out).slice(0, 200));
+  out = await call(K.alpha, "board_request_handoff", { item_id: "task-vps-more", to: "vps-claude" });
+  check("a second request to vps-claude is made", out.ok === true, JSON.stringify(out).slice(0, 200));
+  const req2 = out.handoff?.request_id ?? "";
+  await wait(300);
+  check("one pending stretch sends wake only once", w1.messages.length === 1, w1.messages.join("|"));
+
+  // Take both back and request again: the new request wakes it again.
   out = await call(K.alpha, "board_take_back_handoff", { item_id: "task-vps", request_id: req1 });
   check("take back works", out.ok === true, JSON.stringify(out).slice(0, 200));
+  out = await call(K.alpha, "board_take_back_handoff", { item_id: "task-vps-more", request_id: req2 });
+  check("second take back works", out.ok === true, JSON.stringify(out).slice(0, 200));
   out = await call(K.alpha, "board_request_handoff", { item_id: "task-vps", to: "vps-claude" });
   check("re-requested", out.ok === true, JSON.stringify(out).slice(0, 200));
   const deadline2 = Date.now() + 5000;
