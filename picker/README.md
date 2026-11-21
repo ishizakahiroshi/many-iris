@@ -23,20 +23,43 @@ picker はそれ以外の行き先（`vps-claude`・`vps-devin`・`muse`・`grok
 
 ## 使い方
 
+看板とは別の機械（VPS など）に置き、担当者ごとに 1 つ動かします。
+動かす人が用意するのは次の 3 つです。
+
+- 看板の MCP の URL（`https://board.example.com/board/mcp` の形）
+- その担当者の書き手キーのファイル。リポジトリの外に置きます
+  （作り方はルートの README の「自分の Cloudflare に置く」手順 4）
+- 鍵の担当者名（`vps-claude`・`muse` など、鍵の actor と同じ名前）
+
+まず手で 1 回動かして、看板へ届くことを確かめます。
+
 ```sh
 cd picker
-PICKER_BOARD_URL=https://iris.ishizakahiroshi.com/board/mcp \
+PICKER_BOARD_URL=https://board.example.com/board/mcp \
 PICKER_KEY_FILE=/path/to/writer.key \
 PICKER_WRITER=muse \
-node src/main.mjs --once   # 1 回だけ見に行く（cron 向け）
-node src/main.mjs --loop   # 常駐して繰り返す
+node src/main.mjs --once
 ```
 
-cron の例（5 分おきに 1 回）:
+`--once` は 1 回だけ看板を見て、`[picker] pass outcome: …` を出して
+終わります。拾える仕事が無ければ `nothing` です。環境変数や鍵の
+誤りはメッセージを出して止まります。ひとつ注意: 既定の実行系
+（`record`）は実作業こそしませんが、自分宛てに任せてある仕事が
+あれば受けて「記録のみ」として完了にします。つながりの確認だけなら、
+その担当者宛ての仕事を看板に残さないでください。実作業をさせる
+準備ができたら `PICKER_EXECUTOR=command` と `PICKER_COMMAND` を
+足します（下の「実行系（executor）」）。
+
+確かめられたら cron に登録します（5 分おきの例。出力はログに
+回してください）。
 
 ```cron
-*/5 * * * * cd /path/to/many-iris/picker && PICKER_BOARD_URL=... PICKER_KEY_FILE=... PICKER_WRITER=muse node src/main.mjs --once
+*/5 * * * * cd /path/to/many-iris/picker && PICKER_BOARD_URL=... PICKER_KEY_FILE=... PICKER_WRITER=muse node src/main.mjs --once >> /path/to/picker.log 2>&1
 ```
+
+cron ではなく常駐させる形なら、`--loop` で同じパスを
+`PICKER_INTERVAL_SECS`（既定 300 秒）ごとに繰り返します。どちらで
+動かしても、1 パスで拾う判定は同じです。
 
 状態ファイルの隣に置く鍵（ロックファイル）で同時に動くのは 1 つだけに保たれ、前の回が終わっていなければ後の回は何もせず終わるので、間隔は 1 分おき（`* * * * *`）にしてもかまいません。
 
