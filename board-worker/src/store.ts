@@ -132,7 +132,9 @@ const CHAT_SCHEMA = [
 /** The longest message in a conversation (characters). */
 export const CHAT_TEXT_MAX = 20000;
 /** Who can be talked to: the server's workers (owner decision 2026-11-21). */
-export const CHAT_TARGETS = ["vps-claude", "vps-devin"] as const;
+export /** The project of a chat started with no project (the chat page's 案件なし). */
+const CHAT_PROJECT = "chat";
+const CHAT_TARGETS = ["vps-claude", "vps-devin"] as const;
 /** A turn taken this long ago without an answer may be taken again by the same worker (its run died). */
 export const CHAT_TAKE_MS = 40 * 60 * 1000;
 const MAX_CHAT_MESSAGES = 100000;
@@ -1354,8 +1356,9 @@ export class Store {
       const title = requiredStr(obj, "title");
       const parentId = optionalStr(obj, "parent_id");
       // A project is made by a writer; a typing slip here must not start a new one.
+      // The one exception is CHAT_PROJECT, where a chat with no project goes (chat page).
       const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
-      if (known === 0) throw new BoardError("NOT_FOUND", "No such project");
+      if (known === 0 && project !== CHAT_PROJECT) throw new BoardError("NOT_FOUND", "No such project");
       // The page's own calendar day, for the id only (see newBacklogId).
       const day = optionalStr(obj, "day");
       const args: Record<string, unknown> = { item_id: newId(day), project, kind: "task", title, state: "planned", expected_revision: 0 };

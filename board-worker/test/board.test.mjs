@@ -711,6 +711,8 @@ async function main() {
   check("the card knows the conversation", pageChat?.chat?.messages === 2 && pageChat?.chat?.open === false, JSON.stringify(pageChat?.chat));
 check("the chat list knows when it last moved", typeof pageChat?.chat?.last_at === "number" && pageChat.chat.last_at > 0, JSON.stringify(pageChat?.chat));
 check("the chat page needs Access", (await fetch(`${base}/chat`)).status === 401);
+check("a new chat with no project goes under the project chat", (await ownerCode({ op: "add", project: "chat", title: "ふつうの会話", day: "20261121" })) === "200 OK");
+check("another unknown project is still refused", (await ownerCode({ op: "add", project: "no-such-project", title: "x" })) === "404 NOT_FOUND");
 const chatPage = await fetch(`${base}/chat`, { headers: jar });
 check("the chat page is served", chatPage.status === 200 && (await chatPage.text()).includes('src="/chat.js"'));
   check("the owner can switch partners", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "Devin でも見て", to: "vps-devin" })) === "200 OK" &&
