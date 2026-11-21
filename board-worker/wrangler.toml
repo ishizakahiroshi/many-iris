@@ -31,6 +31,11 @@ directory = "./public"
 [triggers]
 crons = ["*/10 * * * *"]
 
+# Workers Logs: invocations of the Worker and its Durable Objects are kept in
+# the account, queryable in the dashboard and via the Observability MCP server.
+[observability]
+enabled = true
+
 [[durable_objects.bindings]]
 name = "BOARD"
 class_name = "BoardStore"
