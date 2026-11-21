@@ -20,7 +20,7 @@
     FORBIDDEN: 'この操作はできません。',
     NOT_FOUND: '見つかりません。読み直してください。',
   };
-  const PROJECT_KEY = 'iris-chat-project';
+  const NO_PROJECT = 'chat';
   const narrow = window.matchMedia('(max-width: 760px)');
   const touch = window.matchMedia('(pointer: coarse)');
 
@@ -102,7 +102,7 @@
       a.href = '#' + encodeURIComponent(item.item_id);
       if (item.item_id === current) a.setAttribute('aria-current', 'true');
       const top = el('span', 'chat-list-title', item.title);
-      const sub = el('span', 'chat-list-sub', item.project + '　' + when(activity(item)));
+      const sub = el('span', 'chat-list-sub', (item.project === NO_PROJECT ? '' : item.project + '　') + when(activity(item)));
       const m = mark(item);
       if (m) { const badge = el('span', 'chat-dot ' + m[0], m[1]); sub.append(badge); }
       a.append(top, sub);
@@ -110,13 +110,15 @@
       list.append(li);
     }
   }
+  // A new chat belongs to no project unless one is chosen: it goes under
+  // NO_PROJECT, which the server's workers run in a plain folder (no repository).
   function renderProjects() {
     const select = $('chat-start-project');
     if (!board) return;
-    const keep = select.value || (() => { try { return localStorage.getItem(PROJECT_KEY) || localStorage.getItem('iris-board-project') || ''; } catch { return ''; } })();
-    const names = [...new Set(board.items.map((i) => i.project))].sort((a, b) => a.localeCompare(b, 'ja'));
-    select.replaceChildren(...names.map((n) => option(n, n)));
-    if (names.includes(keep)) select.value = keep;
+    const keep = select.value || NO_PROJECT;
+    const names = [...new Set(board.items.map((i) => i.project))].filter((n) => n !== NO_PROJECT).sort((a, b) => a.localeCompare(b, 'ja'));
+    select.replaceChildren(option(NO_PROJECT, '案件なし'), ...names.map((n) => option(n, n)));
+    select.value = names.includes(keep) ? keep : NO_PROJECT;
   }
   async function loadBoard() {
     try {
@@ -151,7 +153,7 @@
   function showConversation(data) {
     shown = data;
     $('chat-title').textContent = data.item.title;
-    $('chat-meta').textContent = data.item.project + '　/　' + (states[data.item.state] || data.item.state);
+    $('chat-meta').textContent = (data.item.project === NO_PROJECT ? '案件なし' : data.item.project) + '　/　' + (states[data.item.state] || data.item.state);
     const log = $('chat-log');
     const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 120;
     log.replaceChildren();
@@ -253,7 +255,6 @@
     const count = () => { $('chat-start-count').textContent = [...startText.value].length + ' / 200'; grow(startText, 220); };
     startText.addEventListener('input', count);
     sendOnEnter(startText, $('chat-start-form'));
-    $('chat-start-project').addEventListener('change', (e) => { try { localStorage.setItem(PROJECT_KEY, e.target.value); } catch { /* private mode */ } });
     $('chat-start-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const status = $('chat-start-status');
@@ -272,6 +273,7 @@
         const handed = await write({ op: 'hand', item_id: itemId, day, to: $('chat-start-partner').value });
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }
         startText.value = '';
+        $('chat-start-project').value = NO_PROJECT;
         count();
         status.textContent = '';
         await loadBoard();
