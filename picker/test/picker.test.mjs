@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
 import { acquireLock, configFromEnv } from "../src/main.mjs";
-import { chatAnswer, eligible, runChatPass, runPass } from "../src/picker.mjs";
+import { chatAnswer, eligible, fetchAttachments, privateTurnDir, runChatPass, runPass } from "../src/picker.mjs";
 
 let passed = 0;
 const failures = [];
@@ -428,6 +428,45 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const plain = executorOf({ outcome: "done", text: "y" });
   await runChatPass({ client: noDir, executor: plain });
   check("without an attachment folder the job carries no files", plain.jobs[0] && !("attachments" in plain.jobs[0]));
+
+  // the attachment folder sits in a shared /tmp: nothing can be planted in it ahead of the run
+  const { lstatSync, statSync, symlinkSync, readdirSync } = await import("node:fs");
+  const { basename } = await import("node:path");
+  const posix = typeof process.getuid === "function";
+  const base = join(mkdtempSync(join(tmpdir(), "picker-base-")), "many-iris-attachments-test");
+  let turnSeen = null;
+  const peek = { async run(job) { const p = job.attachments?.find((a) => a.path)?.path; turnSeen = p ? { dir: dirname(p), dirMode: statSync(dirname(p)).mode & 0o777, fileMode: statSync(p).mode & 0o777 } : null; return { outcome: "done", text: "ok" }; } };
+  await runChatPass({ client: new ChatBoard([{ item_id: "task/1", seq: 13, text: "x", attachments: [{ id: "img", name: "shot.png" }] }]), executor: peek, attachDir: base });
+  check("each turn gets its own unpredictable folder under the base",
+    turnSeen && dirname(turnSeen.dir) === base && /^task_1-13-[A-Za-z0-9]{6}$/.test(basename(turnSeen.dir)), JSON.stringify(turnSeen));
+  if (posix) {
+    check("the base, the turn folder and the files are this user's only",
+      (statSync(base).mode & 0o777) === 0o700 && turnSeen?.dirMode === 0o700 && turnSeen?.fileMode === 0o600, JSON.stringify({ base: (statSync(base).mode & 0o777).toString(8), ...turnSeen }));
+  }
+  check("the turn folder is removed after the run", turnSeen && !existsSync(turnSeen.dir) && readdirSync(base).length === 0);
+
+  const target = mkdtempSync(join(tmpdir(), "picker-target-"));
+  const link = join(mkdtempSync(join(tmpdir(), "picker-link-")), "many-iris-attachments-test");
+  let linked = true;
+  try { symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir"); } catch { linked = false; }
+  if (linked && lstatSync(link).isSymbolicLink()) {
+    check("a base that is a link is refused", privateTurnDir(link, "t-1") === null && readdirSync(target).length === 0);
+    const viaLink = executorOf({ outcome: "done", text: "y" });
+    const refused = new ChatBoard([{ item_id: "task1", seq: 14, text: "x", attachments: [{ id: "img", name: "shot.png" }] }]);
+    await runChatPass({ client: refused, executor: viaLink, attachDir: link });
+    check("a refused base still answers, telling the worker the files could not be given",
+      viaLink.jobs[0]?.attachments?.[0]?.error === "attachment folder is not safe" && !viaLink.jobs[0].attachments[0].path && readdirSync(target).length === 0 && refused.replies.length === 1);
+  } else {
+    console.log("skip: could not make a link here (the link case is covered on Linux CI)");
+  }
+
+  const planted = mkdtempSync(join(tmpdir(), "picker-planted-"));
+  writeFileSync(join(planted, "1-shot.png"), "keep");
+  const got = await fetchAttachments(new ChatBoard([]), [{ id: "img", name: "shot.png" }], planted);
+  const { readFileSync: readKeep } = await import("node:fs");
+  check("a file already at the path is not written over", got[0]?.error && !got[0].path && readKeep(join(planted, "1-shot.png"), "utf8") === "keep", JSON.stringify(got));
+  // the link's folder first (removing it drops the link, not what it points at), then the rest
+  for (const dir of [dirname(link), dirname(base), target, planted, attachDir]) rmSync(dir, { recursive: true, force: true });
 
   check("plain text is the answer as it is", chatAnswer({ outcome: "done", text: "plain" }).reply === "plain");
   check("an answer longer than the board keeps is cut", chatAnswer({ outcome: "done", text: JSON.stringify({ reply: "あ".repeat(25000) }) }).reply.length === 20000);

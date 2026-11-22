@@ -67,6 +67,9 @@ export function configFromEnv(env) {
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",
     // Where a conversation turn's attachments are put for the executor (one
     // folder per turn, removed after the run). The executor is told the paths.
+    // /tmp is shared, so runChatPass uses this folder only if it is a real
+    // folder of this user (narrowed to 0700) and gives each turn an
+    // unpredictable private subfolder (privateTurnDir in picker.mjs).
     attachDir: env.PICKER_ATTACH_DIR || join(tmpdir(), `many-iris-attachments-${(env.PICKER_WRITER ?? "").replace(/[^A-Za-z0-9_-]/g, "_")}`),
     // Optional stop files (e.g. the run directory's STOP, and STOP-devin for
     // the devin picker): while any of them exists, a resident --watch picker

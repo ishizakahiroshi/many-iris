@@ -39,7 +39,7 @@
 // - One run per pass, and a daily cap, bound what an unattended
 //   picker can do before a person looks.
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BoardRefusal, BoardUnreachable } from "./board-client.mjs";
 import { takeoverRef } from "./takeover.mjs";
@@ -295,19 +295,41 @@ export function safeFileName(name, index) {
 export async function fetchAttachments(client, attachments, dir) {
   const out = [];
   if (!Array.isArray(attachments) || attachments.length === 0) return out;
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   for (const [index, a] of attachments.entries()) {
     const name = String(a?.name ?? "file");
     try {
       const got = await client.readAttachment(String(a?.id ?? ""));
       const path = join(dir, safeFileName(got.name || name, index));
-      writeFileSync(path, got.bytes);
+      // "wx": a file or link already at this path is refused, never written through.
+      writeFileSync(path, got.bytes, { flag: "wx", mode: 0o600 });
       out.push({ name: got.name || name, mime: got.mime, path, bytes: got.bytes.length });
     } catch (error) {
       out.push({ name, error: error instanceof BoardRefusal ? error.code : "could not be fetched" });
     }
   }
   return out;
+}
+
+/**
+ * A private folder for one turn's attachments under base, or null when base
+ * is not safe to use. base keeps a stable name (the worker wrappers allow
+ * reading whichever folder the paths sit in), but it usually lives in a shared
+ * /tmp: it must be a real folder owned by this user, not a link or a folder
+ * someone else made first, and it is narrowed to 0700. Each turn then gets an
+ * unpredictable 0700 subfolder from mkdtemp, so nothing can be planted in it.
+ */
+export function privateTurnDir(base, prefix) {
+  try {
+    mkdirSync(base, { recursive: true, mode: 0o700 });
+    const st = lstatSync(base);
+    if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return null;
+    chmodSync(base, 0o700);
+    return mkdtempSync(join(base, `${prefix}-`));
+  } catch {
+    return null;
+  }
 }
 
 export async function runChatPass({ client, executor, log = () => {}, attachDir = null }) {
@@ -344,13 +366,19 @@ export async function runChatPass({ client, executor, log = () => {}, attachDir 
   // The owner's files on this turn: fetched here (this picker holds the board key, the
   // worker does not) and handed over as paths. Removed when the run ends.
   const sent = Array.isArray(taken?.turn?.attachments) ? taken.turn.attachments : [];
-  const turnDir = attachDir && sent.length && typeof client.readAttachment === "function"
-    ? join(attachDir, `${turn.item_id.replace(/[^A-Za-z0-9_-]/g, "_")}-${turn.seq}`) : null;
+  const wantFiles = Boolean(attachDir && sent.length && typeof client.readAttachment === "function");
+  let turnDir = null;
   let result;
   try {
-    if (turnDir) {
-      job.attachments = await fetchAttachments(client, sent, turnDir);
-      log(`fetched ${job.attachments.filter((a) => a.path).length} of ${sent.length} attachment(s) for chat turn ${turn.seq}`);
+    if (wantFiles) {
+      turnDir = privateTurnDir(attachDir, `${turn.item_id.replace(/[^A-Za-z0-9_-]/g, "_")}-${turn.seq}`);
+      if (turnDir) {
+        job.attachments = await fetchAttachments(client, sent, turnDir);
+        log(`fetched ${job.attachments.filter((a) => a.path).length} of ${sent.length} attachment(s) for chat turn ${turn.seq}`);
+      } else {
+        job.attachments = sent.map((a) => ({ name: String(a?.name ?? "file"), error: "attachment folder is not safe" }));
+        log(`attachment folder ${attachDir} is a link, not a folder, or not this user's; chat turn ${turn.seq} gets no files`);
+      }
     }
     result = await executor.run(job, { progress: async () => {} });
   } catch (error) {

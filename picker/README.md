@@ -73,7 +73,7 @@ cron の例（5 分おきに 1 回）:
 | `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限（1〜50）。`0` で上限なし（止めるときは `PICKER_STOP_FILE` か cron 側の STOP） |
 | `PICKER_STATE_FILE` | | `picker-state.json` | 1 日の実行数の記録 |
 | `PICKER_STOP_FILE` | | なし | `--watch` 用。カンマ区切りのファイルのどれかがある間は全パスを止める |
-| `PICKER_ATTACH_DIR` | | OS の一時フォルダの `many-iris-attachments-<書き手>` | 会話の添付を置くフォルダ。1 回分ごとに作り、実行が終わったら消す。作業役には `job.attachments` でパスを渡す |
+| `PICKER_ATTACH_DIR` | | OS の一時フォルダの `many-iris-attachments-<書き手>` | 会話の添付を置くフォルダ。拾い手の利用者のフォルダでなければ（リンクや、ほかの利用者が先に作ったもの）使わず、0700 に締める。1 回分ごとに推測できない名前の 0700 のフォルダを作り、ファイルは 0600 で書いて、実行が終わったら消す。作業役には `job.attachments` でパスを渡す |
 | `PICKER_EXECUTOR` | | `record` | `record`（記録のみ）か `command`（下記） |
 | `PICKER_COMMAND` | command 時 | — | 実行するコマンド（シェルを介さず直接起動） |
 | `PICKER_COMMAND_ARGS` | | `[]` | コマンドの引数（JSON 配列） |
