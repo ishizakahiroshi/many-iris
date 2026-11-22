@@ -29,6 +29,21 @@
   let shown = null;       // the open conversation's data
   let chatTimer = null;
   let busy = false;
+  let pending = [];       // attachments uploaded for the next message: {id, name, bytes, chars}
+  let uploading = 0;
+
+  // Attachments (see the design: docs/local/design_chat-attachments_2026-11-22.md).
+  // A paste longer than this becomes an attachment card instead of text.
+  const PASTE_ATTACH_CHARS = 2000;
+  const FILE_RE = /\.(txt|md|log)$/i;
+  const attachErrors = {
+    TOO_LARGE: '1 ファイルは 1 MB までです。',
+    CONTENT_TYPE: 'テキストとして送れませんでした。',
+    BOARD_EVENT_LIMIT: 'この会話の添付が上限に達しています。',
+    FORBIDDEN: 'この会話には添付できません。',
+  };
+  const limits = () => (shown && shown.attachment_limits) || { max_bytes: 1048576, per_message: 5 };
+  const kb = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
 
   function el(tag, className, content) {
     const node = document.createElement(tag);
@@ -140,11 +155,20 @@
   }
 
   // --- one conversation
-  function bubble(role, who, at, text, ref) {
+  function bubble(role, who, at, text, ref, attachments) {
     const row = el('div', 'chat-row ' + (role === 'owner' ? 'me' : 'ai'));
     const node = el('div', 'chat-msg');
     if (role !== 'owner') node.append(el('span', 'chat-who', who));
-    node.append(el('div', 'chat-text', text));
+    if (text) node.append(el('div', 'chat-text', text));
+    for (const a of attachments || []) {
+      const label = a.name + '（' + a.chars + ' 字）';
+      if (a.expired) { node.append(el('span', 'chat-card gone', label + '　期限切れ')); continue; }
+      const card = el('a', 'chat-card', label);
+      card.href = '/api/board/attachment?id=' + encodeURIComponent(a.id);
+      card.target = '_blank';
+      card.rel = 'noopener noreferrer';
+      node.append(card);
+    }
     if (typeof ref === 'string' && ref.startsWith('https://')) node.append(link(ref));
     const t = el('span', 'chat-time', (role === 'owner' && who ? who + '　' : '') + when(at));
     row.append(node, t);
@@ -164,10 +188,10 @@
       entries.push({ at: n.at, role: 'agent', who: partnerLabel(n.actor), text: n.text, ref: n.ref });
     }
     for (const m of data.messages || []) {
-      entries.push({ at: m.at, role: m.role, who: m.role === 'owner' ? '→ ' + partnerLabel(m.to) : partnerLabel(m.actor), text: m.text, ref: m.ref });
+      entries.push({ at: m.at, role: m.role, who: m.role === 'owner' ? '→ ' + partnerLabel(m.to) : partnerLabel(m.actor), text: m.text, ref: m.ref, attachments: m.attachments });
     }
     entries.sort((a, b) => a.at - b.at);
-    for (const e of entries) log.append(bubble(e.role, e.who, e.at, e.text, e.ref));
+    for (const e of entries) log.append(bubble(e.role, e.who, e.at, e.text, e.ref, e.attachments));
     const open = data.open;
     let wait = '';
     if (open && open.status === 'waiting') wait = partnerLabel(open.to) + ' が 1 分以内に拾います…';
@@ -200,6 +224,7 @@
   // --- which view: the hash names the open conversation
   function route() {
     const id = decodeURIComponent(location.hash.slice(1));
+    discardPending();
     clearInterval(chatTimer);
     chatTimer = null;
     closeSide();
@@ -243,6 +268,77 @@
     area.style.height = Math.min(area.scrollHeight, max) + 'px';
   }
 
+  // --- attachments
+  function renderPending() {
+    const list = $('chat-attach');
+    list.replaceChildren();
+    for (const a of pending) {
+      const li = el('li', 'chat-card');
+      li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
+      const x = el('button', 'quiet chat-card-x', '×');
+      x.type = 'button';
+      x.setAttribute('aria-label', a.name + ' をやめる');
+      x.addEventListener('click', () => dropPending(a.id));
+      li.append(x);
+      list.append(li);
+    }
+    list.hidden = !pending.length;
+  }
+  const takeBack = (id) => fetch('/api/board/attachment?item_id=' + encodeURIComponent(current) + '&id=' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
+  function dropPending(id) {
+    pending = pending.filter((a) => a.id !== id);
+    renderPending();
+    if (current) takeBack(id);
+  }
+  // Unsent attachments of the conversation being left are taken back (best effort).
+  function discardPending() {
+    const left = pending;
+    pending = [];
+    if (current) for (const a of left) takeBack(a.id);
+    renderPending();
+  }
+  async function attach(name, text) {
+    const status = $('chat-status');
+    if (!current || $('chat-text').disabled) { status.textContent = '返事が来てから添付してください。'; return false; }
+    if (pending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; return false; }
+    if (new Blob([text]).size > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; return false; }
+    uploading += 1;
+    $('chat-send').disabled = true;
+    status.textContent = '添付を保管しています…';
+    try {
+      const response = await fetch('/api/board/attachment?item_id=' + encodeURIComponent(current) + '&name=' + encodeURIComponent(name), {
+        method: 'POST', cache: 'no-store',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: text,
+      });
+      let answer = null;
+      try { answer = await response.json(); } catch { answer = null; }
+      if (response.ok && answer && answer.ok === true) {
+        pending.push({ id: answer.attachment.id, name: answer.attachment.name, bytes: answer.attachment.bytes, chars: answer.attachment.chars });
+        renderPending();
+        status.textContent = '';
+        return true;
+      }
+      status.textContent = attachErrors[answer && answer.code] || errors[answer && answer.code] || '添付できませんでした。';
+      return false;
+    } catch {
+      status.textContent = '接続できません。通信を確かめてください。';
+      return false;
+    } finally {
+      uploading -= 1;
+      if (!uploading) $('chat-send').disabled = Boolean(shown && shown.open);
+    }
+  }
+  async function attachFiles(files) {
+    for (const file of files) {
+      if (!FILE_RE.test(file.name)) { $('chat-status').textContent = '添付できるのは .txt .md .log のファイルです。'; continue; }
+      if (file.size > limits().max_bytes) { $('chat-status').textContent = '1 ファイルは 1 MB までです。'; continue; }
+      let text;
+      try { text = await file.text(); } catch { $('chat-status').textContent = 'ファイルを読めませんでした。'; continue; }
+      if (!await attach(file.name, text)) break;
+    }
+  }
+
   function setup() {
     for (const id of ['chat-start-partner', 'chat-partner']) for (const [v, l] of partners) $(id).append(option(v, l));
     $('chat-new').addEventListener('click', () => { if (location.hash) location.hash = ''; else route(); });
@@ -284,17 +380,37 @@
     const text = $('chat-text');
     text.addEventListener('input', () => grow(text, 240));
     sendOnEnter(text, $('chat-form'));
+    // A long paste becomes an attachment card; the page never puts it in the box.
+    text.addEventListener('paste', (event) => {
+      const pasted = event.clipboardData ? event.clipboardData.getData('text/plain') : '';
+      if ([...pasted].length <= PASTE_ATTACH_CHARS) return;
+      event.preventDefault();
+      attach('貼り付け.txt', pasted);
+    });
+    $('chat-file').addEventListener('change', (event) => { attachFiles([...event.target.files]); event.target.value = ''; });
+    const talk = $('chat-talk');
+    talk.addEventListener('dragover', (event) => { if (event.dataTransfer && [...event.dataTransfer.types].includes('Files')) event.preventDefault(); });
+    talk.addEventListener('drop', (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      attachFiles([...event.dataTransfer.files]);
+    });
     $('chat-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const status = $('chat-status');
       const body = text.value.trim();
-      if (!current || !body) { status.textContent = '書いてから送ってください。'; return; }
+      if (uploading) { status.textContent = '添付を保管しています。少し待ってください。'; return; }
+      if (!current || (!body && !pending.length)) { status.textContent = '書いてから送ってください。'; return; }
       $('chat-send').disabled = true;
       status.textContent = '送っています…';
-      const done = await write({ op: 'chat_send', item_id: current, text: body, to: $('chat-partner').value });
+      const message = { op: 'chat_send', item_id: current, text: body, to: $('chat-partner').value };
+      if (pending.length) message.attachments = pending.map((a) => a.id);
+      const done = await write(message);
       $('chat-send').disabled = false;
       if (!done.ok) { status.textContent = done.text; return; }
       text.value = '';
+      pending = [];
+      renderPending();
       grow(text, 240);
       status.textContent = '';
       const log = $('chat-log');

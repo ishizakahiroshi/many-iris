@@ -7,6 +7,10 @@ import {
   nonNegativeInteger, onlyKeys, optionalStr, requiredStr, sameContent, validHttpsUrl,
   validItemId, validLine, validateItem, type Item,
 } from "./rules";
+import {
+  ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_COUNT, ATTACHMENT_MAX_UNSENT, ATTACHMENT_PER_MESSAGE, ATTACHMENT_TOTAL_BYTES,
+  ATTACHMENT_TTL_MS, READ_MAX_CHARS, markerText, validAttachmentId,
+} from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
 import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, parseOrder } from "./route";
 import {
@@ -128,6 +132,20 @@ const CHAT_SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS chat_messages_item ON chat_messages(item_id, seq)`,
   `CREATE INDEX IF NOT EXISTS chat_messages_open ON chat_messages(status, to_target)`,
+  // Text attachments: the body is in R2 (key att/<att_id>); only the name, the
+  // sizes and the first lines are kept here. seq is NULL until the message
+  // that carries it is sent.
+  `CREATE TABLE IF NOT EXISTS chat_attachments(
+    att_id TEXT PRIMARY KEY NOT NULL,
+    item_id TEXT NOT NULL REFERENCES board_items(item_id),
+    seq INTEGER,
+    at INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    chars INTEGER NOT NULL,
+    head TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS chat_attachments_item ON chat_attachments(item_id, seq)`,
 ];
 /** The longest message in a conversation (characters). */
 export const CHAT_TEXT_MAX = 20000;
@@ -443,13 +461,85 @@ export class Store {
 
   // --- conversations ("話す") ------------------------------------------
 
+  /** The sent attachments of an item, by the seq of the message that carries them. */
+  private attachmentsBySeq(itemId: string): Map<number, Record<string, unknown>[]> {
+    const out = new Map<number, Record<string, unknown>[]>();
+    const expired = Date.now() - ATTACHMENT_TTL_MS;
+    for (const r of this.sql.exec(
+      "SELECT att_id,seq,at,name,bytes,chars,head FROM chat_attachments WHERE item_id=? AND seq IS NOT NULL ORDER BY at, att_id", itemId,
+    ).toArray() as Row[]) {
+      const list = out.get(num(r.seq)) ?? [];
+      list.push({ id: str(r.att_id), name: str(r.name), bytes: num(r.bytes), chars: num(r.chars), head: str(r.head), expired: num(r.at) < expired });
+      out.set(num(r.seq), list);
+    }
+    return out;
+  }
   private chatRows(itemId: string): Record<string, unknown>[] {
+    const attachments = this.attachmentsBySeq(itemId);
     return (this.sql.exec(
       "SELECT seq,at,actor,role,to_target,text,ref,status FROM chat_messages WHERE item_id=? ORDER BY seq", itemId,
     ).toArray() as Row[]).map((r) => ({
       seq: num(r.seq), at: num(r.at), actor: str(r.actor), role: str(r.role), to: strOrNull(r.to_target ?? null),
       text: str(r.text), ref: strOrNull(r.ref ?? null), status: strOrNull(r.status ?? null),
+      attachments: attachments.get(num(r.seq)) ?? [],
     }));
+  }
+  /** A message as the worker reads it: its text, then a marker per attachment (never the body). */
+  private withMarkers(m: Record<string, unknown>): string {
+    const list = (m.attachments as Record<string, unknown>[] | undefined) ?? [];
+    const marks = list.map((a) => markerText(a as { id: string; name: string; bytes: number; chars: number; head: string }));
+    return [m.text as string, ...marks].filter((t) => t !== "").join("\n");
+  }
+
+  /** Reserve an uploaded text (the body goes to R2 right after). One conversation holds a bounded number and total size. */
+  attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string): Record<string, unknown> {
+    if (!validItemId(itemId) || !validAttachmentId(id)) throw invalid("item_id or attachment id is not valid");
+    if (bytes < 1 || bytes > ATTACHMENT_MAX_BYTES) throw invalid(`An attachment is 1 to ${ATTACHMENT_MAX_BYTES} bytes`);
+    return this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) has a conversation");
+      const sums = this.sql.exec(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS b, COALESCE(SUM(CASE WHEN seq IS NULL THEN 1 ELSE 0 END),0) AS u FROM chat_attachments WHERE item_id=?", itemId,
+      ).one() as Row;
+      if (num(sums.n) >= ATTACHMENT_MAX_COUNT) throw new BoardError("BOARD_EVENT_LIMIT", "This conversation holds as many attachments as it may");
+      if (num(sums.b) + bytes > ATTACHMENT_TOTAL_BYTES) throw new BoardError("BOARD_EVENT_LIMIT", "The attachments of this conversation are full");
+      if (num(sums.u) >= ATTACHMENT_MAX_UNSENT) throw new BoardError("BOARD_EVENT_LIMIT", "Too many attachments wait to be sent");
+      const at = Date.now();
+      this.sql.exec("INSERT INTO chat_attachments(att_id,item_id,seq,at,name,bytes,chars,head) VALUES(?,?,NULL,?,?,?,?,?)", id, itemId, at, name, bytes, chars, head);
+      return { ok: true, attachment: { id, name, bytes, chars, head, at } };
+    });
+  }
+  /** Forget an attachment that was not sent yet (the owner took the card away, or the R2 write failed). */
+  attachmentDrop(itemId: string, id: string): Record<string, unknown> {
+    if (!validItemId(itemId) || !validAttachmentId(id)) throw invalid("item_id or attachment id is not valid");
+    return this.tx(() => {
+      const rows = this.sql.exec("SELECT seq FROM chat_attachments WHERE att_id=? AND item_id=?", id, itemId).toArray() as Row[];
+      if (!rows.length) throw new BoardError("NOT_FOUND", "No such attachment");
+      if (rows[0].seq !== null) throw new BoardError("FORBIDDEN", "A sent attachment stays");
+      this.sql.exec("DELETE FROM chat_attachments WHERE att_id=?", id);
+      return { ok: true, changed: true };
+    });
+  }
+  /** One attachment's record, or NOT_FOUND (also once it is older than the 30 days). */
+  attachmentMeta(id: string): { id: string; item_id: string; name: string; bytes: number; chars: number } {
+    if (!validAttachmentId(id)) throw invalid("attachment id is not valid");
+    const rows = this.sql.exec("SELECT att_id,item_id,at,name,bytes,chars FROM chat_attachments WHERE att_id=?", id).toArray() as Row[];
+    if (!rows.length) throw new BoardError("NOT_FOUND", "No such attachment");
+    if (num(rows[0].at) < Date.now() - ATTACHMENT_TTL_MS) throw new BoardError("NOT_FOUND", "This attachment has expired");
+    return { id, item_id: str(rows[0].item_id), name: str(rows[0].name), bytes: num(rows[0].bytes), chars: num(rows[0].chars) };
+  }
+  /** The `board_chat_attachment` tool's checks: only the server's workers read attachments. */
+  attachmentForWorker(actor: string, input: unknown): { meta: ReturnType<Store["attachmentMeta"]>; offset: number; limit: number } {
+    const obj = asObject(input);
+    onlyKeys(obj, ["attachment_id", "offset", "limit"]);
+    if (!isChatTarget(actor)) throw new BoardError("FORBIDDEN", "Only the server's workers read attachments");
+    const meta = this.attachmentMeta(requiredStr(obj, "attachment_id"));
+    const offset = has(obj, "offset") ? obj.offset : 0;
+    const limit = has(obj, "limit") ? obj.limit : READ_MAX_CHARS;
+    if (!nonNegativeInteger(offset)) throw invalid("offset must be a non-negative integer");
+    if (!nonNegativeInteger(limit) || (limit as number) < 1) throw invalid("limit must be a positive integer");
+    return { meta, offset: offset as number, limit: Math.min(limit as number, READ_MAX_CHARS) };
   }
   /** The item's notes written by the server's workers (its runs' progress and results), oldest first. */
   private workerNotes(itemId: string): Record<string, unknown>[] {
@@ -480,6 +570,10 @@ export class Store {
       item: { item_id: item.item_id, project: item.project, title: item.title, state: item.state, kind: item.kind },
       handoff, notes: this.workerNotes(itemId), messages, open,
       partner: this.chatPartner(itemId, handoff), targets: [...CHAT_TARGETS], text_max: CHAT_TEXT_MAX,
+      attachment_limits: {
+        max_bytes: ATTACHMENT_MAX_BYTES, total_bytes: ATTACHMENT_TOTAL_BYTES, max_count: ATTACHMENT_MAX_COUNT,
+        per_message: ATTACHMENT_PER_MESSAGE, ttl_days: Math.round(ATTACHMENT_TTL_MS / 86400000),
+      },
     };
   }
   /** Per item: how many messages, whether a turn waits for an answer, and the newest message's time (cards and the chat list). */
@@ -492,10 +586,16 @@ export class Store {
   }
   /** The owner sends a message (from the page only: ownerWrite). One open turn per item. */
   private chatSend(actor: string, obj: Record<string, unknown>): Record<string, unknown> {
-    onlyKeys(obj, ["op", "item_id", "text", "to"]);
+    onlyKeys(obj, ["op", "item_id", "text", "to", "attachments"]);
     const itemId = requiredStr(obj, "item_id");
-    const text = requiredStr(obj, "text");
-    if (!validLine(text, CHAT_TEXT_MAX, true)) throw invalid(`text must be 1 to ${CHAT_TEXT_MAX} characters`);
+    // Attachments (ids from the upload). With at least one, the text may be empty.
+    const ids = has(obj, "attachments") ? obj.attachments : [];
+    if (!Array.isArray(ids) || ids.length > ATTACHMENT_PER_MESSAGE || !ids.every(validAttachmentId) || new Set(ids).size !== ids.length)
+      throw invalid(`attachments must be up to ${ATTACHMENT_PER_MESSAGE} distinct attachment ids`);
+    const typed = has(obj, "text") ? obj.text : "";
+    if (typeof typed !== "string") throw invalid("text must be text");
+    const text = ids.length > 0 && typed.trim() === "" ? "" : requiredStr(obj, "text");
+    if (text !== "" && !validLine(text, CHAT_TEXT_MAX, true)) throw invalid(`text must be 1 to ${CHAT_TEXT_MAX} characters`);
     const to = has(obj, "to") ? obj.to : null;
     if (to !== null && !isChatTarget(to)) throw invalid(`to must be one of ${CHAT_TARGETS.join(", ")}`);
     return this.tx(() => {
@@ -513,6 +613,14 @@ export class Store {
         "INSERT INTO chat_messages(item_id,at,actor,role,to_target,text,status) VALUES(?,?,?,'owner',?,?,'waiting')",
         itemId, Date.now(), actor, target, text,
       );
+      if (ids.length > 0) {
+        const seq = num((this.sql.exec("SELECT MAX(seq) AS s FROM chat_messages").one() as Row).s);
+        for (const id of ids as string[]) {
+          const own = this.sql.exec("SELECT att_id FROM chat_attachments WHERE att_id=? AND item_id=? AND seq IS NULL", id, itemId).toArray();
+          if (!own.length) throw new BoardError("NOT_FOUND", "An attachment was not found (or was sent already)");
+          this.sql.exec("UPDATE chat_attachments SET seq=? WHERE att_id=?", seq, id);
+        }
+      }
       return this.chatView(itemId);
     });
   }
@@ -554,7 +662,7 @@ export class Store {
       // entries are kept when it is longer than CHAT_TRANSCRIPT_CHARS.
       const entries: { at: number; who: string; actor: string; text: string }[] = [];
       for (const n of this.workerNotes(itemId)) entries.push({ at: n.at as number, who: "agent", actor: n.actor as string, text: n.text as string });
-      for (const m of this.chatRows(itemId)) entries.push({ at: m.at as number, who: m.role as string, actor: m.actor as string, text: m.text as string });
+      for (const m of this.chatRows(itemId)) entries.push({ at: m.at as number, who: m.role as string, actor: m.actor as string, text: this.withMarkers(m) });
       entries.sort((a, b) => a.at - b.at);
       let total = 0;
       const kept: typeof entries = [];
@@ -565,12 +673,20 @@ export class Store {
       }
       return {
         ok: true,
-        turn: { item_id: itemId, seq, text: (this.sql.exec("SELECT text FROM chat_messages WHERE seq=?", seq).one() as Row).text },
+        turn: {
+          item_id: itemId, seq, text: this.turnText(itemId, seq),
+          attachments: ((this.chatRows(itemId).find((m) => m.seq === seq)?.attachments ?? []) as Record<string, unknown>[])
+            .map((a) => ({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars })),
+        },
         item: { item_id: item.item_id, project: item.project, title: item.title, source_ref: item.source_ref },
         handoff: handoff === null ? null : { request_id: handoff.request_id, title: handoff.title, accepted_by: handoff.accepted_by },
         transcript: kept, transcript_truncated: kept.length < entries.length,
       };
     });
+  }
+  private turnText(itemId: string, seq: number): string {
+    const m = this.chatRows(itemId).find((x) => x.seq === seq);
+    return m ? this.withMarkers(m) : "";
   }
   /** The `board_chat_reply` tool: answer the turn this worker took. */
   chatReply(actor: string, input: unknown): Record<string, unknown> {

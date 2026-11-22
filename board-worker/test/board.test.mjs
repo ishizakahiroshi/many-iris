@@ -115,7 +115,7 @@ const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 async function main() {
   mkdirSync(temp, { recursive: true });
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=22\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=26\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -162,7 +162,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("eighteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_reply,board_resolve_dispatch",
+  check("nineteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -720,14 +720,93 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("a worker cannot take a turn for the other worker", code(await call(K.vps, "board_chat_take", { item_id: orderWork, seq: (await chatOf(orderWork)).body.open.seq })) === "FORBIDDEN");
   check("a conversation of an unknown item is not found", (await chatOf("nope")).status === 404);
 
-  // --- the item limit (22 in this run)
+  // --- text attachments of a conversation (R2: local simulation under wrangler dev)
+  r = await ownerPost({ op: "add", project: "demo", title: "添付の会話", day: dayOf(0) });
+  const attWork = (await r.json()).item?.item_id ?? "";
+  const upload = (item, name, body, headers = { ...jar, origin: base }, type = "text/plain; charset=utf-8") =>
+    fetch(`${base}/api/board/attachment?item_id=${encodeURIComponent(item)}&name=${encodeURIComponent(name)}`, { method: "POST", headers: { "content-type": type, ...headers }, body });
+  const bodyText = ["一行目", "二行目", "三行目", "四行目（先頭には入らない）", "ZZ-SENTINEL-BODY"].join("\n") + "\n" + "あ".repeat(30000);
+  check("an upload needs Access", (await upload(attWork, "a.txt", "x", { origin: base })).status === 401);
+  check("an upload needs this site's Origin", (await upload(attWork, "a.txt", "x", { ...jar })).status === 403);
+  check("an upload with another Origin is refused", (await upload(attWork, "a.txt", "x", { ...jar, origin: "https://evil.example" })).status === 403);
+  check("an upload must be text", (await upload(attWork, "a.png", "x", undefined, "image/png")).status === 415);
+  check("an empty upload is refused", (await upload(attWork, "a.txt", "")).status === 400);
+  check("an upload that is not UTF-8 is refused", (await upload(attWork, "a.txt", new Uint8Array([0xff, 0xfe, 0x41, 0x80]))).status === 400);
+  check("an upload with a NUL is refused", (await upload(attWork, "a.txt", "a\u0000b")).status === 400);
+  check("an upload for an unknown item is refused", (await upload("nope", "a.txt", "x")).status === 404);
+  check("an upload over 1 MB is refused", (await upload(attWork, "big.txt", "a".repeat(1048577))).status === 413);
+  r = await upload(attWork, "../メモ/貼り付け.txt", bodyText);
+  const up = await r.json();
+  check("a text is stored; the name is kept without its path, the head is 3 lines",
+    r.status === 200 && up.attachment?.name === "貼り付け.txt" && up.attachment?.chars === bodyText.length && up.attachment?.head === "一行目\n二行目\n三行目" && /^[a-f0-9]{32}$/.test(up.attachment?.id),
+    JSON.stringify(up).slice(0, 300));
+  const attId = up.attachment?.id ?? "";
+  const attGet = (id, headers = jar) => fetch(`${base}/api/board/attachment?id=${id}`, { headers });
+  check("reading an attachment needs Access", (await attGet(attId, {})).status === 401);
+  const got = await attGet(attId);
+  check("the owner reads the body back as plain text", got.status === 200 && (await got.text()) === bodyText && got.headers.get("content-type")?.startsWith("text/plain"));
+  check("an unknown attachment id is not found", (await attGet("0".repeat(32))).status === 404);
+  check("a bad attachment id is refused", (await attGet("zz")).status === 400);
+  check("a message with an unknown attachment is refused and leaves no message",
+    (await ownerCode({ op: "chat_send", item_id: attWork, text: "見て", attachments: ["1".repeat(32)] })) === "404 NOT_FOUND" && (await chatOf(attWork)).body.messages?.length === 0);
+  check("a bad attachment list is refused", (await ownerCode({ op: "chat_send", item_id: attWork, text: "見て", attachments: ["x"] })) === "400 INVALID" &&
+    (await ownerCode({ op: "chat_send", item_id: attWork, text: "見て", attachments: [attId, attId] })) === "400 INVALID");
+  check("the owner sends an attachment with no typed text", (await ownerCode({ op: "chat_send", item_id: attWork, text: "", attachments: [attId] })) === "200 OK");
+  chat = await chatOf(attWork);
+  const attMsg = chat.body.messages?.[0];
+  check("the page sees the card, not the body", attMsg?.text === "" && attMsg?.attachments?.length === 1 && attMsg.attachments[0].id === attId &&
+    attMsg.attachments[0].expired === false && !JSON.stringify(chat.body).includes("ZZ-SENTINEL-BODY") && chat.body.attachment_limits?.max_bytes === 1048576, JSON.stringify(chat.body.attachment_limits));
+  check("a sent attachment cannot be sent again", (await ownerCode({ op: "chat_send", item_id: attWork, text: "もう一度", attachments: [attId] })) === "409 HANDOFF_CONFLICT");
+  check("a sent attachment cannot be taken back", (await fetch(`${base}/api/board/attachment?item_id=${encodeURIComponent(attWork)}&id=${attId}`, { method: "DELETE", headers: { ...jar, origin: base } })).status === 403);
+  const attTurn = chat.body.open?.seq;
+  const attTaken = await call(K.vps, "board_chat_take", { item_id: attWork, seq: attTurn });
+  const transcriptText = JSON.stringify(attTaken.transcript);
+  check("the worker's transcript has a marker (name, size, head, id), never the body",
+    attTaken.ok === true && transcriptText.includes("貼り付け.txt") && transcriptText.includes(attId) && transcriptText.includes("一行目") &&
+    !transcriptText.includes("ZZ-SENTINEL-BODY") && !JSON.stringify(attTaken.turn).includes("ZZ-SENTINEL-BODY") &&
+    attTaken.turn.text.includes(attId) && attTaken.turn.attachments?.[0]?.id === attId && attTaken.turn.attachments[0].chars === bodyText.length,
+    JSON.stringify(attTaken.turn).slice(0, 400));
+  check("the transcript stays far smaller than the attachment", transcriptText.length < 2000, String(transcriptText.length));
+  check("a writer that is not a server worker cannot read an attachment", code(await call(K.alpha, "board_chat_attachment", { attachment_id: attId })) === "FORBIDDEN");
+  const part1 = await call(K.vps, "board_chat_attachment", { attachment_id: attId, offset: 0, limit: 10 });
+  check("the worker reads a part by characters", part1.ok === true && part1.text === "一行目\n二行目\n三行目".slice(0, 10) && part1.returned === 10 && part1.next_offset === 10 && part1.total_chars === bodyText.length, JSON.stringify(part1).slice(0, 300));
+  const sentinelAt = bodyText.indexOf("ZZ-SENTINEL-BODY");
+  const part2 = await call(K.vps, "board_chat_attachment", { attachment_id: attId, offset: sentinelAt, limit: 16 });
+  check("the worker reads a later part with an offset", part2.text === "ZZ-SENTINEL-BODY" && part2.next_offset === sentinelAt + 16, JSON.stringify(part2).slice(0, 200));
+  const whole = await call(K.vps, "board_chat_attachment", { attachment_id: attId });
+  check("a read returns at most 20000 characters and says where to go on", whole.returned === 20000 && whole.next_offset === 20000, JSON.stringify({ r: whole.returned, n: whole.next_offset }));
+  const tail = await call(K.vps, "board_chat_attachment", { attachment_id: attId, offset: bodyText.length - 5, limit: 100 });
+  check("the last part has no next_offset", tail.returned === 5 && tail.next_offset === null);
+  check("limit 0 is refused", code(await call(K.vps, "board_chat_attachment", { attachment_id: attId, limit: 0 })) === "INVALID");
+  check("an unknown attachment is not found for the worker", code(await call(K.vps, "board_chat_attachment", { attachment_id: "2".repeat(32) })) === "NOT_FOUND");
+  check("the worker answers a turn that had an attachment", (await call(K.vps, "board_chat_reply", { item_id: attWork, seq: attTurn, text: "読みました" })).ok === true);
+
+  // limits: one file 1 MB, five on a message, 5 MiB and 20 in a conversation; unsent ones can be taken back
+  r = await ownerPost({ op: "add", project: "demo", title: "添付の上限", day: dayOf(0) });
+  const capWork = (await r.json()).item?.item_id ?? "";
+  const mb = "a".repeat(1048576);
+  const ids = [];
+  for (let n = 0; n < 5; n++) { const x = await (await upload(capWork, `m${n}.txt`, mb)).json(); ids.push(x.attachment?.id); }
+  check("five files of exactly 1 MB are accepted", ids.every((x) => typeof x === "string"), JSON.stringify(ids));
+  check("a sixth file is over the conversation's 5 MiB", (await upload(capWork, "m5.txt", "a")).status === 409);
+  check("more than five on one message is refused", (await ownerCode({ op: "chat_send", item_id: capWork, text: "x", attachments: [...ids, "3".repeat(32)] })) === "400 INVALID");
+  r = await fetch(`${base}/api/board/attachment?item_id=${encodeURIComponent(capWork)}&id=${ids[4]}`, { method: "DELETE", headers: { ...jar, origin: base } });
+  check("an unsent attachment can be taken back", r.status === 200 && (await attGet(ids[4])).status === 404);
+  check("taking one back frees room", (await upload(capWork, "again.txt", mb)).status === 200);
+  r = await ownerPost({ op: "add", project: "demo", title: "未送信の上限", day: dayOf(0) });
+  const unsentWork = (await r.json()).item?.item_id ?? "";
+  let unsentCodes = [];
+  for (let n = 0; n < 11; n++) unsentCodes.push((await upload(unsentWork, `u${n}.txt`, "x")).status);
+  check("ten unsent attachments at most", unsentCodes.slice(0, 10).every((c) => c === 200) && unsentCodes[10] === 409, JSON.stringify(unsentCodes));
+
+  // --- the item limit (26 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 22 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 26 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 22, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 26, String(list.counts.items));
   // The counts are kept by triggers (issue #38), not counted per call: they must
   // still match the rows. Events are never deleted and seq is the rowid, so
   // the newest seq is the number of events.
