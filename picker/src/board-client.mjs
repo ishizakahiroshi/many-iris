@@ -54,6 +54,46 @@ export class BoardClient {
 
   /** Call one board tool and return its result object (`ok: true` data). */
   async call(tool, args = {}) {
+    const result = await this.rpc(tool, args);
+    const data = result.structuredContent ?? parseTextContent(result);
+    if (data === null || typeof data !== "object") {
+      throw new BoardUnreachable(`board call ${tool} returned no structured result`);
+    }
+    if (data.ok === false) {
+      throw new BoardRefusal(data.error?.code ?? "UNKNOWN", data.error?.detail ?? null);
+    }
+    return data;
+  }
+
+  /**
+   * One attachment of a conversation, whole: { name, mime, bytes: Buffer }.
+   * A text comes in parts (board_chat_attachment pages it by characters);
+   * an image comes as MCP image content.
+   */
+  async readAttachment(id) {
+    const first = await this.rpc("board_chat_attachment", { attachment_id: id });
+    const head = first.structuredContent ?? parseTextContent(first);
+    if (head === null || typeof head !== "object") throw new BoardUnreachable("board_chat_attachment returned no description");
+    if (head.ok === false) throw new BoardRefusal(head.error?.code ?? "UNKNOWN", head.error?.detail ?? null);
+    const image = Array.isArray(first.content) ? first.content.find((c) => c?.type === "image") : undefined;
+    if (image) {
+      if (typeof image.data !== "string" || typeof image.mimeType !== "string") throw new BoardUnreachable("board_chat_attachment returned a broken image");
+      return { name: String(head.name ?? "image"), mime: image.mimeType, bytes: Buffer.from(image.data, "base64") };
+    }
+    let text = String(head.text ?? "");
+    let next = head.next_offset;
+    // At most 1 MB of text: 20,000 characters a call, so a bounded number of calls.
+    for (let calls = 0; Number.isSafeInteger(next) && calls < 200; calls++) {
+      const part = await this.call("board_chat_attachment", { attachment_id: id, offset: next });
+      text += String(part.text ?? "");
+      next = part.next_offset;
+    }
+    if (Number.isSafeInteger(next)) throw new BoardUnreachable("board_chat_attachment did not reach the end of the text");
+    return { name: String(head.name ?? "text.txt"), mime: "text/plain", bytes: Buffer.from(text, "utf8") };
+  }
+
+  /** The tool call itself: the JSON-RPC `result` (protocol failures throw BoardUnreachable). */
+  async rpc(tool, args = {}) {
     let response;
     try {
       response = await this.fetchImpl(this.url, {
@@ -80,14 +120,7 @@ export class BoardClient {
       const message = body?.error?.message ?? `HTTP ${response.status}`;
       throw new BoardUnreachable(`board call ${tool} failed at the protocol level: ${message}`);
     }
-    const data = body.result.structuredContent ?? parseTextContent(body.result);
-    if (data === null || typeof data !== "object") {
-      throw new BoardUnreachable(`board call ${tool} returned no structured result`);
-    }
-    if (data.ok === false) {
-      throw new BoardRefusal(data.error?.code ?? "UNKNOWN", data.error?.detail ?? null);
-    }
-    return data;
+    return body.result;
   }
 
   /** All items of one project (or of every project), with no events. */

@@ -680,7 +680,7 @@ export class Store {
         turn: {
           item_id: itemId, seq, text: this.turnText(itemId, seq),
           attachments: ((this.chatRows(itemId).find((m) => m.seq === seq)?.attachments ?? []) as Record<string, unknown>[])
-            .map((a) => ({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars })),
+            .map((a) => ({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars, mime: a.mime ?? null })),
         },
         item: { item_id: item.item_id, project: item.project, title: item.title, source_ref: item.source_ref },
         handoff: handoff === null ? null : { request_id: handoff.request_id, title: handoff.title, accepted_by: handoff.accepted_by },

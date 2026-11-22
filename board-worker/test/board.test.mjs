@@ -802,7 +802,7 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   const imgPending = await call(K.vps, "board_chat_pending", {});
   const imgTurn = imgPending.turns?.find((t) => t.item_id === attWork)?.seq;
   const imgTaken = await call(K.vps, "board_chat_take", { item_id: attWork, seq: imgTurn });
-  check("the worker's turn carries an image marker", imgTaken.ok === true && imgTaken.turn.text.includes("添付 画像") && imgTaken.turn.text.includes(imgId), imgTaken.turn?.text);
+  check("the worker's turn carries an image marker", imgTaken.ok === true && imgTaken.turn.text.includes("添付 画像") && imgTaken.turn.text.includes(imgId) && imgTaken.turn.attachments?.[0]?.mime === "image/png", imgTaken.turn?.text);
   const rawImg = await rpc(K.vps, "tools/call", { name: "board_chat_attachment", arguments: { attachment_id: imgId } });
   const parts = rawImg.body.result?.content ?? [];
   const imgPart = parts.find((c) => c.type === "image");

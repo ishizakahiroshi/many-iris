@@ -13,6 +13,8 @@
 // repeat — the board, not this process, decides who took what.
 
 import { closeSync, existsSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
@@ -63,6 +65,9 @@ export function configFromEnv(env) {
       return value;
     })(),
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",
+    // Where a conversation turn's attachments are put for the executor (one
+    // folder per turn, removed after the run). The executor is told the paths.
+    attachDir: env.PICKER_ATTACH_DIR || join(tmpdir(), `many-iris-attachments-${(env.PICKER_WRITER ?? "").replace(/[^A-Za-z0-9_-]/g, "_")}`),
     // Optional stop files (e.g. the run directory's STOP, and STOP-devin for
     // the devin picker): while any of them exists, a resident --watch picker
     // takes no passes. The shell wrappers check their own stop files for the
@@ -157,7 +162,7 @@ async function pass(config, executor) {
   }
   try {
     // A conversation turn first: the owner is waiting on the other end.
-    const chat = await runChatPass({ client, executor, log });
+    const chat = await runChatPass({ client, executor, log, attachDir: config.attachDir });
     if (chat.kind !== "nothing") return chat;
     return await runPass({ client, config, executor, state: fileState(config.stateFile), log });
   } finally {

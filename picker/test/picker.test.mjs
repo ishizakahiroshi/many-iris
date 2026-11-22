@@ -371,11 +371,16 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         const t = this.turns.find((x) => x.seq === args.seq);
         if (!t || t.taken) throw new BoardRefusal("HANDOFF_CONFLICT", "not open");
         t.taken = true;
-        return { ok: true, turn: { item_id: t.item_id, seq: t.seq, text: t.text }, item: { item_id: t.item_id, project: "demo", title: "Item title" },
+        return { ok: true, turn: { item_id: t.item_id, seq: t.seq, text: t.text, attachments: t.attachments ?? [] }, item: { item_id: t.item_id, project: "demo", title: "Item title" },
           handoff: { request_id: "REQ-9", title: "Handed title" }, transcript: [{ at: 1, who: "owner", actor: "page:owner", text: t.text }] };
       }
       if (tool === "board_chat_reply") { this.replies.push(args); return { ok: true }; }
       throw new Error(`unexpected ${tool}`);
+    }
+    async readAttachment(id) {
+      if (id === "img") return { name: "shot.png", mime: "image/png", bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]) };
+      if (id === "txt") return { name: "../メモ.txt", mime: "text/plain", bytes: Buffer.from("中身", "utf8") };
+      throw new BoardRefusal("NOT_FOUND", "gone");
     }
   }
   const executorOf = (result) => ({ jobs: [], async run(job) { this.jobs.push(job); if (result instanceof Error) throw result; return result; } });
@@ -405,6 +410,24 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const raced = new ChatBoard([{ item_id: "task1", seq: 10, text: "x", taken: true }]);
   const r = await runChatPass({ client: raced, executor: executorOf({ outcome: "done", text: "y" }) });
   check("a turn someone else took is left alone", r.kind === "chat-refused" && raced.replies.length === 0);
+
+  // attachments: fetched into files for the executor, removed after the run
+  const { existsSync, readFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const attachDir = mkdtempSync(join(tmpdir(), "picker-att-"));
+  const withFiles = new ChatBoard([{ item_id: "task/1", seq: 11, text: "見て", attachments: [{ id: "img", name: "shot.png" }, { id: "txt", name: "メモ.txt" }, { id: "gone", name: "old.png" }] }]);
+  let seen = null;
+  const looking = { async run(job) { seen = job.attachments?.map((a) => ({ ...a, there: a.path ? existsSync(a.path) : false, body: a.path ? readFileSync(a.path) : null })); return { outcome: "done", text: "見ました" }; } };
+  await runChatPass({ client: withFiles, executor: looking, attachDir });
+  check("the turn's attachments reach the executor as files", seen?.length === 3 && seen[0].there && seen[0].mime === "image/png" && seen[0].body.length === 4 &&
+    seen[1].there && seen[1].body.toString("utf8") === "中身" && seen[1].path.startsWith(attachDir) && !seen[1].path.includes("..") && seen[2].error === "NOT_FOUND" && !seen[2].path, JSON.stringify(seen?.map((a) => ({ ...a, body: undefined }))));
+  check("the files are removed after the run", seen?.every((a) => !a.path || !existsSync(a.path)));
+  check("the turn is still answered", withFiles.replies[0]?.text === "見ました");
+  const noDir = new ChatBoard([{ item_id: "task1", seq: 12, text: "x", attachments: [{ id: "img", name: "shot.png" }] }]);
+  const plain = executorOf({ outcome: "done", text: "y" });
+  await runChatPass({ client: noDir, executor: plain });
+  check("without an attachment folder the job carries no files", plain.jobs[0] && !("attachments" in plain.jobs[0]));
 
   check("plain text is the answer as it is", chatAnswer({ outcome: "done", text: "plain" }).reply === "plain");
   check("an answer longer than the board keeps is cut", chatAnswer({ outcome: "done", text: JSON.stringify({ reply: "あ".repeat(25000) }) }).reply.length === 20000);

@@ -39,6 +39,8 @@
 // - One run per pass, and a daily cap, bound what an unattended
 //   picker can do before a person looks.
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { BoardRefusal, BoardUnreachable } from "./board-client.mjs";
 import { takeoverRef } from "./takeover.mjs";
 
@@ -277,7 +279,38 @@ export function chatAnswer(result) {
  * conversations; each turn needs the owner to send one). A board without
  * conversations (an older version) reads as nothing to do.
  */
-export async function runChatPass({ client, executor, log = () => {} }) {
+/** A file name that is safe in one folder: no path, no control or reserved characters. */
+export function safeFileName(name, index) {
+  // eslint-disable-next-line no-control-regex
+  const clean = String(name ?? "").replace(/[\u0000-\u001f\u007f/\\:*?"<>|]/g, "_").replace(/^[.\s]+/, "").slice(0, 80);
+  return `${index + 1}-${clean || "file"}`;
+}
+
+/**
+ * The turn's attachments as files the executor can read: each is fetched
+ * from the board into dir (created here; the caller removes it). Returns
+ * [{ name, mime, path, bytes }] and, for one that could not be fetched,
+ * [{ name, error }] so the worker can say so instead of guessing.
+ */
+export async function fetchAttachments(client, attachments, dir) {
+  const out = [];
+  if (!Array.isArray(attachments) || attachments.length === 0) return out;
+  mkdirSync(dir, { recursive: true });
+  for (const [index, a] of attachments.entries()) {
+    const name = String(a?.name ?? "file");
+    try {
+      const got = await client.readAttachment(String(a?.id ?? ""));
+      const path = join(dir, safeFileName(got.name || name, index));
+      writeFileSync(path, got.bytes);
+      out.push({ name: got.name || name, mime: got.mime, path, bytes: got.bytes.length });
+    } catch (error) {
+      out.push({ name, error: error instanceof BoardRefusal ? error.code : "could not be fetched" });
+    }
+  }
+  return out;
+}
+
+export async function runChatPass({ client, executor, log = () => {}, attachDir = null }) {
   let pending;
   try {
     pending = await client.call("board_chat_pending", {});
@@ -308,11 +341,22 @@ export async function runChatPass({ client, executor, log = () => {} }) {
     turn: { seq: turn.seq, text: String(taken?.turn?.text ?? "") },
     transcript: Array.isArray(taken?.transcript) ? taken.transcript : [],
   };
+  // The owner's files on this turn: fetched here (this picker holds the board key, the
+  // worker does not) and handed over as paths. Removed when the run ends.
+  const sent = Array.isArray(taken?.turn?.attachments) ? taken.turn.attachments : [];
+  const turnDir = attachDir && sent.length && typeof client.readAttachment === "function"
+    ? join(attachDir, `${turn.item_id.replace(/[^A-Za-z0-9_-]/g, "_")}-${turn.seq}`) : null;
   let result;
   try {
+    if (turnDir) {
+      job.attachments = await fetchAttachments(client, sent, turnDir);
+      log(`fetched ${job.attachments.filter((a) => a.path).length} of ${sent.length} attachment(s) for chat turn ${turn.seq}`);
+    }
     result = await executor.run(job, { progress: async () => {} });
   } catch (error) {
     result = { outcome: "stopped", text: `[失敗] executor failed: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (turnDir) rmSync(turnDir, { recursive: true, force: true });
   }
   const answer = chatAnswer(result);
   const args = { item_id: turn.item_id, seq: turn.seq, text: answer.reply };
