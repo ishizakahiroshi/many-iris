@@ -16,7 +16,7 @@
 // Work for any other destination is left for that writer to pick up.
 // The board and the Devin start come in as `DispatchDeps`, so
 // test/route.test.mjs runs this with stand-ins under Node.
-import { OWNER_ACTOR, chooseByOrder, isAlive, plainLine } from "./route.ts";
+import { OWNER_ACTOR, chooseByOrder, isAlive, orderFor, plainLine } from "./route.ts";
 
 export const DISPATCH_DEDUPE_MS = 15 * 60 * 1000;
 export const DISPATCH_MAX_PER_TICK = 3;
@@ -117,8 +117,10 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     // An unreadable order sends the work to hold: nothing flows on by default.
     const order = route.ok === true && Array.isArray(route.order) ? (route.order as string[]) : [];
     const seen = route.ok === true && route.seen !== null && typeof route.seen === "object" ? (route.seen as Record<string, number>) : {};
+    // A 手元だけ project goes down the PC's part of the order only (#46 Q6).
+    const scopes = route.ok === true && route.scopes !== null && typeof route.scopes === "object" ? (route.scopes as Record<string, unknown>) : {};
     for (const item of unrouted) {
-      const to = await routeOne(deps, item, order, seen, clock());
+      const to = await routeOne(deps, item, orderFor(order, item.project, scopes), seen, clock());
       if (to !== null) item.to = to;
     }
   }

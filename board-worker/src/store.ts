@@ -12,7 +12,7 @@ import {
   ATTACHMENT_TTL_MS, IMAGE_MAX_BYTES, READ_MAX_CHARS, isImageType, markerText, validAttachmentId,
 } from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
-import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, parseOrder } from "./route";
+import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
@@ -168,6 +168,23 @@ const str = (v: SqlStorageValue) => v as string;
 const strOrNull = (v: SqlStorageValue) => (v === null ? null : (v as string));
 const num = (v: SqlStorageValue) => Number(v);
 
+/** The hand-off columns, in the order handoffOf reads them (loadHandoff and list select these). */
+const HANDOFF_COLUMNS = [
+  "handoff_state", "handoff_request", "handoff_at", "handoff_actor", "handoff_accepted_at", "handoff_to", "handoff_by",
+  "handoff_to_by", "handoff_title", "handoff_generation", "handoff_heartbeat_at", "handoff_lease_until",
+  "handoff_versions", "handoff_result_ref", "handoff_result_commit",
+];
+/** A finished run's result link and commit, or null when it gave neither. */
+function resultOf(r: Row, prefix: string): { ref: string | null; commit: string | null } | null {
+  const ref = r[prefix + "handoff_result_ref"] ?? null;
+  const commit = r[prefix + "handoff_result_commit"] ?? null;
+  return ref === null && commit === null ? null : { ref: ref === null ? null : String(ref), commit: commit === null ? null : String(commit) };
+}
+/** A commit id as a run reports it: 7 to 40 lowercase hex characters. */
+const COMMIT = /^[0-9a-f]{7,40}$/;
+/** An event text kept within the 2,000 characters an event may have. */
+const truncateLine = (s: string) => ([...s].length <= 2000 ? s : `${[...s].slice(0, 1999).join("")}…`);
+
 function rowItem(r: Row, prefix = ""): Item {
   const g = (c: string) => r[prefix + c] ?? null;
   return {
@@ -235,6 +252,11 @@ export class Store {
     // recording used to happen after the start, so that is what they were.
     this.addDispatchColumn("status", "TEXT");
     this.addDispatchColumn("session_id", "TEXT");
+    // What the taker said it runs with (picker, rules, skills commits; Q8 of
+    // #46), and the run's result link and commit, so the card can show them.
+    this.addColumn("handoff_versions", "TEXT");
+    this.addColumn("handoff_result_ref", "TEXT");
+    this.addColumn("handoff_result_commit", "TEXT");
     // Every tool call looks for requested handoffs (watchTargets, after each
     // answer) and the dispatcher does every ten minutes; without this index
     // each look read the whole item table (issue #38).
@@ -290,6 +312,8 @@ export class Store {
    * addressed to them, or a waiting conversation turn. The board's WebSocket
    * watch uses this to wake only the watchers it concerns. */
   watchTargets(): string[] {
+    // While the owner has stopped everything, nobody is woken: nothing may be taken.
+    if (this.pauseState().paused) return [];
     const actors = new Set<string>();
     for (const r of this.sql.exec(
       "SELECT DISTINCT handoff_to AS a FROM board_items WHERE handoff_state='requested' AND handoff_to IS NOT NULL",
@@ -337,6 +361,8 @@ export class Store {
     limits: { dedupeMs: number; maxPerRequest: number; daySince: number; maxPerDay: number },
   ): Record<string, unknown> {
     return this.tx(() => {
+      // 全部止める: no Devin session is started while it is on.
+      if (this.pauseState().paused) return { ok: true, claimed: false, reason: "paused" };
       const rows = this.dispatchRows(request);
       if (rows.some((r) => r.status === "claimed" || r.status === "unknown"))
         return { ok: true, claimed: false, reason: "blocked" };
@@ -436,6 +462,66 @@ export class Store {
     );
   }
 
+  /** One owner setting as parsed JSON, with when and by whom it was set; `bad` when the stored value does not parse. */
+  private setting(key: string): { value: unknown; bad: boolean; at: number; by: string } | null {
+    const rows = this.sql.exec("SELECT value,updated_at,updated_by FROM board_settings WHERE key=?", key).toArray() as Row[];
+    if (!rows.length) return null;
+    let value: unknown = null;
+    let bad = false;
+    try { value = JSON.parse(str(rows[0].value)); } catch { bad = true; }
+    return { value, bad, at: num(rows[0].updated_at), by: str(rows[0].updated_by) };
+  }
+  private putSetting(key: string, value: unknown, actor: string): void {
+    this.sql.exec(
+      `INSERT INTO board_settings(key,value,updated_at,updated_by) VALUES(?,?,?,?)
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,updated_by=excluded.updated_by`,
+      key, JSON.stringify(value), Date.now(), actor,
+    );
+  }
+
+  /**
+   * The owner's "全部止める" (#46 Q7, owner decision 2026-11-22). While it is
+   * on, no handed-over work and no conversation turn is taken, the
+   * dispatcher starts no Devin session, nobody is woken, and every run is
+   * told at its next heartbeat to stop (`stop: true`). A stored value that
+   * does not parse counts as on: when in doubt, nothing starts.
+   */
+  pauseState(): { paused: boolean; at: number | null; by: string | null } {
+    const s = this.setting("paused");
+    if (s === null) return { paused: false, at: null, by: null };
+    return { paused: s.bad || s.value === true, at: s.at, by: s.by };
+  }
+  private refuseWhilePaused(): void {
+    if (this.pauseState().paused)
+      throw new BoardError("PAUSED", "The owner stopped everything on the board (全部止める): nothing is taken until the owner resumes");
+  }
+  /** What a run's answer carries while everything is stopped: the run stops at this heartbeat. */
+  private stopSignal(): Record<string, unknown> {
+    return this.pauseState().paused ? { stop: true, stop_reason: "paused" } : {};
+  }
+
+  /**
+   * Projects the owner marked 手元だけ (#46 Q6, owner decision 2026-11-22):
+   * their work is taken only on the owner's PC (local-* writers). Every
+   * other project is どこでもよい. A stored value that does not parse is
+   * read as no marks, and the page shows the setting as it is read.
+   */
+  projectScopes(): Record<string, "local"> {
+    const s = this.setting("project_scopes");
+    const out: Record<string, "local"> = {};
+    if (s === null || s.bad || s.value === null || typeof s.value !== "object" || Array.isArray(s.value)) return out;
+    for (const [project, scope] of Object.entries(s.value as Record<string, unknown>)) if (scope === "local") out[project] = "local";
+    return out;
+  }
+  private projectIsLocal(project: string): boolean {
+    return this.projectScopes()[project] === "local";
+  }
+  /** Refuses a destination outside a 手元だけ project's range (owner and hold are not takers, so they stay allowed). */
+  private checkScope(project: string, to: string | null): void {
+    if (to === null || UNTAKEN_TARGETS.has(to) || isLocalTarget(to) || !this.projectIsLocal(project)) return;
+    throw new BoardError("FORBIDDEN", `Project ${project} is 手元だけ: only the owner's PC (local-*) takes its work, not ${to}`);
+  }
+
   /** The owner's order (or the default until one is set) and when each writer last came. */
   routeOrder(): Record<string, unknown> {
     const rows = this.sql.exec("SELECT value,updated_at FROM board_settings WHERE key='route_order'").toArray() as Row[];
@@ -447,7 +533,7 @@ export class Store {
     for (const r of this.sql.exec("SELECT actor,at FROM writer_seen").toArray() as Row[]) seen[str(r.actor)] = num(r.at);
     return {
       ok: true, order: order ?? [...DEFAULT_ORDER], set_by_owner: order !== null,
-      updated_at: rows.length ? num(rows[0].updated_at) : null, seen,
+      updated_at: rows.length ? num(rows[0].updated_at) : null, seen, scopes: this.projectScopes(),
     };
   }
 
@@ -606,6 +692,9 @@ export class Store {
       const item = this.loadItem(itemId);
       if (item === null) throw new BoardError("NOT_FOUND", "No such item");
       if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) has a conversation");
+      // The conversation partners are the server's workers: a 手元だけ project's work does not go to the server.
+      if (this.projectIsLocal(item.project))
+        throw new BoardError("FORBIDDEN", `Project ${item.project} is 手元だけ: its work is not talked over with the server's AI`);
       const open = num((this.sql.exec(
         "SELECT COUNT(*) AS n FROM chat_messages WHERE item_id=? AND status IN ('waiting','taken')", itemId,
       ).one() as Row).n);
@@ -631,6 +720,7 @@ export class Store {
   /** The `board_chat_pending` tool: turns waiting for this worker, oldest first (and its own turns whose run died). */
   chatPending(actor: string): Record<string, unknown> {
     if (!isChatTarget(actor)) return { ok: true, turns: [] };
+    if (this.pauseState().paused) return { ok: true, turns: [], paused: true };
     const stale = Date.now() - CHAT_TAKE_MS;
     const turns = (this.sql.exec(
       `SELECT c.seq,c.item_id,c.at,i.project,i.title FROM chat_messages c JOIN board_items i ON i.item_id=c.item_id
@@ -649,6 +739,7 @@ export class Store {
     const seq = obj.seq as number;
     if (!isChatTarget(actor)) throw new BoardError("FORBIDDEN", "Only the server's workers answer conversations");
     return this.tx(() => {
+      this.refuseWhilePaused();
       const rows = this.sql.exec(
         "SELECT role,to_target,status,taken_by,taken_at FROM chat_messages WHERE seq=? AND item_id=?", seq, itemId,
       ).toArray() as Row[];
@@ -762,11 +853,13 @@ export class Store {
       lease_until: view.lease_until,
       lease_expired: leaseExpired(view, Date.now()),
       legacy_run: isLegacyRun(view),
+      versions: parseVersions(strOrNull(r[prefix + "handoff_versions"] ?? null)),
+      result: resultOf(r, prefix),
     };
   }
   private loadHandoff(id: string): Record<string, unknown> | null {
     const rows = this.sql.exec(
-      "SELECT handoff_state,handoff_request,handoff_at,handoff_actor,handoff_accepted_at,handoff_to,handoff_by,handoff_to_by,handoff_title,handoff_generation,handoff_heartbeat_at,handoff_lease_until FROM board_items WHERE item_id=?", id,
+      `SELECT ${HANDOFF_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id,
     ).toArray() as Row[];
     return rows.length ? this.handoffOf(rows[0]) : null;
   }
@@ -790,7 +883,7 @@ export class Store {
   /** Clears a handoff back to the pile. The generation stays, on purpose. */
   private clearHandoff(itemId: string): void {
     this.sql.exec(
-      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL WHERE item_id=?",
       itemId,
     );
   }
@@ -954,13 +1047,19 @@ export class Store {
    */
   acceptHandoff(actor: string, input: unknown): Record<string, unknown> {
     const obj = asObject(input);
-    onlyKeys(obj, ["item_id", "request_id"]);
+    onlyKeys(obj, ["item_id", "request_id", "versions"]);
     const itemId = requiredStr(obj, "item_id");
     const request = requiredStr(obj, "request_id");
+    // What the taker runs with, e.g. "picker=1a2b3c4,rules=5d6e7f8" (#46 Q8): recorded, never acted on.
+    const versionsText = optionalStr(obj, "versions");
+    const versions = versionsText === null ? null : parseVersions(versionsText);
+    if (versionsText !== null && versions === null)
+      throw invalid("versions must be up to 8 name=commit pairs separated by commas (name ^[a-z][a-z0-9_-]{0,31}$, commit 7 to 40 hex)");
     const now = Date.now();
     let again = false;
     this.tx(() => {
-      if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+      const target = this.loadItem(itemId);
+      if (target === null) throw new BoardError("NOT_FOUND", "No such item");
       const handoff = this.loadHandoff(itemId);
       // Idempotent retry: the same writer asking again for the request it
       // already took (its first answer may have been lost on the wire) gets
@@ -981,6 +1080,9 @@ export class Store {
       }
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request)
         throw new BoardError("HANDOFF_CONFLICT", "This request is not open: it was taken, taken back, or the id is another one");
+      this.refuseWhilePaused();
+      if (this.projectIsLocal(target.project) && !isLocalTarget(actor))
+        throw new BoardError("FORBIDDEN", `Project ${target.project} is 手元だけ: only the owner's PC (local-*) takes its work, not ${actor}`);
       // A request with a destination is only for that writer, so another one cannot pick it up by mistake.
       const to = handoff.to as string | null;
       if (to !== null && (UNTAKEN_TARGETS.has(to) || to !== actor))
@@ -990,10 +1092,12 @@ export class Store {
       // COALESCE: a request made before generations existed has none yet;
       // the accept is where its run begins, so it gets the first one here.
       this.sql.exec(
-        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=?,handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?) WHERE item_id=?",
-        actor, now, now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)), itemId,
+        "UPDATE board_items SET handoff_state='accepted',handoff_actor=?,handoff_accepted_at=?,handoff_heartbeat_at=?,handoff_lease_until=?,handoff_generation=COALESCE(handoff_generation,?),handoff_versions=? WHERE item_id=?",
+        actor, now, now, now + this.leaseMs, nextGeneration(this.loadGeneration(itemId)),
+        versions === null ? null : Object.entries(versions).map(([k, v]) => `${k}=${v}`).join(","), itemId,
       );
-      this.insertEvent(itemId, now, actor, "note", `accepted ${request}`, null);
+      const withVersions = versions === null ? "" : ` (versions: ${Object.entries(versions).map(([k, v]) => `${k} ${v}`).join(", ")})`;
+      this.insertEvent(itemId, now, actor, "note", `accepted ${request}${withVersions}`, null);
     });
     if (again) return { ok: true, changed: false, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
     // The request is this writer's now; the state follows as an internal
@@ -1034,7 +1138,7 @@ export class Store {
     return this.tx(() => {
       this.checkRun(itemId, actor, request, generation);
       this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", now, now + this.leaseMs, itemId);
-      return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
+      return { ok: true, changed: true, handoff: this.loadHandoff(itemId), ...this.stopSignal() };
     });
   }
 
@@ -1060,7 +1164,7 @@ export class Store {
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
       this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", at, at + this.leaseMs, itemId);
-      return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference }, handoff: this.loadHandoff(itemId) };
+      return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference }, handoff: this.loadHandoff(itemId), ...this.stopSignal() };
     });
   }
 
@@ -1074,17 +1178,26 @@ export class Store {
    */
   completeHandoff(actor: string, input: unknown): Record<string, unknown> {
     const obj = asObject(input);
-    onlyKeys(obj, ["item_id", "request_id", "generation", "outcome", "text"]);
+    onlyKeys(obj, ["item_id", "request_id", "generation", "outcome", "text", "ref", "commit"]);
     const { itemId, request, generation } = this.fenced(obj);
     const outcome = requiredStr(obj, "outcome");
     if (outcome !== "done" && outcome !== "stopped") throw invalid("outcome must be done or stopped");
     const text = optionalStr(obj, "text");
     if (text !== null && !validLine(text, 2000, true)) throw invalid("text must be 1 to 2000 characters");
+    // The result's link (a PR, a commit page) and commit: the card's 結果 (#46 段 2).
+    const ref = optionalStr(obj, "ref");
+    if (ref !== null && !validHttpsUrl(ref)) throw invalid("ref must be an https URL of 500 characters at most");
+    const commit = optionalStr(obj, "commit");
+    if (commit !== null && !COMMIT.test(commit)) throw invalid("commit must be 7 to 40 lowercase hex characters");
     const now = Date.now();
     this.tx(() => {
       this.checkRun(itemId, actor, request, generation);
-      this.sql.exec("UPDATE board_items SET handoff_state='completed',handoff_lease_until=NULL WHERE item_id=?", itemId);
-      this.insertEvent(itemId, now, actor, "note", text ?? `completed ${request} (${outcome})`, null);
+      this.sql.exec(
+        "UPDATE board_items SET handoff_state='completed',handoff_lease_until=NULL,handoff_result_ref=?,handoff_result_commit=? WHERE item_id=?",
+        ref, commit, itemId,
+      );
+      const base = text ?? `completed ${request} (${outcome})`;
+      this.insertEvent(itemId, now, actor, "note", commit !== null && !base.includes(commit) ? truncateLine(`${base} (commit ${commit})`) : base, ref);
     });
     const item = this.loadItem(itemId);
     const written = item !== null && item.state !== outcome ? this.upsertItem(actor, { item_id: itemId, state: outcome }) : { item };
@@ -1239,10 +1352,11 @@ export class Store {
       throw new BoardError("FORBIDDEN", "Only work on the pile (kind task, state planned) can be handed over");
     const prior = this.loadHandoff(item.item_id);
     if (prior !== null && prior.state !== "completed") throw new BoardError("HANDOFF_CONFLICT", "This work is handed over already");
+    this.checkScope(item.project, to);
     const request = newId(day, "REQ-");
     const now = Date.now();
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL WHERE item_id=?",
       request, now, to, actor, to === null ? null : actor, item.title, nextGeneration(this.loadGeneration(item.item_id)), item.item_id,
     );
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
@@ -1261,6 +1375,8 @@ export class Store {
     if (handoff === null || handoff.state !== "requested")
       throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be routed");
     if (handoff.to === to) return false;
+    const item = this.loadItem(itemId);
+    if (item !== null) this.checkScope(item.project, to);
     this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, to === null ? null : actor, itemId);
     this.insertEvent(itemId, now, actor, "note", `routed ${String(handoff.request_id)} to ${to ?? "the board's choice"}`, null);
     return true;
@@ -1343,6 +1459,36 @@ export class Store {
     return { ok: true, item_id: itemId, request_id: handoff?.request_id ?? null, lifecycle };
   }
 
+  /**
+   * The `board_my_work` tool (#46 段 2, the read the patrols need before more
+   * of them are added, Q10): only what concerns the calling writer — work
+   * handed to it that waits to be taken, its own runs (accepted or unknown),
+   * and how many conversation turns wait for it — plus whether the owner
+   * stopped everything. Uses the handoff_state index instead of reading
+   * every item and its latest event as board_list does.
+   */
+  myWork(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["project"]);
+    const project = optionalStr(obj, "project");
+    const pause = this.pauseState();
+    const rows = this.sql.exec(
+      `SELECT ${ITEM_COLUMNS.join(",")},${HANDOFF_COLUMNS.join(",")} FROM board_items
+       WHERE handoff_state IN ('requested','accepted','unknown')
+         AND ((handoff_state='requested' AND handoff_to=?) OR (handoff_state<>'requested' AND handoff_actor=?))
+         AND (? IS NULL OR project=?)
+       ORDER BY handoff_at, item_id LIMIT 200`,
+      actor, actor, project, project,
+    ).toArray() as Row[];
+    const items = rows.map((r) => ({ ...rowItem(r), handoff: this.handoffOf(r) }));
+    const turns = isChatTarget(actor) && !pause.paused
+      ? num((this.sql.exec(
+        "SELECT COUNT(*) AS n FROM chat_messages WHERE role='owner' AND status='waiting' AND to_target=?", actor,
+      ).one() as Row).n)
+      : 0;
+    return { ok: true, paused: pause.paused, items, chat_turns: turns, scopes: this.projectScopes() };
+  }
+
   /** The `board_list` tool: arguments `project` and `since_seq`. */
   listForTool(input: unknown): Record<string, unknown> {
     const obj = asObject(input);
@@ -1381,7 +1527,10 @@ export class Store {
       const chat = chats.get(item.item_id as string);
       return chat ? { ...withNote, chat } : withNote;
     });
-    return { ...data, items, generated_at: now, can_write: true, route: this.routeView(devinReady, now) };
+    return {
+      ...data, items, generated_at: now, can_write: true, route: this.routeView(devinReady, now),
+      paused: this.pauseState(), scopes: this.projectScopes(),
+    };
   }
 
   /**
@@ -1464,6 +1613,48 @@ export class Store {
       });
     }
     if (op === "chat_send") return this.chatSend(actor, obj);
+    if (op === "pause") {
+      // {op:"pause", paused:true|false}: 全部止める / 再開 (see pauseState).
+      onlyKeys(obj, ["op", "paused"]);
+      if (typeof obj.paused !== "boolean") throw invalid("paused must be true or false");
+      const before = this.pauseState().paused;
+      if (before === obj.paused) return { ok: true, changed: false, paused: this.pauseState() };
+      this.putSetting("paused", obj.paused, actor);
+      return { ok: true, changed: true, paused: this.pauseState() };
+    }
+    if (op === "scope") {
+      // {op:"scope", project, scope:"local"|"any"}: 手元だけ / どこでもよい (see projectScopes).
+      // Marking a project 手元だけ sends its open requests that point outside
+      // the range back to the board's choice, which then stays within it.
+      onlyKeys(obj, ["op", "project", "scope"]);
+      const project = requiredStr(obj, "project");
+      const scope = requiredStr(obj, "scope");
+      if (scope !== "local" && scope !== "any") throw invalid("scope must be local or any");
+      return this.tx(() => {
+        const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
+        if (known === 0) throw new BoardError("NOT_FOUND", "No such project");
+        const scopes: Record<string, string> = { ...this.projectScopes() };
+        if ((scopes[project] === "local") === (scope === "local")) return { ok: true, changed: false, scopes };
+        if (scope === "local") scopes[project] = "local";
+        else delete scopes[project];
+        this.putSetting("project_scopes", scopes, actor);
+        let rerouted = 0;
+        if (scope === "local") {
+          const now = Date.now();
+          for (const r of this.sql.exec(
+            "SELECT item_id,handoff_request,handoff_to FROM board_items WHERE project=? AND handoff_state='requested' AND handoff_to IS NOT NULL", project,
+          ).toArray() as Row[]) {
+            const to = str(r.handoff_to);
+            if (UNTAKEN_TARGETS.has(to) || isLocalTarget(to)) continue;
+            this.sql.exec("UPDATE board_items SET handoff_to=NULL,handoff_to_by=NULL WHERE item_id=?", str(r.item_id));
+            this.insertEvent(str(r.item_id), now, actor, "note",
+              `routed ${String(r.handoff_request)} to the board's choice: project ${project} became 手元だけ, and ${to} is outside it`, null);
+            rerouted += 1;
+          }
+        }
+        return { ok: true, changed: true, scopes: this.projectScopes(), rerouted };
+      });
+    }
     if (op === "order") {
       onlyKeys(obj, ["op", "order"]);
       const order = parseOrder(obj.order);
@@ -1555,7 +1746,7 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, chat_send, mark_unknown, release or resume");
+    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, chat_send, pause, scope, mark_unknown, release or resume");
   }
 
   /** All items of the project (or of every project), each with its latest
@@ -1565,7 +1756,7 @@ export class Store {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
       `SELECT ${itemCols},i.pile_rank AS i_pile_rank,i.handoff_state AS i_handoff_state,i.handoff_request AS i_handoff_request,
-              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,i.handoff_generation AS i_handoff_generation,i.handoff_heartbeat_at AS i_handoff_heartbeat_at,i.handoff_lease_until AS i_handoff_lease_until,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,i.handoff_generation AS i_handoff_generation,i.handoff_heartbeat_at AS i_handoff_heartbeat_at,i.handoff_lease_until AS i_handoff_lease_until,i.handoff_versions AS i_handoff_versions,i.handoff_result_ref AS i_handoff_result_ref,i.handoff_result_commit AS i_handoff_result_commit,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
        WHERE (? IS NULL OR i.project=?) ORDER BY i.project,

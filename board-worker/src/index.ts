@@ -14,7 +14,7 @@
 // Scripts and styles come from ./public (static assets, no secrets in them).
 import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import boardHtml from "../../iris/web/board.html";
+import boardHtml from "../web/board.html";
 import chatHtml from "../web/chat.html";
 import { accessUser, type AccessResult } from "./access";
 import { ATTACHMENT_MAX_BYTES, IMAGE_MAX_BYTES, attachmentKey, cleanName, isImageType, parseText, sliceChars, sniffImage, toBase64 } from "./attachments";
@@ -95,6 +95,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.addEvent(actor, args);
         case "board_list":
           return this.store.listForTool(args);
+        case "board_my_work":
+          return this.store.myWork(actor, args);
         case "board_request_status":
           return this.store.requestStatus(args);
         case "board_request_handoff":
@@ -306,6 +308,7 @@ function ownerWriteStatus(code: unknown): number {
     case "FENCE_REQUIRED":
     case "BOARD_ITEM_LIMIT":
     case "BOARD_EVENT_LIMIT":
+    case "PAUSED":
       return 409;
     case "STORAGE":
       return 503;
@@ -546,7 +549,7 @@ const siteHandler = {
       // pass, after the answer is on its way. Its claims are atomic, so a
       // tick running at the same moment cannot start anything twice.
       const op = (body.value as { op?: unknown } | null)?.op;
-      if (op === "hand" || op === "route" || op === "continue" || op === "order") ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
+      if (op === "hand" || op === "route" || op === "continue" || op === "order" || op === "pause" || op === "scope") ctx.waitUntil(runDispatcher(dispatcherDeps(env)));
       return json(200, result);
     }
 

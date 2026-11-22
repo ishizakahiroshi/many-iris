@@ -2,7 +2,7 @@
 // Devin (no wrangler). Node loads the .ts files directly (type stripping).
 //
 //   node test/route.test.mjs
-import { ALIVE_MS, DEFAULT_ORDER, HANDOFF_TARGETS, ORDERABLE, chooseByOrder, isAlive, parseOrder } from "../src/route.ts";
+import { ALIVE_MS, DEFAULT_ORDER, HANDOFF_TARGETS, ORDERABLE, chooseByOrder, isAlive, isLocalTarget, orderFor, parseOrder, parseVersions } from "../src/route.ts";
 import { runDispatcher, spawnDevinSession, DISPATCH_MAX_PER_DAY, DISPATCH_MAX_PER_REQUEST } from "../src/dispatch.ts";
 
 let passed = 0;
@@ -227,6 +227,18 @@ const startDevin = async () => { devinStarts++; return { session_id: `s${devinSt
   await spawnDevinSession(async (url, init) => { sent = { url, init }; return new Response("{}", { status: 200 }); }, "https://devin.test/sessions", "key-1", "the prompt");
   check("the start posts the prompt with the key", sent?.url === "https://devin.test/sessions" && sent.init.method === "POST" &&
     sent.init.headers.authorization === "Bearer key-1" && JSON.parse(sent.init.body).prompt === "the prompt", JSON.stringify(sent?.init?.headers));
+}
+
+// --- #46 段 2: 手元だけ keeps the PC's part of the order; versions are name=commit pairs
+{
+  check("local-* is on the PC", isLocalTarget("local-claude") && isLocalTarget("local-devin") && !isLocalTarget("vps-claude") && !isLocalTarget("devin") && !isLocalTarget(null));
+  check("a 手元だけ project keeps only the PC's destinations", orderFor(["vps-claude", "local-claude", "devin", "local-devin"], "p", { p: "local" }).join(",") === "local-claude,local-devin");
+  check("other projects keep the whole order", orderFor(["vps-claude", "local-claude"], "q", { p: "local" }).join(",") === "vps-claude,local-claude");
+  check("an order without the PC leaves a 手元だけ project nowhere (hold)", chooseByOrder(orderFor(["vps-claude"], "p", { p: "local" }), () => true).to === "hold");
+  const v = parseVersions("picker=abc1234,rules=0123456789abcdef0123456789abcdef01234567");
+  check("versions parse", v?.picker === "abc1234" && v?.rules?.length === 40, JSON.stringify(v));
+  for (const bad of ["", "picker", "picker=ABC1234", "picker=abc12", "Picker=abc1234", "a=abc1234,a=abc1234", "1x=abc1234", Array(9).fill(0).map((_, i) => `n${i}=abc1234`).join(","), null, 7])
+    check(`versions ${JSON.stringify(bad)} are refused`, parseVersions(bad) === null);
 }
 
 console.log(`passed ${passed}, failed ${failures.length}`);

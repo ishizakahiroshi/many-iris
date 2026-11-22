@@ -86,6 +86,34 @@ export function chooseByOrder(order: readonly string[], alive: (target: string) 
   };
 }
 
+/** A destination on the owner's PC (`local-*`): the only ones a 手元だけ project's work goes to (#46 Q6). */
+export function isLocalTarget(target: unknown): boolean {
+  return typeof target === "string" && target.startsWith("local-");
+}
+
+/** The order "おまかせ" goes down for one project: a 手元だけ project keeps only the PC's destinations. */
+export function orderFor(order: readonly string[], project: unknown, scopes: Record<string, unknown>): string[] {
+  return typeof project === "string" && scopes[project] === "local" ? order.filter(isLocalTarget) : [...order];
+}
+
+/**
+ * The versions a taker says it runs with (#46 Q8), as `name=commit` pairs
+ * separated by commas: at most 8, names ^[a-z][a-z0-9_-]{0,31}$, distinct,
+ * commits 7 to 40 lowercase hex. Null for anything else (or for null).
+ */
+export function parseVersions(value: unknown): Record<string, string> | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 500) return null;
+  const out: Record<string, string> = {};
+  const pairs = value.split(",");
+  if (pairs.length > 8) return null;
+  for (const pair of pairs) {
+    const m = /^([a-z][a-z0-9_-]{0,31})=([0-9a-f]{7,40})$/.exec(pair.trim());
+    if (m === null || m[1] in out) return null;
+    out[m[1]] = m[2];
+  }
+  return out;
+}
+
 /** A board string cut to one short line (the same rule as the Devin prompt). */
 export function plainLine(value: unknown): string {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, 200);

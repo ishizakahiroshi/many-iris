@@ -19,12 +19,13 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), local: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
   { actor: "muse", token_sha256: sha(K.muse), enabled: true },
   { actor: "vps-claude", token_sha256: sha(K.vps), enabled: true },
+  { actor: "local-claude", token_sha256: sha(K.local), enabled: true },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -162,7 +163,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("nineteen tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
+  check("twenty tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -831,6 +832,79 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   let unsentCodes = [];
   for (let n = 0; n < 11; n++) unsentCodes.push((await upload(unsentWork, `u${n}.txt`, "x")).status);
   check("ten unsent attachments at most", unsentCodes.slice(0, 10).every((c) => c === 200) && unsentCodes[10] === 409, JSON.stringify(unsentCodes));
+
+  // --- #46 段 2: 全部止める (op pause), board_my_work, versions, results, 手元だけ (op scope)
+  await call(K.alpha, "board_upsert_item", { item_id: "stop1", project: "scoped", kind: "task", title: "work to stop", state: "planned" });
+  await call(K.alpha, "board_upsert_item", { item_id: "stop2", project: "scoped", kind: "task", title: "work with a result", state: "planned" });
+  check("the owner hands stop1 to vps-claude", (await ownerCode({ op: "hand", item_id: "stop1", to: "vps-claude" })) === "200 OK");
+  let mine = await call(K.vps, "board_my_work", { project: "scoped" });
+  check("board_my_work lists the caller's work", mine.ok === true && mine.paused === false && mine.items.map((i) => i.item_id).join(",") === "stop1" &&
+    mine.items[0].handoff?.to === "vps-claude" && mine.items[0].kind === "task", JSON.stringify(mine).slice(0, 400));
+  check("board_my_work leaves out work for others", (await call(K.alpha, "board_my_work", { project: "scoped" })).items.length === 0);
+  const req1 = mine.items[0]?.handoff?.request_id;
+  check("the owner stops everything", (await ownerCode({ op: "pause", paused: true })) === "200 OK");
+  page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
+  check("the page data says everything is stopped", page.paused?.paused === true && page.paused?.by === "page:owner", JSON.stringify(page.paused));
+  check("board_my_work says it is stopped", (await call(K.vps, "board_my_work", { project: "scoped" })).paused === true);
+  check("an accept is refused while everything is stopped", code(await call(K.vps, "board_accept_handoff", { item_id: "stop1", request_id: req1 })) === "PAUSED");
+  const pausedTurns = await call(K.vps, "board_chat_pending", {});
+  check("no conversation turn is offered while everything is stopped", pausedTurns.turns.length === 0 && pausedTurns.paused === true);
+  check("pause needs true or false", (await ownerCode({ op: "pause", paused: "yes" })) === "400 INVALID");
+  check("the owner resumes", (await ownerCode({ op: "pause", paused: false })) === "200 OK");
+  check("bad versions are refused", code(await call(K.vps, "board_accept_handoff", { item_id: "stop1", request_id: req1, versions: "Picker=xyz" })) === "INVALID");
+  let acc = await call(K.vps, "board_accept_handoff", { item_id: "stop1", request_id: req1, versions: "picker=abc1234,rules=0123456789abcdef" });
+  check("an accept records the versions it was given", acc.ok === true && acc.handoff?.versions?.picker === "abc1234" && acc.handoff?.versions?.rules === "0123456789abcdef", JSON.stringify(acc.handoff));
+  const fence1 = { item_id: "stop1", request_id: req1, generation: acc.handoff?.generation };
+  check("board_my_work lists the caller's own run", (await call(K.vps, "board_my_work", { project: "scoped" })).items[0]?.handoff?.state === "accepted");
+  let hb = await call(K.vps, "board_heartbeat_handoff", fence1);
+  check("a heartbeat says nothing about stopping while the board runs", hb.ok === true && hb.stop === undefined, JSON.stringify(hb).slice(0, 200));
+  await ownerPost({ op: "pause", paused: true });
+  hb = await call(K.vps, "board_heartbeat_handoff", fence1);
+  check("a heartbeat tells the run to stop while everything is stopped", hb.ok === true && hb.stop === true && hb.stop_reason === "paused", JSON.stringify(hb).slice(0, 200));
+  const prog = await call(K.vps, "board_progress_handoff", { ...fence1, kind: "note", text: "still here" });
+  check("a progress write also tells the run to stop", prog.ok === true && prog.stop === true);
+  const given = await call(K.vps, "board_release_handoff", fence1);
+  check("the stopped run gives the work back to the pile", given.ok === true && given.item?.state === "planned" && given.handoff === null, JSON.stringify(given).slice(0, 300));
+  await ownerPost({ op: "pause", paused: false });
+  check("the owner hands stop2 to vps-claude", (await ownerCode({ op: "hand", item_id: "stop2", to: "vps-claude" })) === "200 OK");
+  const req2 = (await handoffOf("stop2"))?.request_id;
+  acc = await call(K.vps, "board_accept_handoff", { item_id: "stop2", request_id: req2 });
+  const fence2 = { item_id: "stop2", request_id: req2, generation: acc.handoff?.generation };
+  check("an accept without versions records none", acc.ok === true && acc.handoff?.versions === null);
+  check("a bad result commit is refused", code(await call(K.vps, "board_complete_handoff", { ...fence2, outcome: "done", commit: "XYZ" })) === "INVALID");
+  check("a result link must be https", code(await call(K.vps, "board_complete_handoff", { ...fence2, outcome: "done", ref: "http://example.com/x" })) === "INVALID");
+  const finished = await call(K.vps, "board_complete_handoff", { ...fence2, outcome: "done", ref: "https://github.com/example/repo/pull/7", commit: "0a1b2c3d" });
+  check("a completion keeps the result link and commit", finished.ok === true && finished.handoff?.result?.ref === "https://github.com/example/repo/pull/7" && finished.handoff?.result?.commit === "0a1b2c3d", JSON.stringify(finished.handoff));
+  const resultStatus = await call(K.alpha, "board_request_status", { item_id: "stop2" });
+  check("the result link is among the request's evidence", JSON.stringify(resultStatus).includes("https://github.com/example/repo/pull/7"));
+  check("the owner hands stop1 to vps-claude again", (await ownerCode({ op: "hand", item_id: "stop1", to: "vps-claude" })) === "200 OK");
+  check("a scope needs a known project", (await ownerCode({ op: "scope", project: "no-such-project", scope: "local" })) === "404 NOT_FOUND");
+  check("a scope is local or any", (await ownerCode({ op: "scope", project: "scoped", scope: "cloud" })) === "400 INVALID");
+  r = await ownerPost({ op: "scope", project: "scoped", scope: "local" });
+  out = await r.json();
+  check("marking a project 手元だけ sends its outside requests back to the board's choice", r.status === 200 && out.rerouted === 1 && out.scopes?.scoped === "local", JSON.stringify(out));
+  page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
+  check("the page data lists the 手元だけ projects", page.scopes?.scoped === "local");
+  check("a 手元だけ project refuses a destination outside the PC", (await ownerCode({ op: "route", item_id: "stop1", to: "vps-claude" })) === "403 FORBIDDEN");
+  check("a writer cannot route 手元だけ work outside the PC either", code(await call(K.alpha, "board_route_handoff", { item_id: "stop1", to: "devin" })) === "FORBIDDEN");
+  check("a 手元だけ project may still go on hold", (await ownerCode({ op: "route", item_id: "stop1", to: "hold" })) === "200 OK");
+  // The board's choice for a 手元だけ project goes down the PC's part of the order only.
+  await call(K.local, "board_my_work", {});
+  await call(K.vps, "board_my_work", {});
+  check("the owner sets an order with the server first", (await ownerCode({ op: "order", order: ["vps-claude", "local-claude"] })) === "200 OK");
+  check("the owner sends stop1 to the board's choice", (await ownerCode({ op: "route", item_id: "stop1", to: null })) === "200 OK");
+  let chosen = null;
+  for (let n = 0; n < 20 && (chosen === null || chosen === undefined); n++) {
+    await new Promise((res) => setTimeout(res, 250));
+    chosen = (await handoffOf("stop1"))?.to;
+  }
+  check("the board's choice for 手元だけ work skips the server", chosen === "local-claude", String(chosen));
+  const req3 = (await handoffOf("stop1"))?.request_id;
+  check("the PC takes 手元だけ work", (await call(K.local, "board_accept_handoff", { item_id: "stop1", request_id: req3 })).ok === true);
+  check("talking to the server about 手元だけ work is refused", (await ownerCode({ op: "chat_send", item_id: "stop2", text: "hello" })) === "403 FORBIDDEN");
+  check("a project goes back to どこでもよい", (await ownerCode({ op: "scope", project: "scoped", scope: "any" })) === "200 OK");
+  page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
+  check("the page data no longer lists it", page.scopes?.scoped === undefined);
 
   // --- the item limit (26 in this run)
   let lastCode = "OK";

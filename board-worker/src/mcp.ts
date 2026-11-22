@@ -60,6 +60,12 @@ export const TOOLS: Json[] = [
     [],
   ),
   tool(
+    "board_my_work",
+    "Read only what concerns you: work handed to you that waits to be taken (handoff.state requested, handoff.to = you), your own runs (accepted or unknown), how many conversation turns wait for you, the projects the owner marked 手元だけ (scopes), and whether the owner stopped everything (paused: while true, take nothing; accepts and chat takes are refused with PAUSED, and heartbeats answer stop: true). Much cheaper than board_list for a taker that polls.",
+    { project: text("Only this project") },
+    [],
+  ),
+  tool(
     "board_request_status",
     "Read-only: where one request really is. Separates saved on the board (board_upsert_item) from handed over, taken by a writer, running (the run reported in after taking it), silent (lease expired), unknown and completed, with the evidence, what the board cannot confirm, whether it is stalled, result links, and the options a person has. Never starts, retries or re-queues anything, so asking for progress cannot run the work twice. An open GitHub Issue is not evidence of anything here.",
     { item_id: text("The item to look at") },
@@ -81,6 +87,7 @@ export const TOOLS: Json[] = [
     {
       item_id: text("The item that was handed over"),
       request_id: text("handoff.request_id of that item"),
+      versions: text("Optional: what this taker runs with, as name=commit pairs separated by commas (e.g. picker=1a2b3c4,rules=5d6e7f8; up to 8, commits 7 to 40 hex). Recorded on the handoff and in the accept's event"),
     },
     ["item_id", "request_id"],
   ),
@@ -104,7 +111,7 @@ export const TOOLS: Json[] = [
   ),
   tool(
     "board_heartbeat_handoff",
-    "Say the run that took a request is still working, and extend its lease (handoff.lease_until). Send the item's handoff.request_id and the handoff.generation the accept returned. A stale generation is refused (STALE_GENERATION): a replaced run must stop. Writes no event.",
+    "Say the run that took a request is still working, and extend its lease (handoff.lease_until). Send the item's handoff.request_id and the handoff.generation the accept returned. A stale generation is refused (STALE_GENERATION): a replaced run must stop. While the owner has stopped everything (全部止める) the answer carries stop: true: stop the run and give the work back (board_release_handoff). Writes no event.",
     {
       item_id: text("The item that was handed over"),
       request_id: text("handoff.request_id of that item"),
@@ -134,6 +141,8 @@ export const TOOLS: Json[] = [
       generation: { type: "integer", description: "handoff.generation returned by board_accept_handoff" },
       outcome: { type: "string", enum: ["done", "stopped"], description: "done or stopped" },
       text: text("Optional result note (1 to 2000 characters)"),
+      ref: text("Optional https URL of the result (a pull request, a commit page): shown on the card as the result"),
+      commit: text("Optional commit id of the result (7 to 40 lowercase hex)"),
     },
     ["item_id", "request_id", "generation", "outcome"],
   ),
