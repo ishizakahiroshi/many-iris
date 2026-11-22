@@ -1,6 +1,7 @@
 // Copies the page's scripts and styles into ./public before `wrangler dev` and
 // `wrangler deploy` (wrangler.toml [build]). The Rust board's files in
-// iris/web stay the only original; ./public is generated and not committed.
+// iris/web stay the only original of the shared files; the chat page's files
+// live in ./web (moved out of the frozen iris/, #46). ./public is generated and not committed.
 import { copyFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +9,8 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "public");
 const sources = [
-  [join(root, "..", "iris", "web"), ["app.css", "board.css", "board.js", "chat.css", "chat.js"]],
-  [join(root, "web"), ["_headers"]],
+  [join(root, "..", "iris", "web"), ["app.css", "board.css", "board.js"]],
+  [join(root, "web"), ["_headers", "chat.css", "chat.js"]],
 ];
 
 mkdirSync(out, { recursive: true });

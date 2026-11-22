@@ -21,6 +21,16 @@ BOARD_PUBLIC_ORIGIN = "https://iris.ishizakahiroshi.com"
 binding = "OAUTH_KV"
 id = "b055efabcf8249f2ad7ba2ea06cc772c"
 
+# Bodies of the chat's text attachments (the board keeps only name, sizes and the
+# first lines). Read only through the Worker (the signed-in owner, or the
+# server's workers by MCP); the bucket has no public access. Created once at
+# deploy time and given a 30-day expiry (see docs/local/design_chat-attachments_2026-11-22.md):
+#   wrangler r2 bucket create many-iris-attachments
+#   wrangler r2 bucket lifecycle add many-iris-attachments expire-30d att/ --expire-days 30
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "many-iris-attachments"
+
 # Scripts and styles only. Pages are served by the Worker, which checks the key first.
 [assets]
 directory = "./public"

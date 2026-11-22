@@ -51,9 +51,14 @@
         <div class="chat-foot">
           <p id="chat-state" class="chat-state" role="status"></p>
           <form id="chat-form" class="chat-box">
+            <ul id="chat-attach" class="chat-attach" aria-label="添付" hidden></ul>
             <label class="sr-only" for="chat-text">送る文</label>
             <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>
             <div class="chat-box-row">
+              <label class="chat-clip" title="テキストファイル（.txt .md .log）を添付">
+                <input id="chat-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown" multiple hidden>
+                <span aria-hidden="true">＋</span><span class="sr-only">ファイルを添付</span>
+              </label>
               <label class="chat-pick"><span>相手</span><select id="chat-partner"></select></label>
               <span id="chat-status" class="chat-status" role="status"></span>
               <button id="chat-send" type="submit" class="chat-send" aria-label="送る">↑</button>

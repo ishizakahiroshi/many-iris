@@ -15,8 +15,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import boardHtml from "../../iris/web/board.html";
-import chatHtml from "../../iris/web/chat.html";
+import chatHtml from "../web/chat.html";
 import { accessUser, type AccessResult } from "./access";
+import { ATTACHMENT_MAX_BYTES, attachmentKey, cleanName, parseText, sliceChars } from "./attachments";
 import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
@@ -31,6 +32,8 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   /** Injected by the OAuth library into the handlers it calls. */
   OAUTH_PROVIDER: OAuthHelpers;
+  /** Bodies of the conversations' text attachments (R2). Owner-only reads; the 30-day expiry is an R2 lifecycle rule. */
+  ATTACHMENTS: R2Bucket;
   /** The public origin, e.g. https://iris.example.com: the OAuth issuer. */
   BOARD_PUBLIC_ORIGIN?: string;
   /** JSON: {"schema_version":1,"writers":[{"actor","token_sha256","enabled"}]} */
@@ -83,6 +86,7 @@ export class BoardStore extends DurableObject<Env> {
     if (actor !== DISPATCH_ACTOR) {
       try { this.store.noteSeen(actor, Date.now()); } catch { /* the call goes on */ }
     }
+    if (tool === "board_chat_attachment") return this.readAttachmentTool(actor, args);
     const result = guarded(() => {
       switch (tool) {
         case "board_upsert_item":
@@ -136,6 +140,32 @@ export class BoardStore extends DurableObject<Env> {
   /** One conversation for the page (see Store.chatView). */
   async chat(itemId: string): Promise<Record<string, unknown>> {
     return guarded(() => this.store.chatView(itemId));
+  }
+  /** The `board_chat_attachment` tool: a part of an attachment's text, by characters. The body is read from R2 here, never put in a transcript. */
+  private async readAttachmentTool(actor: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    let checked: ReturnType<Store["attachmentForWorker"]>;
+    try {
+      checked = this.store.attachmentForWorker(actor, args);
+    } catch (e) {
+      return guarded(() => { throw e; });
+    }
+    const object = await this.env.ATTACHMENTS.get(attachmentKey(checked.meta.id));
+    if (object === null) return { ok: false, error: { code: "NOT_FOUND", detail: "The attachment's text is gone (expired)" } };
+    const part = sliceChars(await object.text(), checked.offset, checked.limit);
+    return {
+      ok: true, attachment_id: checked.meta.id, name: checked.meta.name, offset: checked.offset,
+      returned: [...part.text].length, total_chars: part.total, next_offset: part.next, text: part.text,
+    };
+  }
+  /** Reserve an attachment's record (see Store.attachmentAdd). */
+  async attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.attachmentAdd(itemId, id, name, bytes, chars, head));
+  }
+  async attachmentDrop(itemId: string, id: string): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.attachmentDrop(itemId, id));
+  }
+  async attachmentMeta(id: string): Promise<Record<string, unknown>> {
+    return guarded(() => ({ ok: true, ...this.store.attachmentMeta(id) }));
   }
   /** A write by the signed-in owner from the page (see Store.ownerWrite). */
   async ownerWrite(args: unknown): Promise<Record<string, unknown>> {
@@ -325,6 +355,12 @@ function accessFailure(result: Exclude<AccessResult, { ok: true }>): Response {
   }
 }
 
+/** The HTTP answer for a refused call to the board. */
+function refusal(result: Record<string, unknown>): Response {
+  const error = (result.error ?? {}) as { code?: unknown; detail?: unknown };
+  return failure(ownerWriteStatus(error.code), String(error.code ?? "STORAGE"), String(error.detail ?? "Board unavailable"));
+}
+
 function boardStub(env: Env) {
   return env.BOARD.get(env.BOARD.idFromName("board"));
 }
@@ -416,6 +452,55 @@ const siteHandler = {
         return failure(ownerWriteStatus(error.code), String(error.code ?? "STORAGE"), String(error.detail ?? "Board unavailable"));
       }
       return json(200, data);
+    }
+
+    // Text attachments of a conversation: the owner uploads (a long paste or a
+    // .txt/.md/.log), reads and takes back an unsent one. The body is kept in
+    // R2; the board keeps the name, the sizes and the first lines.
+    if (path === "/api/board/attachment") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      if (method === "GET") {
+        const id = url.searchParams.get("id") ?? "";
+        const meta = await boardStub(env).attachmentMeta(id);
+        if (meta.ok === false) return refusal(meta);
+        const object = await env.ATTACHMENTS.get(attachmentKey(id));
+        if (object === null) return failure(404, "NOT_FOUND", "The attachment's text is gone (expired)");
+        // Shown as plain text; the sandbox CSP keeps even a hostile file inert.
+        return new Response(object.body, { status: 200, headers: {
+          "content-type": "text/plain; charset=utf-8", ...SECURITY_HEADERS, "content-security-policy": "sandbox",
+        } });
+      }
+      if (request.headers.get("origin") !== url.origin) return failure(403, "ORIGIN", "Requests from other sites are refused");
+      const itemId = url.searchParams.get("item_id") ?? "";
+      if (!validItemId(itemId)) return failure(400, "INVALID", "item_id is required");
+      if (method === "DELETE") {
+        const done = await boardStub(env).attachmentDrop(itemId, url.searchParams.get("id") ?? "");
+        if (done.ok === false) return refusal(done);
+        const id = url.searchParams.get("id") ?? "";
+        try { await env.ATTACHMENTS.delete(attachmentKey(id)); } catch { /* the lifecycle rule removes it */ }
+        return json(200, done);
+      }
+      if (method !== "POST") return failure(405, "METHOD", "POST, GET or DELETE");
+      const declared = Number(request.headers.get("content-length") ?? "0");
+      if (declared > ATTACHMENT_MAX_BYTES) return failure(413, "TOO_LARGE", "An attachment may be 1 MB");
+      const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      if (type !== "text/plain" && type !== "text/markdown") return failure(415, "CONTENT_TYPE", "Send text/plain");
+      const bytes = new Uint8Array(await request.arrayBuffer());
+      if (bytes.length > ATTACHMENT_MAX_BYTES) return failure(413, "TOO_LARGE", "An attachment may be 1 MB");
+      const parsed = bytes.length > 0 ? parseText(bytes) : null;
+      if (parsed === null) return failure(400, "INVALID", "An attachment is a non-empty UTF-8 text");
+      const id = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const name = cleanName(url.searchParams.get("name") ?? "");
+      const added = await boardStub(env).attachmentAdd(itemId, id, name, parsed.bytes, parsed.chars, parsed.head);
+      if (added.ok === false) return refusal(added);
+      try {
+        await env.ATTACHMENTS.put(attachmentKey(id), bytes, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
+      } catch {
+        await boardStub(env).attachmentDrop(itemId, id);
+        return failure(503, "STORAGE", "The attachment could not be stored");
+      }
+      return json(200, added);
     }
 
     // The owner's own writes from the page. Cloudflare Access proves who it is;
