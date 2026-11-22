@@ -7,7 +7,7 @@
 | 場所 | 中身 | 状態 |
 |---|---|---|
 | `board-worker/` | 進捗の看板。Cloudflare Workers で動き、保存は SQLite 型の Durable Object | 作者の環境で稼働中 |
-| `iris/` | 計画と実行の本体（Rust）。手元の PC だけで動く | 合成データと合成の担当だけで動く候補。詳しくは [`iris/README.md`](iris/README.md) |
+| `iris/` | 計画と実行の参照実装（Rust）。手元の PC だけで動く | 2026-11-22 に凍結（#46）。今の状態の正本は看板で、ここには新しい機能を足さない。合成データと合成の担当だけで動く。詳しくは [`iris/README.md`](iris/README.md) |
 | `prototype/`・`tests/`・`examples/`・`CONTRACT.md` | 最初に作った Python の試作 | 記録として残している。新しい機能は足さない |
 | `experiments/stack-evaluation/` | 本体の言語を決めたときの比較（Python・Go・Rust） | 記録 |
 
@@ -78,9 +78,9 @@ Cloudflare のアカウントと、Cloudflare で管理しているドメイン�
 
 `board-worker/` で `pnpm test` を実行します。先に `test/route.test.mjs` が、振り分けと cron の判断（持ち主の順番の読み方・拾っているかの見分け・Devin を起こす条件）を、看板・Devin の代役で Node の上だけで確かめます。続けて `test/board.test.mjs` が、`wrangler dev`（手元の workerd）の上で、鍵の拒否・Access の署名の確認・OAuth の一周（発見・client の登録・許可の画面・PKCE・token・使い回した code の取り消し）・項目と出来事の規則・持ち主が画面から書く操作（ほかのサイトからの要求の拒否を含む）・上限・再起動後も残ることを確かめます。一時フォルダは OS の一時フォルダ（`BOARD_TEST_TEMP` で変えられます）に作り、終わると消します。
 
-## 本体（iris）
+## 参照実装（iris）
 
-計画と許可、判断待ち、実行の状態、成果の根拠を一つの流れで確かめる、手元専用の本体です。起動の仕方・MCP・看板・状態の診断と復旧は [`iris/README.md`](iris/README.md) にまとめています。試験は `iris/` で `cargo test --locked` を実行します。
+計画と許可、判断待ち、実行の状態、成果の根拠を一つの流れで確かめる、手元専用の参照実装です。2026-11-22 に凍結しました（#46）。今の状態の正本は看板（`board-worker/`）で、ここには新しい機能を足しません。起動の仕方・MCP・看板・状態の診断と復旧は [`iris/README.md`](iris/README.md) にまとめています。試験は `iris/` で `cargo test --locked` を実行します。
 
 ## ライセンス
 
