@@ -14,7 +14,8 @@
 
 import { closeSync, existsSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardClient } from "./board-client.mjs";
 import { CommandExecutor, RecordExecutor } from "./executors.mjs";
@@ -22,6 +23,33 @@ import { runChatPass, runPass } from "./picker.mjs";
 import { watchBoard, watchUrl } from "./watch.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The commit a folder's git checkout is at, or null. */
+export function headCommit(dir, run = execFileSync) {
+  try {
+    const out = String(run("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 })).trim();
+    return /^[0-9a-f]{40}$/.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** "picker=<commit>[,name=<commit>...]" for board_accept_handoff, or null when nothing is known. */
+export function versionsFromEnv(env, commitOf = headCommit) {
+  const pairs = [];
+  const own = commitOf(join(dirname(fileURLToPath(import.meta.url)), ".."));
+  if (own !== null) pairs.push(`picker=${own}`);
+  for (const entry of (env.PICKER_VERSION_DIRS ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
+    const at = entry.indexOf("=");
+    const name = at > 0 ? entry.slice(0, at) : "";
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name) || name === "picker" || pairs.some((p) => p.startsWith(`${name}=`))) {
+      throw new Error("PICKER_VERSION_DIRS must be name=folder pairs (names ^[a-z][a-z0-9_-]{0,31}$, distinct, not picker)");
+    }
+    const commit = commitOf(entry.slice(at + 1));
+    if (commit !== null) pairs.push(`${name}=${commit}`);
+  }
+  return pairs.length ? pairs.slice(0, 8).join(",") : null;
+}
 
 export function configFromEnv(env) {
   const required = (name) => {
@@ -65,6 +93,10 @@ export function configFromEnv(env) {
       return value;
     })(),
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",
+    // What this picker runs with, sent with every accept (#46 Q8), e.g.
+    // "picker=<commit>,rules=<commit>": the picker's own commit, and the
+    // folders named in PICKER_VERSION_DIRS ("rules=/path,skills=/path").
+    versions: versionsFromEnv(env),
     // Where a conversation turn's attachments are put for the executor (one
     // folder per turn, removed after the run). The executor is told the paths.
     // /tmp is shared, so runChatPass uses this folder only if it is a real

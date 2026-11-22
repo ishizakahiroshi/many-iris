@@ -11,8 +11,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
-import { acquireLock, configFromEnv } from "../src/main.mjs";
-import { chatAnswer, eligible, fetchAttachments, privateTurnDir, runChatPass, runPass } from "../src/picker.mjs";
+import { acquireLock, configFromEnv, versionsFromEnv } from "../src/main.mjs";
+import { chatAnswer, eligible, fetchAttachments, privateTurnDir, runChatPass, runPass, runResult } from "../src/picker.mjs";
 
 let passed = 0;
 const failures = [];
@@ -102,7 +102,13 @@ class FakeBoard {
         this.fenceOf(args);
         this.heartbeats += 1;
         if (this.onHeartbeat) this.onHeartbeat(this.heartbeats);
-        return { ok: true };
+        return this.stop ? { ok: true, stop: true, stop_reason: "paused" } : { ok: true };
+      }
+      case "board_release_handoff": {
+        const target = this.fenceOf(args);
+        target.handoff = null;
+        target.state = "planned";
+        return { ok: true, changed: true };
       }
       case "board_progress_handoff": {
         this.fenceOf(args);
@@ -473,6 +479,54 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   check("an empty answer says so", chatAnswer({ outcome: "done", text: "" }).reply === "（返事が空でした）");
   check("a non-https ref is dropped", chatAnswer({ outcome: "done", text: JSON.stringify({ reply: "a", ref: "http://x" }) }).ref === null);
 }
+// --- #46 段 2: 全部止める, the read of one's own work, versions and results
+{
+  // A board with board_my_work: the picker reads only that.
+  const board = new FakeBoard([item()]);
+  board.listMine = async () => { board.calls.push({ tool: "board_my_work" }); return { paused: true, items: structuredClone(board.items) }; };
+  const outcome = await runPass({ client: board, config: baseConfig, executor: new RecordExecutor(), state: state() });
+  check("nothing is taken while the owner stopped everything", outcome.kind === "paused" && board.callsOf("board_accept_handoff").length === 0, JSON.stringify(outcome));
+  check("the paused pass read board_my_work, not board_list", board.callsOf("board_my_work").length === 1 && board.callsOf("board_list").length === 0);
+}
+{
+  const board = new FakeBoard([item()]);
+  board.listMine = async () => ({ paused: false, items: structuredClone(board.items) });
+  const outcome = await runPass({ client: board, config: { ...baseConfig, versions: "picker=abc1234,rules=def5678" }, executor: new RecordExecutor(), state: state() });
+  check("the accept carries the versions", outcome.kind === "ran" && board.callsOf("board_accept_handoff")[0]?.args.versions === "picker=abc1234,rules=def5678",
+    JSON.stringify(board.callsOf("board_accept_handoff")[0]?.args));
+}
+{
+  // The board says stop at a heartbeat: the run is aborted and gives the work back.
+  const board = new FakeBoard([item()]);
+  board.onHeartbeat = () => { board.stop = true; };
+  const slow = { async run(job, { signal }) { await new Promise((resolve) => { const t = setTimeout(resolve, 2000); signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }); }); return { outcome: signal.aborted ? "stopped" : "done", text: "x" }; } };
+  const outcome = await runPass({ client: board, config: baseConfig, executor: slow, state: state() });
+  check("a stop at the heartbeat ends the run as paused", outcome.kind === "paused", JSON.stringify(outcome));
+  check("the stopped run gives the work back, and does not complete it",
+    board.callsOf("board_release_handoff").length === 1 && board.callsOf("board_complete_handoff").length === 0 && board.items[0].state === "planned");
+  check("the release carries the run's fence", board.callsOf("board_release_handoff")[0]?.args.generation === 1);
+}
+{
+  const board = new FakeBoard([item()]);
+  const executor = { async run() { return { outcome: "done", text: JSON.stringify({ summary: "直しました", ref: "https://github.com/example/repo/pull/3", commit: "0a1b2c3d" }) }; } };
+  await runPass({ client: board, config: baseConfig, executor, state: state() });
+  const done = board.callsOf("board_complete_handoff")[0]?.args;
+  check("a JSON result gives the completion its summary, link and commit", done?.text === "直しました" && done?.ref === "https://github.com/example/repo/pull/3" && done?.commit === "0a1b2c3d", JSON.stringify(done));
+}
+{
+  check("a pull request link in plain text becomes the result link", runResult({ text: "opened https://github.com/example/repo/pull/9 for review" }).ref === "https://github.com/example/repo/pull/9");
+  check("plain text without a link has no result link", runResult({ text: "done" }).ref === null && runResult({ text: "done" }).commit === null);
+  check("a bad commit in JSON is dropped", runResult({ text: JSON.stringify({ summary: "s", commit: "XYZ" }) }).commit === null);
+  check("a non-https ref in JSON is dropped", runResult({ text: JSON.stringify({ summary: "s", ref: "http://x" }) }).ref === null);
+  const commits = { "/r": "a".repeat(40), "/s": null };
+  const commitOf = (dir) => (dir in commits ? commits[dir] : "b".repeat(40));
+  check("versions name the picker and the named folders", versionsFromEnv({ PICKER_VERSION_DIRS: "rules=/r,skills=/s" }, commitOf) === `picker=${"b".repeat(40)},rules=${"a".repeat(40)}`);
+  check("no versions when nothing is known", versionsFromEnv({}, () => null) === null);
+  let threw = false;
+  try { versionsFromEnv({ PICKER_VERSION_DIRS: "picker=/r" }, commitOf); } catch { threw = true; }
+  check("PICKER_VERSION_DIRS may not name picker", threw);
+}
+
 console.log(`picker.test: ${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);
 process.exitCode = failures.length === 0 ? 0 : 1;

@@ -123,6 +123,23 @@ export class BoardClient {
     return body.result;
   }
 
+  /**
+   * What concerns this writer only (board_my_work, #46 段 2): { paused, items }.
+   * The items have the board_list shape that eligible() reads. A board from
+   * before the tool answers "Unknown or invalid tool"; then the full list is
+   * read as before and paused is false (that board has no 全部止める).
+   */
+  async listMine(project) {
+    const args = project ? { project } : {};
+    try {
+      const data = await this.call("board_my_work", args);
+      return { paused: data.paused === true, items: Array.isArray(data.items) ? data.items : [] };
+    } catch (error) {
+      if (!(error instanceof BoardUnreachable) || !/Unknown or invalid tool/.test(error.message)) throw error;
+      return { paused: false, items: await this.listItems(project) };
+    }
+  }
+
   /** All items of one project (or of every project), with no events. */
   async listItems(project) {
     // since_seq far in the future asks for the items alone, as in

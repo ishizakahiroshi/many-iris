@@ -100,6 +100,33 @@ export async function lookUpTakeover(client, job, listed = []) {
   return { itemId: ref, project: found.project ?? null, createdAt: found.created_at, title: truncate(found.title ?? "", 200) };
 }
 
+/** A commit id as the board takes it (7 to 40 lowercase hex). */
+const COMMIT = /^[0-9a-f]{7,40}$/;
+/** The first pull request link in a text, if any. */
+const PR_LINK = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/;
+
+/**
+ * The result to put in the card's 結果 (#46 段 2): { text, ref, commit }.
+ * A worker that knows this prints one last line of JSON
+ * {"summary": "...", "ref": "https://...", "commit": "<hex>"}; otherwise the
+ * text is kept as it is and the first pull request link in it becomes ref.
+ */
+export function runResult(result) {
+  let text = String(result?.text ?? "");
+  let ref = null;
+  let commit = null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (typeof parsed.summary === "string") text = parsed.summary;
+      if (typeof parsed.ref === "string" && parsed.ref.startsWith("https://") && parsed.ref.length <= 500) ref = parsed.ref;
+      if (typeof parsed.commit === "string" && COMMIT.test(parsed.commit)) commit = parsed.commit;
+    }
+  } catch { /* plain text */ }
+  if (ref === null) ref = PR_LINK.exec(text)?.[0] ?? null;
+  return { text, ref, commit };
+}
+
 /** Fence refusals: the board has moved on; this run stops, no retry. */
 export function isFenceRefusal(error) {
   return error instanceof BoardRefusal
@@ -130,7 +157,13 @@ export async function runPass({ client, config, executor, state, log = () => {},
   for (const project of projects) {
     let items;
     try {
-      items = await client.listItems(project ?? undefined);
+      // Only what is addressed to this writer (board_my_work); an older board falls back to the full list.
+      const mine = typeof client.listMine === "function" ? await client.listMine(project ?? undefined) : { paused: false, items: await client.listItems(project ?? undefined) };
+      if (mine.paused) {
+        log("the owner stopped everything on the board; not taking anything");
+        return { kind: "paused" };
+      }
+      items = mine.items;
     } catch (error) {
       if (error instanceof BoardUnreachable) {
         log("the board could not be read; ending this pass without taking anything");
@@ -151,7 +184,9 @@ export async function runPass({ client, config, executor, state, log = () => {},
   // an ordinary race, reported and never retried in this pass.
   let accepted;
   try {
-    accepted = await client.call("board_accept_handoff", { item_id: chosen.itemId, request_id: chosen.requestId });
+    const acceptArgs = { item_id: chosen.itemId, request_id: chosen.requestId };
+    if (typeof config.versions === "string" && config.versions.length > 0) acceptArgs.versions = config.versions;
+    accepted = await client.call("board_accept_handoff", acceptArgs);
   } catch (error) {
     if (error instanceof BoardRefusal) {
       log(`accept refused for ${chosen.itemId}: ${error.code}`);
@@ -181,10 +216,17 @@ export async function runPass({ client, config, executor, state, log = () => {},
   log(`took ${chosen.itemId} (generation ${generation})`);
 
   const abort = new AbortController();
-  let stopReason = null; // "fenced-out" | "unreachable"
+  let stopReason = null; // "fenced-out" | "unreachable" | "paused"
+  // 全部止める: the board's answer to a heartbeat or a progress write says stop.
+  const heedStop = (answer) => {
+    if (answer?.stop === true && stopReason === null) {
+      stopReason = "paused";
+      abort.abort();
+    }
+  };
   const heartbeat = async () => {
     try {
-      await client.call("board_heartbeat_handoff", fence);
+      heedStop(await client.call("board_heartbeat_handoff", fence));
     } catch (error) {
       if (isFenceRefusal(error)) stopReason = "fenced-out";
       else if (error instanceof BoardUnreachable) stopReason = "unreachable";
@@ -194,7 +236,7 @@ export async function runPass({ client, config, executor, state, log = () => {},
   };
   const timer = timers.setInterval(() => { void heartbeat(); }, config.heartbeatMs);
   const progress = async (text) => {
-    await client.call("board_progress_handoff", { ...fence, kind: "note", text: truncate(text) });
+    heedStop(await client.call("board_progress_handoff", { ...fence, kind: "note", text: truncate(text) }));
   };
 
   let result;
@@ -208,6 +250,21 @@ export async function runPass({ client, config, executor, state, log = () => {},
     result = { outcome: "stopped", text: `executor failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
     timers.clearInterval(timer);
+  }
+
+  if (stopReason === "paused") {
+    // The owner stopped everything: this run is still the current one, so it
+    // gives the work back to the pile itself (fenced), and the owner hands it
+    // over again after resuming. If the board cannot be told, the lease
+    // lapses into the unknown quarantine as with any other lost run.
+    try {
+      await client.call("board_release_handoff", fence);
+      log(`run of ${chosen.itemId} stopped: the owner stopped everything; the work is back on the pile`);
+    } catch (error) {
+      if (!(error instanceof BoardRefusal) && !(error instanceof BoardUnreachable)) throw error;
+      log(`run of ${chosen.itemId} stopped for 全部止める, but giving it back failed (${error instanceof BoardRefusal ? error.code : "unreachable"})`);
+    }
+    return { kind: "paused", itemId: chosen.itemId };
   }
 
   if (stopReason !== null) {
@@ -229,8 +286,12 @@ export async function runPass({ client, config, executor, state, log = () => {},
   }
 
   const outcome = result?.outcome === "done" ? "done" : "stopped";
+  const found = runResult(result);
+  const completion = { ...fence, outcome, text: truncate(found.text) || undefined };
+  if (found.ref !== null) completion.ref = found.ref;
+  if (found.commit !== null) completion.commit = found.commit;
   try {
-    await client.call("board_complete_handoff", { ...fence, outcome, text: truncate(result?.text ?? "") || undefined });
+    await client.call("board_complete_handoff", completion);
   } catch (error) {
     if (isFenceRefusal(error)) {
       log(`completion of ${chosen.itemId} refused: ${error.code}`);

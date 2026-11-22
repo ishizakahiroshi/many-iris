@@ -43,6 +43,15 @@ node src/main.mjs --watch   # 常駐: 看板の通知で即見に行く + ポー
 通知・ポーリングのどちらのパスも止まります（VPS の `STOP` 作法の常駐版。
 カンマ区切りで複数指定でき、例えば `STOP,STOP-devin` はどちらかがあれば止まります）。
 
+看板を見るのは `board_my_work`（自分宛ての分だけ）です。この道具が無い古い看板では、
+いままでどおり `board_list` を読みます。看板で持ち主が「全部止める」を押している間は
+何も受けず、動いている実行は次の連絡で `stop: true` を受け取ったら作業役を止め、
+仕事を `board_release_handoff` で積み直します（完了は書きません）。
+作業役の最後の 1 行が JSON `{"summary": "...", "ref": "https://...", "commit": "<16進>"}`
+なら、`summary` を結果の文、`ref` と `commit` をカードの「結果」として
+`board_complete_handoff` へ渡します。JSON でなければ文はそのままで、文の中の
+最初の GitHub の PR のリンクを `ref` にします。
+
 cron の例（5 分おきに 1 回）:
 
 ```cron
@@ -73,6 +82,7 @@ cron の例（5 分おきに 1 回）:
 | `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限（1〜50）。`0` で上限なし（止めるときは `PICKER_STOP_FILE` か cron 側の STOP） |
 | `PICKER_STATE_FILE` | | `picker-state.json` | 1 日の実行数の記録 |
 | `PICKER_STOP_FILE` | | なし | `--watch` 用。カンマ区切りのファイルのどれかがある間は全パスを止める |
+| `PICKER_VERSION_DIRS` | | なし | 受けるときに看板へ伝える版。`rules=/path,skills=/path` のように名前とフォルダを並べると、各フォルダの git の commit を、拾い手自身の commit（`picker=`）と一緒に `board_accept_handoff` の `versions` で送る |
 | `PICKER_ATTACH_DIR` | | OS の一時フォルダの `many-iris-attachments-<書き手>` | 会話の添付を置くフォルダ。拾い手の利用者のフォルダでなければ（リンクや、ほかの利用者が先に作ったもの）使わず、0700 に締める。1 回分ごとに推測できない名前の 0700 のフォルダを作り、ファイルは 0600 で書いて、実行が終わったら消す。作業役には `job.attachments` でパスを渡す |
 | `PICKER_EXECUTOR` | | `record` | `record`（記録のみ）か `command`（下記） |
 | `PICKER_COMMAND` | command 時 | — | 実行するコマンド（シェルを介さず直接起動） |
