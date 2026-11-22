@@ -197,6 +197,9 @@ try {
   await main();
 } finally {
   stop();
-  try { rmSync(temp, { recursive: true, force: true }); } catch {}
+  // workerd lets go of its files a moment after it is stopped (Windows refuses
+  // to remove them before), so wait and retry instead of leaving the folder.
+  await new Promise((r) => setTimeout(r, 1000));
+  try { rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); } catch (e) { console.log(`could not remove ${temp}: ${e.code ?? e}`); }
 }
 process.exit(failures.length === 0 ? 0 : 1);

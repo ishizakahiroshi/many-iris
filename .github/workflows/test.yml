@@ -1,0 +1,49 @@
+name: test
+
+# The board (board-worker, under a local `wrangler dev`) and the picker, on
+# every push and pull request to main and develop (#46 段 1). The frozen Rust
+# iris/ is not run here: it gets no new code (#46 Q1).
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: board and picker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.1.1
+
+      - name: Install the board's packages
+        working-directory: board-worker
+        run: pnpm install --frozen-lockfile
+
+      - name: Board tests
+        working-directory: board-worker
+        env:
+          BOARD_TEST_TEMP: ${{ runner.temp }}
+        run: pnpm test
+
+      - name: Picker tests
+        working-directory: picker
+        run: npm test
