@@ -31,6 +31,11 @@
   let busy = false;
   let pending = [];       // attachments uploaded for the next message: {id, name, bytes, chars}
   let uploading = 0;
+  // The new chat has no conversation yet, so its attachments wait here (not uploaded)
+  // until the work is made and handed over: {key, name, text, bytes, chars}.
+  let startPending = [];
+  let startKey = 0;
+  let startNote = '';     // what the first send could not do, shown on the conversation it opens
 
   // Attachments (see the design: docs/local/design_chat-attachments_2026-11-22.md).
   // A paste longer than this becomes an attachment card instead of text.
@@ -245,7 +250,8 @@
     const log = $('chat-log');
     log.replaceChildren(el('p', 'chat-loading', '読み込んでいます…'));
     delete log.dataset.shown;
-    $('chat-status').textContent = '';
+    $('chat-status').textContent = startNote;
+    startNote = '';
     renderList();
     refreshConversation();
     chatTimer = setInterval(() => { if (!document.hidden) refreshConversation(); }, 8000);
@@ -297,6 +303,22 @@
     if (current) for (const a of left) takeBack(a.id);
     renderPending();
   }
+  // Stores one attachment on a conversation. {ok, attachment} or {ok:false, text}.
+  async function upload(itemId, name, text) {
+    try {
+      const response = await fetch('/api/board/attachment?item_id=' + encodeURIComponent(itemId) + '&name=' + encodeURIComponent(name), {
+        method: 'POST', cache: 'no-store',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: text,
+      });
+      let answer = null;
+      try { answer = await response.json(); } catch { answer = null; }
+      if (response.ok && answer && answer.ok === true) return { ok: true, attachment: answer.attachment };
+      return { ok: false, text: attachErrors[answer && answer.code] || errors[answer && answer.code] || '添付できませんでした。' };
+    } catch {
+      return { ok: false, text: '接続できません。通信を確かめてください。' };
+    }
+  }
   async function attach(name, text) {
     const status = $('chat-status');
     if (!current || $('chat-text').disabled) { status.textContent = '返事が来てから添付してください。'; return false; }
@@ -306,37 +328,67 @@
     $('chat-send').disabled = true;
     status.textContent = '添付を保管しています…';
     try {
-      const response = await fetch('/api/board/attachment?item_id=' + encodeURIComponent(current) + '&name=' + encodeURIComponent(name), {
-        method: 'POST', cache: 'no-store',
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        body: text,
-      });
-      let answer = null;
-      try { answer = await response.json(); } catch { answer = null; }
-      if (response.ok && answer && answer.ok === true) {
-        pending.push({ id: answer.attachment.id, name: answer.attachment.name, bytes: answer.attachment.bytes, chars: answer.attachment.chars });
-        renderPending();
-        status.textContent = '';
-        return true;
-      }
-      status.textContent = attachErrors[answer && answer.code] || errors[answer && answer.code] || '添付できませんでした。';
-      return false;
-    } catch {
-      status.textContent = '接続できません。通信を確かめてください。';
-      return false;
+      const stored = await upload(current, name, text);
+      if (!stored.ok) { status.textContent = stored.text; return false; }
+      const a = stored.attachment;
+      pending.push({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars });
+      renderPending();
+      status.textContent = '';
+      return true;
     } finally {
       uploading -= 1;
       if (!uploading) $('chat-send').disabled = Boolean(shown && shown.open);
     }
   }
-  async function attachFiles(files) {
+  // Reads the chosen or dropped text files and hands each to `add(name, text)` (stops when it returns false).
+  async function readFiles(files, status, add) {
     for (const file of files) {
-      if (!FILE_RE.test(file.name)) { $('chat-status').textContent = '添付できるのは .txt .md .log のファイルです。'; continue; }
-      if (file.size > limits().max_bytes) { $('chat-status').textContent = '1 ファイルは 1 MB までです。'; continue; }
+      if (!FILE_RE.test(file.name)) { status.textContent = '添付できるのは .txt .md .log のファイルです。'; continue; }
+      if (file.size > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; continue; }
       let text;
-      try { text = await file.text(); } catch { $('chat-status').textContent = 'ファイルを読めませんでした。'; continue; }
-      if (!await attach(file.name, text)) break;
+      try { text = await file.text(); } catch { status.textContent = 'ファイルを読めませんでした。'; continue; }
+      if (!await add(file.name, text)) break;
     }
+  }
+  const attachFiles = (files) => readFiles(files, $('chat-status'), attach);
+
+  // --- attachments of the new chat (kept in the page until the first send)
+  function renderStartPending() {
+    const list = $('chat-start-attach');
+    list.replaceChildren();
+    for (const a of startPending) {
+      const li = el('li', 'chat-card');
+      li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
+      const x = el('button', 'quiet chat-card-x', '×');
+      x.type = 'button';
+      x.setAttribute('aria-label', a.name + ' をやめる');
+      x.addEventListener('click', () => { startPending = startPending.filter((b) => b.key !== a.key); renderStartPending(); });
+      li.append(x);
+      list.append(li);
+    }
+    list.hidden = !startPending.length;
+  }
+  function addStart(name, text) {
+    const status = $('chat-start-status');
+    if (startPending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; return false; }
+    const bytes = new Blob([text]).size;
+    if (bytes > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; return false; }
+    startPending.push({ key: ++startKey, name, text, bytes, chars: [...text].length });
+    renderStartPending();
+    status.textContent = '';
+    return true;
+  }
+  // After the work is made and handed over, its attachments go as the first message.
+  // Returns '' or why they could not be sent.
+  async function sendStartAttachments(itemId, to) {
+    const ids = [];
+    for (const a of startPending) {
+      const stored = await upload(itemId, a.name, a.text);
+      if (!stored.ok) return a.name + ' を添付できませんでした（' + stored.text + '）';
+      ids.push(stored.attachment.id);
+    }
+    const sent = await write({ op: 'chat_send', item_id: itemId, text: '', to, attachments: ids });
+    return sent.ok ? '' : '添付を送れませんでした（' + sent.text + '）';
   }
 
   function setup() {
@@ -351,6 +403,22 @@
     const count = () => { $('chat-start-count').textContent = [...startText.value].length + ' / 200'; grow(startText, 220); };
     startText.addEventListener('input', count);
     sendOnEnter(startText, $('chat-start-form'));
+    // The same attachments as in a conversation: a long paste, a chosen or dropped file.
+    startText.addEventListener('paste', (event) => {
+      const pasted = event.clipboardData ? event.clipboardData.getData('text/plain') : '';
+      if ([...pasted].length <= PASTE_ATTACH_CHARS) return;
+      event.preventDefault();
+      addStart('貼り付け.txt', pasted);
+    });
+    const addStartFiles = (files) => readFiles(files, $('chat-start-status'), addStart);
+    $('chat-start-file').addEventListener('change', (event) => { addStartFiles([...event.target.files]); event.target.value = ''; });
+    const start = $('chat-start');
+    start.addEventListener('dragover', (event) => { if (event.dataTransfer && [...event.dataTransfer.types].includes('Files')) event.preventDefault(); });
+    start.addEventListener('drop', (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      addStartFiles([...event.dataTransfer.files]);
+    });
     $('chat-start-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const status = $('chat-start-status');
@@ -366,13 +434,20 @@
         const added = await write({ op: 'add', project, title: [...text].slice(0, 200).join(''), day });
         if (!added.ok) { status.textContent = added.text; return; }
         const itemId = added.answer.item.item_id;
-        const handed = await write({ op: 'hand', item_id: itemId, day, to: $('chat-start-partner').value });
+        const to = $('chat-start-partner').value;
+        const handed = await write({ op: 'hand', item_id: itemId, day, to });
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }
+        const missed = startPending.length ? await sendStartAttachments(itemId, to) : '';
         startText.value = '';
+        startPending = [];
+        renderStartPending();
         $('chat-start-project').value = NO_PROJECT;
         count();
-        status.textContent = '';
         await loadBoard();
+        // The conversation page shows its own status line; route() says there what did not go.
+        startNote = '';
+        status.textContent = '';
+        if (missed) startNote = '仕事は任せました。' + missed + '。続けて添付し直せます。';
         location.hash = encodeURIComponent(itemId);
       } finally { send.disabled = false; }
     });

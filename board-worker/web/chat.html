@@ -33,9 +33,14 @@
       <section id="chat-start" class="chat-start" aria-labelledby="chat-start-title">
         <h1 id="chat-start-title">何を頼みますか？</h1>
         <form id="chat-start-form" class="chat-box">
+          <ul id="chat-start-attach" class="chat-attach" aria-label="添付" hidden></ul>
           <label class="sr-only" for="chat-start-text">最初のひとこと</label>
           <textarea id="chat-start-text" rows="3" maxlength="200" placeholder="例：昨日のキオクシアの終値を調べて" enterkeyhint="send"></textarea>
           <div class="chat-box-row">
+            <label class="chat-clip" title="テキストファイル（.txt .md .log）を添付">
+              <input id="chat-start-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown" multiple hidden>
+              <span aria-hidden="true">＋</span><span class="sr-only">ファイルを添付</span>
+            </label>
             <label class="chat-pick"><span>案件</span><select id="chat-start-project"><option value="chat">案件なし</option></select></label>
             <label class="chat-pick"><span>相手</span><select id="chat-start-partner"></select></label>
             <span id="chat-start-count" class="chat-count">0 / 200</span>
