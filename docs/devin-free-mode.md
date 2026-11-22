@@ -3,6 +3,29 @@
 Devin のクラウドに、SWE-2 を使った無料枠「Free mode」が追加されたという
 調査の記録です。調査日は 2026-11-22 です。
 
+> **2026-11-22 追記（公式情報の再確認と #46 の決定）**
+>
+> - 公式文書（self-serve plans）と料金ページで確認できる Free mode の同時数は、
+>   Teams の「1 人あたり 2」だけでした。Pro 2・Max 4 は、公式文書と料金ページの
+>   どちらでも確認できませんでした（下の「無料枠の同時セッション数」の区別のとおり）。
+> - API のセッション作成（v3）に、Free mode を指定する項目は文書にありません。
+>   `devin_mode` に `swe-2-medium`・`swe-2-high`・`swe-2-max` はありますが、
+>   無料かどうかは書かれていません。
+> - 料金ページの Pro には「Free use of SWE-2」とあり、期限の記載はありません。
+>   models のページは「2026-11-30 まで、Desktop と CLI のみ」のままで、
+>   食い違いは残っています。
+> - cognition.com のブログの一覧には、Teams プラン更新・Free mode の記事は
+>   見当たりませんでした。
+> - #46 の決定で「ローカルが寝ているときだけフォールバック」は廃止しました。
+>   下の「many-iris #41 との関係」は当時の検討として残します。看板から起こす
+>   Devin Cloud は有料の前提で回数の上限を残し、Free mode を振り分けの前提に
+>   しません。2026-12-01 以降に models と料金ページを見直します（#44）。
+>
+> 出典（2026-11-22 確認）: https://docs.devin.ai/admin/billing/self-serve 、
+> https://docs.devin.ai/desktop/models 、https://devin.ai/pricing 、
+> https://docs.devin.ai/api-reference/v3/sessions/post-organizations-sessions 、
+> https://cognition.com/blog
+
 ## この記録の位置づけ
 
 - このファイルは調査記録のみで、コードの変更はありません。
@@ -80,7 +103,7 @@ SWE-2)」を選ぶことでクラウドセッションを無料で実行でき�
   - X の Kinopee 氏の投稿では、「Devin cloud も SWE-2 は上限を消費
     しません。ただし、プランごとの同時セッション数上限はあります
     （画面確認ベースで Pro 2、Max 4、Teams 2」と説明されています。
-  - Devin Central の Chris Wozniczek 氏の 2026-11-16 の投稿でも、
+  - Devin Central の 2026-11-16 の投稿でも、
     クラウドセッションの無料 SWE-2 について「Pro up to 2 concurrent
     cloud sessions, Max up to 4」と報告されています。
   - ユーザーのスクリーンショットにも、Max のものとみられる画面で
@@ -184,7 +207,7 @@ Max プランに入っているからといって、Free mode が Max エフォ�
 
 ## many-iris #41 との関係
 
-many-iris の Issue #41「VPS 中継ハブ＋ローカル並列ハイブリッド運用の
+many-iris の Issue #41「VPS 中継ハブとローカル並列を組み合わせた運用の
 実装」では、実装方針の 6 番目として「ローカルが寝ているときだけ
 VPS 軽量バッチ／Devin へ」と決めています。
 
@@ -238,7 +261,7 @@ VPS 軽量バッチ／Devin へ」と決めています。
   https://planyield.dev/changes/2026-11-12-devin-teams-plan-update/
 - AI Oriens（2026-11-12 の Teams プラン更新の報道）
   https://ai-oriens.com/en/news/cognition-devin-teams-plan/
-- Devin Central（Chris Wozniczek 氏の 2026-11-16 の投稿、Pro 2・
+- Devin Central（2026-11-16 の投稿、Pro 2・
   Max 4 の報告）
   https://devincentral.com/wire/2026-11-16-chris-woz-cloud-free-swe2-session-caps
 
