@@ -30,6 +30,7 @@
     BOARD_ITEM_LIMIT: '看板の項目が上限に達しています。',
     AUTH: 'ログインが切れています。このページを開き直してください。',
     FORBIDDEN: 'この操作はできません。',
+    PAUSED: '全部止めています。再開してから、もう一度お試しください。',
   };
   let loading = false;
   // The project the page shows ('' = every project), kept on this device, and
@@ -557,10 +558,72 @@
   // Someone is in the middle of typing or choosing: a timed reload would wipe it.
   function editing() {
     if ($('board-route').querySelector('details[open]')) return true;
+    if ($('board-pause').querySelector('details[open]')) return true;
     const host = $('board-projects');
     if (host.contains(document.activeElement) && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return true;
     if (host.querySelector('details.board-write[open]')) return true;
     return [...host.querySelectorAll('.board-add input')].some((input) => input.value !== '');
+  }
+  // What the taker said it ran with (#46 Q8): name and the commit's first 7 characters.
+  function versionsLine(versions) {
+    const parts = Object.entries(versions).map(([name, commit]) => name + ' ' + String(commit).slice(0, 7));
+    return el('p', 'board-versions', '使った版：' + parts.join('、'));
+  }
+  // A finished run's result: its link (a PR, a commit page) and commit.
+  function resultLine(result) {
+    const line = el('p', 'board-result');
+    line.append(el('span', 'board-result-label', '結果：'));
+    if (typeof result.ref === 'string' && result.ref.startsWith('https://')) line.append(sourceNode(result.ref));
+    if (result.commit) line.append(el('code', null, String(result.commit).slice(0, 12)));
+    return line;
+  }
+  // 全部止める / 再開 (#46 Q7): only the signed-in owner sees and presses it.
+  function pauseSection(paused) {
+    const host = $('board-pause');
+    host.replaceChildren();
+    if (!canWrite || !paused || typeof paused.paused !== 'boolean') { host.hidden = true; return; }
+    host.hidden = false;
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    if (paused.paused) {
+      host.classList.add('on');
+      host.append(el('p', 'board-pause-line', '全部止めています' + (paused.at ? '（' + when(paused.at) + 'から）' : '') + '。新しい仕事も会話も受けず、Devin も起動しません。動いていた仕事は、次の連絡で止まって積み直されます。'));
+      const button = el('button', 'board-pause-resume', '再開する');
+      button.type = 'button';
+      button.addEventListener('click', async () => { if (await write({ op: 'pause', paused: false }, status, button)) load(true); });
+      host.append(button, status);
+      return;
+    }
+    host.classList.remove('on');
+    const box = el('details', 'board-write board-pause-edit');
+    box.append(el('summary', null, '全部止める'));
+    box.append(el('p', 'board-hint', '新しい仕事と会話を受けるのを止め、Devin の起動も止めます。動いている仕事は、次の連絡（数分以内）で止まって積み直されます。再開するまで、このままです。'));
+    const button = el('button', 'board-pause-stop', '止める');
+    button.type = 'button';
+    button.addEventListener('click', async () => { if (await write({ op: 'pause', paused: true }, status, button)) load(true); });
+    box.append(button, status);
+    host.append(box);
+  }
+  // 手元だけ / どこでもよい for one project (#46 Q6).
+  function scopeControl(project, local) {
+    const box = el('details', 'board-write board-scope');
+    box.append(el('summary', null, local ? '範囲：手元だけ（変える）' : '範囲：どこでもよい（変える）'));
+    box.append(el('p', 'board-hint', local
+      ? 'この案件の仕事は、手元の PC だけが受けます。VPS・Devin・Muse には行かず、サーバーの AI とも話せません。'
+      : 'この案件の仕事は、おまかせの順番どおり、手元でもサーバーでもクラウドでも受けます。'));
+    const button = el('button', 'quiet', local ? 'どこでもよいに戻す' : '手元だけにする');
+    button.type = 'button';
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    button.addEventListener('click', async () => {
+      const done = await write({ op: 'scope', project, scope: local ? 'any' : 'local' }, status, button);
+      if (done) {
+        if (done.rerouted) status.textContent = '外へ向いていた依頼 ' + done.rerouted + ' 件を、おまかせに戻しました。';
+        load(true);
+      }
+    });
+    box.append(button, status);
+    return box;
   }
   function card(item, peers) {
     const box = el('div', 'board-card');
@@ -597,8 +660,11 @@
     if (item.handoff && item.handoff.state === 'accepted') {
       box.append(el('p', 'board-wait', '受けた担当：' + item.handoff.accepted_by + '（' + when(item.handoff.accepted_at) + '、依頼の番号 ' + item.handoff.request_id + '）'));
       if (item.handoff.generation) box.append(el('p', 'board-wait', '実行の世代：' + item.handoff.generation + '　最後の連絡：' + when(item.handoff.heartbeat_at) + '　連絡の期限：' + when(item.handoff.lease_until)));
+      if (item.handoff.versions) box.append(versionsLine(item.handoff.versions));
       if (item.handoff.lease_expired) box.append(el('p', 'board-wait', '連絡の期限を過ぎています。自動では再実行されません。担当の状態を確かめてから「状態不明にする」を押してください。'));
     }
+    if (item.handoff && item.handoff.state === 'completed' && item.handoff.result) box.append(resultLine(item.handoff.result));
+    if (item.handoff && item.handoff.state === 'completed' && item.handoff.versions) box.append(versionsLine(item.handoff.versions));
     if (item.handoff && item.handoff.state === 'unknown')
       box.append(el('p', 'board-wait', '状態不明：担当（' + item.handoff.accepted_by + '）の結果が確認できていません。勝手には再実行されません。停止を確認できたら「停止を確認したので戻す」、まだ作業中と確認できたら「まだ作業中なので続ける」を押してください。'));
     if (canWrite && item.kind === 'task' && item.handoff && (item.handoff.state === 'unknown' || (item.handoff.state === 'accepted' && item.handoff.lease_expired))) box.append(recoveryControl(item));
@@ -646,6 +712,7 @@
     $('board-mode-note').textContent = canWrite ? '題名や状態は、書いた担当だけが直せます' : 'この画面から書き込むことはできません';
     $('board-foot').textContent = canWrite ? 'Many Iris / 看板' : 'Many Iris / 看板（読み取り専用）';
     routeSection(data.route);
+    pauseSection(data.paused);
     // The chat page exists on the Worker board only (the one with the owner's order).
     $('board-chat-link').hidden = !(canWrite && data.route);
     const host = $('board-projects');
@@ -661,7 +728,11 @@
       if (shownProject && project !== shownProject) continue;
       const section = el('section', 'board-project');
       const { tree, unlinked, unlinkedCount } = forest(list);
-      section.append(el('h2', null, project));
+      const scoped = Boolean(data.scopes && data.scopes[project] === 'local');
+      const title = el('h2', null, project);
+      if (scoped) title.append(el('span', 'badge board-scope-badge', '手元だけ'));
+      section.append(title);
+      if (canWrite && data.scopes) section.append(scopeControl(project, scoped));
       if (canWrite) section.append(addControl(project, list));
       section.append(tree);
       const loose = el('div', 'board-unlinked');
