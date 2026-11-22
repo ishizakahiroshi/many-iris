@@ -1,4 +1,4 @@
-// Text attachments of a conversation (design: docs/local/design_chat-attachments_2026-11-22.md).
+// Attachments of a conversation (text and images) (design: docs/local/design_chat-attachments_2026-11-22.md).
 // Plain functions without imports, so they run under node in tests.
 //
 // A long paste or a dropped .txt/.md/.log becomes an attachment: the body is
@@ -8,8 +8,10 @@
 
 /** One file: 1 MB (bytes). */
 export const ATTACHMENT_MAX_BYTES = 1024 * 1024;
-/** All attachments of one conversation together: 5 MiB. */
-export const ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
+/** One image: 5 MB (the page scales screenshots down well below this). */
+export const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+/** All attachments of one conversation together: 20 MiB. */
+export const ATTACHMENT_TOTAL_BYTES = 20 * 1024 * 1024;
 /** At most this many attachments in one conversation. */
 export const ATTACHMENT_MAX_COUNT = 20;
 /** Uploaded but not yet sent (the owner can drop them again). */
@@ -36,6 +38,28 @@ export function cleanName(raw: string): string {
 }
 
 export const TEXT_FILE = /\.(txt|md|log)$/i;
+
+/** The image types the worker AI can be shown. */
+export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
+export type ImageType = (typeof IMAGE_TYPES)[number];
+export const isImageType = (t: unknown): t is ImageType => typeof t === "string" && (IMAGE_TYPES as readonly string[]).includes(t);
+
+/** The image type the bytes really are (by their first bytes), or null. */
+export function sniffImage(b: Uint8Array): ImageType | null {
+  const at = (i: number, ...xs: number[]) => xs.every((x, k) => b[i + k] === x);
+  if (b.length >= 8 && at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+  if (b.length >= 3 && at(0, 0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (b.length >= 12 && at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
+  if (b.length >= 6 && (at(0, 0x47, 0x49, 0x46, 0x38, 0x37, 0x61) || at(0, 0x47, 0x49, 0x46, 0x38, 0x39, 0x61))) return "image/gif";
+  return null;
+}
+
+/** Bytes as base64 (for the MCP image content). */
+export function toBase64(b: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
 
 export type Parsed = { text: string; bytes: number; chars: number; head: string };
 
@@ -72,10 +96,11 @@ export function sliceChars(text: string, offset: number, limit: number): { text:
   return { text: part.join(""), next: end < all.length ? end : null, total: all.length };
 }
 
-export type Marker = { id: string; name: string; bytes: number; chars: number; head: string };
+export type Marker = { id: string; name: string; bytes: number; chars: number; head: string; mime?: string | null };
 
 /** What the worker sees in place of the body. */
 export function markerText(a: Marker): string {
+  if (isImageType(a.mime)) return `[添付 画像 ${a.name}（${a.bytes} バイト・${a.mime}）id=${a.id}。board_chat_attachment で取ると画像が返る]`;
   const lines = a.head === "" ? "" : "\n" + a.head.split("\n").map((l) => `> ${l}`).join("\n");
   return `[添付 ${a.name}（${a.chars} 字・${a.bytes} バイト）id=${a.id}。中身は board_chat_attachment で取る。先頭:${lines}]`;
 }

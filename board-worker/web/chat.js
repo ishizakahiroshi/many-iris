@@ -42,13 +42,19 @@
   // A paste longer than this becomes an attachment card instead of text.
   const PASTE_ATTACH_CHARS = 2000;
   const FILE_RE = /\.(txt|md|log)$/i;
+  const IMAGE_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
+  const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  // Images are scaled to this long side before they are sent; a PNG larger than
+  // IMAGE_PNG_MAX after that is sent as JPEG.
+  const IMAGE_EDGE = 1568;
+  const IMAGE_PNG_MAX = 1536 * 1024;
   const attachErrors = {
     TOO_LARGE: '1 ファイルは 1 MB までです。',
     CONTENT_TYPE: 'テキストとして送れませんでした。',
     BOARD_EVENT_LIMIT: 'この会話の添付が上限に達しています。',
     FORBIDDEN: 'この会話には添付できません。',
   };
-  const limits = () => (shown && shown.attachment_limits) || { max_bytes: 1048576, per_message: 5 };
+  const limits = () => (shown && shown.attachment_limits) || { max_bytes: 1048576, image_max_bytes: 5242880, per_message: 5 };
   const kb = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
 
   function el(tag, className, content) {
@@ -167,10 +173,26 @@
     if (role !== 'owner') node.append(el('span', 'chat-who', who));
     if (text) node.append(el('div', 'chat-text', text));
     for (const a of attachments || []) {
-      const label = a.name + '（' + a.chars + ' 字）';
+      const image = IMAGE_TYPES.includes(a.mime);
+      const label = image ? a.name : a.name + '（' + a.chars + ' 字）';
       if (a.expired) { node.append(el('span', 'chat-card gone', label + '　期限切れ')); continue; }
+      const href = '/api/board/attachment?id=' + encodeURIComponent(a.id);
+      if (image) {
+        // A sent image is shown small; it opens full size in a new tab.
+        const card = el('a', 'chat-shot');
+        card.href = href;
+        card.target = '_blank';
+        card.rel = 'noopener noreferrer';
+        const img = el('img');
+        img.src = href;
+        img.alt = a.name;
+        img.loading = 'lazy';
+        card.append(img);
+        node.append(card);
+        continue;
+      }
       const card = el('a', 'chat-card', label);
-      card.href = '/api/board/attachment?id=' + encodeURIComponent(a.id);
+      card.href = href;
       card.target = '_blank';
       card.rel = 'noopener noreferrer';
       node.append(card);
@@ -276,24 +298,42 @@
   }
 
   // --- attachments
+  // A file to attach, before it is stored: {name, body (text or image Blob), type, bytes, chars, thumb}.
+  const TEXT_TYPE = 'text/plain; charset=utf-8';
+  const isImage = (type) => IMAGE_TYPES.includes(type);
+  function textFile(name, text) {
+    return { name, body: text, type: TEXT_TYPE, bytes: new Blob([text]).size, chars: [...text].length, thumb: null };
+  }
+  // The card's words: "name（N 字・12 KB）" for text, "name（12 KB）" for an image.
+  const cardLabel = (a) => a.name + '（' + (isImage(a.type || a.mime) ? '' : a.chars + ' 字・') + kb(a.bytes) + '）';
+  function cardFor(a, fresh, onDrop) {
+    const li = el('li', fresh ? 'chat-card fresh' : 'chat-card');
+    if (a.thumb) { const img = el('img', 'chat-thumb'); img.src = a.thumb; img.alt = ''; li.append(img); }
+    li.append(el('span', null, cardLabel(a)));
+    const x = el('button', 'quiet chat-card-x', '×');
+    x.type = 'button';
+    x.setAttribute('aria-label', a.name + ' をやめる');
+    x.addEventListener('click', onDrop);
+    li.append(x);
+    return li;
+  }
+  const forget = (a) => { if (a.thumb) URL.revokeObjectURL(a.thumb); };
+  // Checks a file against the limits; '' when it may be attached.
+  function tooBig(file) {
+    if (isImage(file.type)) return file.bytes > limits().image_max_bytes ? '1 枚の画像は 5 MB までです。' : '';
+    return file.bytes > limits().max_bytes ? '1 ファイルは 1 MB までです。' : '';
+  }
+
   function renderPending() {
     const list = $('chat-attach');
     list.replaceChildren();
-    for (const a of pending) {
-      const li = el('li', a.id === freshId ? 'chat-card fresh' : 'chat-card');
-      li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
-      const x = el('button', 'quiet chat-card-x', '×');
-      x.type = 'button';
-      x.setAttribute('aria-label', a.name + ' をやめる');
-      x.addEventListener('click', () => dropPending(a.id));
-      li.append(x);
-      list.append(li);
-    }
+    for (const a of pending) list.append(cardFor(a, a.id === freshId, () => dropPending(a.id)));
     list.hidden = !pending.length;
     freshId = null;
   }
   const takeBack = (id) => fetch('/api/board/attachment?item_id=' + encodeURIComponent(current) + '&id=' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
   function dropPending(id) {
+    for (const a of pending) if (a.id === id) forget(a);
     pending = pending.filter((a) => a.id !== id);
     renderPending();
     if (current) takeBack(id);
@@ -302,16 +342,16 @@
   function discardPending() {
     const left = pending;
     pending = [];
-    if (current) for (const a of left) takeBack(a.id);
+    for (const a of left) { forget(a); if (current) takeBack(a.id); }
     renderPending();
   }
   // Stores one attachment on a conversation. {ok, attachment} or {ok:false, text}.
-  async function upload(itemId, name, text) {
+  async function upload(itemId, file) {
     try {
-      const response = await fetch('/api/board/attachment?item_id=' + encodeURIComponent(itemId) + '&name=' + encodeURIComponent(name), {
+      const response = await fetch('/api/board/attachment?item_id=' + encodeURIComponent(itemId) + '&name=' + encodeURIComponent(file.name), {
         method: 'POST', cache: 'no-store',
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        body: text,
+        headers: { 'Content-Type': file.type },
+        body: file.body,
       });
       let answer = null;
       try { answer = await response.json(); } catch { answer = null; }
@@ -321,19 +361,20 @@
       return { ok: false, text: '接続できません。通信を確かめてください。' };
     }
   }
-  async function attach(name, text) {
+  async function attach(file) {
     const status = $('chat-status');
-    if (!current || $('chat-text').disabled) { status.textContent = '返事が来てから添付してください。'; return false; }
-    if (pending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; return false; }
-    if (new Blob([text]).size > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; return false; }
+    if (!current || $('chat-text').disabled) { status.textContent = '返事が来てから添付してください。'; forget(file); return false; }
+    if (pending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; forget(file); return false; }
+    const big = tooBig(file);
+    if (big) { status.textContent = big; forget(file); return false; }
     uploading += 1;
     $('chat-send').disabled = true;
     status.textContent = '添付を保管しています…';
     try {
-      const stored = await upload(current, name, text);
-      if (!stored.ok) { status.textContent = stored.text; return false; }
+      const stored = await upload(current, file);
+      if (!stored.ok) { status.textContent = stored.text; forget(file); return false; }
       const a = stored.attachment;
-      pending.push({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars });
+      pending.push({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars, type: file.type, thumb: file.thumb });
       freshId = a.id;
       renderPending();
       status.textContent = '';
@@ -343,17 +384,65 @@
       if (!uploading) $('chat-send').disabled = Boolean(shown && shown.open);
     }
   }
-  // Reads the chosen or dropped text files and hands each to `add(name, text)` (stops when it returns false).
+
+  // An image as it will be sent: a screenshot larger than IMAGE_EDGE on its long side is
+  // scaled down (the AI sees no more detail than that, and it costs fewer of its tokens).
+  // Returns a file to attach, or null when the browser cannot read the image.
+  async function imageFile(blob, name) {
+    let bitmap;
+    try { bitmap = await createImageBitmap(blob); } catch { return null; }
+    const scale = Math.min(1, IMAGE_EDGE / Math.max(bitmap.width, bitmap.height));
+    let out = blob;
+    if (scale < 1 || !isImage(blob.type)) {
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const encode = (type, quality) => new Promise((done) => canvas.toBlob(done, type, quality));
+      out = await encode('image/png');
+      // A photo is far smaller as JPEG; a screenshot usually stays PNG.
+      if (!out || out.size > IMAGE_PNG_MAX) out = await encode('image/jpeg', 0.9);
+      if (!out) { bitmap.close(); return null; }
+    }
+    bitmap.close();
+    const type = out.type;
+    const base = name.replace(/\.[^.]*$/, '');
+    const fixed = base + (type === 'image/jpeg' ? '.jpg' : type === 'image/webp' ? '.webp' : type === 'image/gif' ? '.gif' : '.png');
+    return { name: fixed, body: out, type, bytes: out.size, chars: 0, thumb: URL.createObjectURL(out) };
+  }
+  // Reads the chosen, dropped or pasted files and hands each to `add(file)` (stops when it returns false).
   async function readFiles(files, status, add) {
     for (const file of files) {
-      if (!FILE_RE.test(file.name)) { status.textContent = '添付できるのは .txt .md .log のファイルです。'; continue; }
+      if (IMAGE_FILE_RE.test(file.name) || isImage(file.type)) {
+        const image = await imageFile(file, file.name || 'スクリーンショット.png');
+        if (!image) { status.textContent = '画像を読めませんでした。'; continue; }
+        if (!await add(image)) break;
+        continue;
+      }
+      if (!FILE_RE.test(file.name)) { status.textContent = '添付できるのは .txt .md .log と画像（PNG・JPEG・WebP・GIF）です。'; continue; }
       if (file.size > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; continue; }
       let text;
       try { text = await file.text(); } catch { status.textContent = 'ファイルを読めませんでした。'; continue; }
-      if (!await add(file.name, text)) break;
+      if (!await add(textFile(file.name, text))) break;
     }
   }
   const attachFiles = (files) => readFiles(files, $('chat-status'), attach);
+  // A paste: images on the clipboard (a screenshot) are attached; a long text becomes
+  // a card; a short text goes into the box as usual.
+  function onPaste(event, status, add) {
+    const data = event.clipboardData;
+    if (!data) return;
+    const images = [...data.files].filter((f) => isImage(f.type));
+    if (images.length) {
+      event.preventDefault();
+      readFiles(images.map((f) => (f.name ? f : new File([f], 'スクリーンショット.png', { type: f.type }))), status, add);
+      return;
+    }
+    const pasted = data.getData('text/plain');
+    if ([...pasted].length <= PASTE_ATTACH_CHARS) return;
+    event.preventDefault();
+    add(textFile('貼り付け.txt', pasted));
+  }
 
   // Dragging files over an area lights up its box ("ここに置くと添付"); dropping attaches them.
   // enter/leave fire for every child, so a counter tells when the drag really left.
@@ -377,24 +466,17 @@
     const list = $('chat-start-attach');
     list.replaceChildren();
     for (const a of startPending) {
-      const li = el('li', a.key === freshId ? 'chat-card fresh' : 'chat-card');
-      li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
-      const x = el('button', 'quiet chat-card-x', '×');
-      x.type = 'button';
-      x.setAttribute('aria-label', a.name + ' をやめる');
-      x.addEventListener('click', () => { startPending = startPending.filter((b) => b.key !== a.key); renderStartPending(); });
-      li.append(x);
-      list.append(li);
+      list.append(cardFor(a, a.key === freshId, () => { forget(a); startPending = startPending.filter((b) => b.key !== a.key); renderStartPending(); }));
     }
     list.hidden = !startPending.length;
     freshId = null;
   }
-  function addStart(name, text) {
+  function addStart(file) {
     const status = $('chat-start-status');
-    if (startPending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; return false; }
-    const bytes = new Blob([text]).size;
-    if (bytes > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; return false; }
-    startPending.push({ key: ++startKey, name, text, bytes, chars: [...text].length });
+    if (startPending.length >= limits().per_message) { status.textContent = '1 回に添付できるのは ' + limits().per_message + ' 件までです。'; forget(file); return false; }
+    const big = tooBig(file);
+    if (big) { status.textContent = big; forget(file); return false; }
+    startPending.push({ ...file, key: ++startKey });
     freshId = startKey;
     renderStartPending();
     status.textContent = '';
@@ -403,7 +485,7 @@
   function startTitle() {
     const first = startPending[0];
     if (!first) return '';
-    const line = first.text.split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).find(Boolean) || '';
+    const line = isImage(first.type) ? '' : first.body.split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).find(Boolean) || '';
     return [...(line || first.name)].slice(0, 80).join('');
   }
   // After the work is made and handed over, its attachments go as the first message.
@@ -411,7 +493,7 @@
   async function sendStartAttachments(itemId, to) {
     const ids = [];
     for (const a of startPending) {
-      const stored = await upload(itemId, a.name, a.text);
+      const stored = await upload(itemId, a);
       if (!stored.ok) return a.name + ' を添付できませんでした（' + stored.text + '）';
       ids.push(stored.attachment.id);
     }
@@ -432,12 +514,7 @@
     startText.addEventListener('input', count);
     sendOnEnter(startText, $('chat-start-form'));
     // The same attachments as in a conversation: a long paste, a chosen or dropped file.
-    startText.addEventListener('paste', (event) => {
-      const pasted = event.clipboardData ? event.clipboardData.getData('text/plain') : '';
-      if ([...pasted].length <= PASTE_ATTACH_CHARS) return;
-      event.preventDefault();
-      addStart('貼り付け.txt', pasted);
-    });
+    startText.addEventListener('paste', (event) => onPaste(event, $('chat-start-status'), addStart));
     const addStartFiles = (files) => readFiles(files, $('chat-start-status'), addStart);
     $('chat-start-file').addEventListener('change', (event) => { addStartFiles([...event.target.files]); event.target.value = ''; });
     dropZone($('chat-start'), $('chat-start-form'), addStartFiles);
@@ -463,6 +540,7 @@
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }
         const missed = startPending.length ? await sendStartAttachments(itemId, to) : '';
         startText.value = '';
+        for (const a of startPending) forget(a);
         startPending = [];
         renderStartPending();
         $('chat-start-project').value = NO_PROJECT;
@@ -479,13 +557,8 @@
     const text = $('chat-text');
     text.addEventListener('input', () => grow(text, 240));
     sendOnEnter(text, $('chat-form'));
-    // A long paste becomes an attachment card; the page never puts it in the box.
-    text.addEventListener('paste', (event) => {
-      const pasted = event.clipboardData ? event.clipboardData.getData('text/plain') : '';
-      if ([...pasted].length <= PASTE_ATTACH_CHARS) return;
-      event.preventDefault();
-      attach('貼り付け.txt', pasted);
-    });
+    // A screenshot or a long paste becomes an attachment card; the page never puts it in the box.
+    text.addEventListener('paste', (event) => onPaste(event, $('chat-status'), attach));
     $('chat-file').addEventListener('change', (event) => { attachFiles([...event.target.files]); event.target.value = ''; });
     dropZone($('chat-talk'), $('chat-form'), attachFiles);
     $('chat-form').addEventListener('submit', async (event) => {
@@ -502,6 +575,7 @@
       $('chat-send').disabled = false;
       if (!done.ok) { status.textContent = done.text; return; }
       text.value = '';
+      for (const a of pending) forget(a);
       pending = [];
       renderPending();
       grow(text, 240);

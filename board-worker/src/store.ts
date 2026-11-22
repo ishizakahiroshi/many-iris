@@ -9,7 +9,7 @@ import {
 } from "./rules";
 import {
   ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_COUNT, ATTACHMENT_MAX_UNSENT, ATTACHMENT_PER_MESSAGE, ATTACHMENT_TOTAL_BYTES,
-  ATTACHMENT_TTL_MS, READ_MAX_CHARS, markerText, validAttachmentId,
+  ATTACHMENT_TTL_MS, IMAGE_MAX_BYTES, READ_MAX_CHARS, isImageType, markerText, validAttachmentId,
 } from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
 import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, parseOrder } from "./route";
@@ -200,6 +200,8 @@ export class Store {
     // an existing table gets the column here (NULL = not ordered yet). It is not
     // one of the writers' fields: the Rust board does not have it.
     this.addColumn("pile_rank", "INTEGER");
+    // Images came after text: a row without a type is text.
+    try { this.sql.exec("SELECT mime FROM chat_attachments LIMIT 0"); } catch { this.sql.exec("ALTER TABLE chat_attachments ADD COLUMN mime TEXT"); }
     // Handing a piece of work to an AI: the owner asks (requested), one writer
     // takes it (accepted). Kept beside the item so that taking it is one
     // atomic step and no second writer can take the same request.
@@ -466,10 +468,10 @@ export class Store {
     const out = new Map<number, Record<string, unknown>[]>();
     const expired = Date.now() - ATTACHMENT_TTL_MS;
     for (const r of this.sql.exec(
-      "SELECT att_id,seq,at,name,bytes,chars,head FROM chat_attachments WHERE item_id=? AND seq IS NOT NULL ORDER BY at, att_id", itemId,
+      "SELECT att_id,seq,at,name,bytes,chars,head,mime FROM chat_attachments WHERE item_id=? AND seq IS NOT NULL ORDER BY at, att_id", itemId,
     ).toArray() as Row[]) {
       const list = out.get(num(r.seq)) ?? [];
-      list.push({ id: str(r.att_id), name: str(r.name), bytes: num(r.bytes), chars: num(r.chars), head: str(r.head), expired: num(r.at) < expired });
+      list.push({ id: str(r.att_id), name: str(r.name), bytes: num(r.bytes), chars: num(r.chars), head: str(r.head), mime: strOrNull(r.mime ?? null), expired: num(r.at) < expired });
       out.set(num(r.seq), list);
     }
     return out;
@@ -487,14 +489,16 @@ export class Store {
   /** A message as the worker reads it: its text, then a marker per attachment (never the body). */
   private withMarkers(m: Record<string, unknown>): string {
     const list = (m.attachments as Record<string, unknown>[] | undefined) ?? [];
-    const marks = list.map((a) => markerText(a as { id: string; name: string; bytes: number; chars: number; head: string }));
+    const marks = list.map((a) => markerText(a as { id: string; name: string; bytes: number; chars: number; head: string; mime: string | null }));
     return [m.text as string, ...marks].filter((t) => t !== "").join("\n");
   }
 
   /** Reserve an uploaded text (the body goes to R2 right after). One conversation holds a bounded number and total size. */
-  attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string): Record<string, unknown> {
+  attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string, mime: string | null = null): Record<string, unknown> {
     if (!validItemId(itemId) || !validAttachmentId(id)) throw invalid("item_id or attachment id is not valid");
-    if (bytes < 1 || bytes > ATTACHMENT_MAX_BYTES) throw invalid(`An attachment is 1 to ${ATTACHMENT_MAX_BYTES} bytes`);
+    if (mime !== null && !isImageType(mime)) throw invalid("mime is not an image type");
+    const max = mime === null ? ATTACHMENT_MAX_BYTES : IMAGE_MAX_BYTES;
+    if (bytes < 1 || bytes > max) throw invalid(`An attachment is 1 to ${max} bytes`);
     return this.tx(() => {
       const item = this.loadItem(itemId);
       if (item === null) throw new BoardError("NOT_FOUND", "No such item");
@@ -506,8 +510,8 @@ export class Store {
       if (num(sums.b) + bytes > ATTACHMENT_TOTAL_BYTES) throw new BoardError("BOARD_EVENT_LIMIT", "The attachments of this conversation are full");
       if (num(sums.u) >= ATTACHMENT_MAX_UNSENT) throw new BoardError("BOARD_EVENT_LIMIT", "Too many attachments wait to be sent");
       const at = Date.now();
-      this.sql.exec("INSERT INTO chat_attachments(att_id,item_id,seq,at,name,bytes,chars,head) VALUES(?,?,NULL,?,?,?,?,?)", id, itemId, at, name, bytes, chars, head);
-      return { ok: true, attachment: { id, name, bytes, chars, head, at } };
+      this.sql.exec("INSERT INTO chat_attachments(att_id,item_id,seq,at,name,bytes,chars,head,mime) VALUES(?,?,NULL,?,?,?,?,?,?)", id, itemId, at, name, bytes, chars, head, mime);
+      return { ok: true, attachment: { id, name, bytes, chars, head, mime, at } };
     });
   }
   /** Forget an attachment that was not sent yet (the owner took the card away, or the R2 write failed). */
@@ -522,12 +526,12 @@ export class Store {
     });
   }
   /** One attachment's record, or NOT_FOUND (also once it is older than the 30 days). */
-  attachmentMeta(id: string): { id: string; item_id: string; name: string; bytes: number; chars: number } {
+  attachmentMeta(id: string): { id: string; item_id: string; name: string; bytes: number; chars: number; mime: string | null } {
     if (!validAttachmentId(id)) throw invalid("attachment id is not valid");
-    const rows = this.sql.exec("SELECT att_id,item_id,at,name,bytes,chars FROM chat_attachments WHERE att_id=?", id).toArray() as Row[];
+    const rows = this.sql.exec("SELECT att_id,item_id,at,name,bytes,chars,mime FROM chat_attachments WHERE att_id=?", id).toArray() as Row[];
     if (!rows.length) throw new BoardError("NOT_FOUND", "No such attachment");
     if (num(rows[0].at) < Date.now() - ATTACHMENT_TTL_MS) throw new BoardError("NOT_FOUND", "This attachment has expired");
-    return { id, item_id: str(rows[0].item_id), name: str(rows[0].name), bytes: num(rows[0].bytes), chars: num(rows[0].chars) };
+    return { id, item_id: str(rows[0].item_id), name: str(rows[0].name), bytes: num(rows[0].bytes), chars: num(rows[0].chars), mime: strOrNull(rows[0].mime ?? null) };
   }
   /** The `board_chat_attachment` tool's checks: only the server's workers read attachments. */
   attachmentForWorker(actor: string, input: unknown): { meta: ReturnType<Store["attachmentMeta"]>; offset: number; limit: number } {
@@ -571,7 +575,7 @@ export class Store {
       handoff, notes: this.workerNotes(itemId), messages, open,
       partner: this.chatPartner(itemId, handoff), targets: [...CHAT_TARGETS], text_max: CHAT_TEXT_MAX,
       attachment_limits: {
-        max_bytes: ATTACHMENT_MAX_BYTES, total_bytes: ATTACHMENT_TOTAL_BYTES, max_count: ATTACHMENT_MAX_COUNT,
+        max_bytes: ATTACHMENT_MAX_BYTES, image_max_bytes: IMAGE_MAX_BYTES, total_bytes: ATTACHMENT_TOTAL_BYTES, max_count: ATTACHMENT_MAX_COUNT,
         per_message: ATTACHMENT_PER_MESSAGE, ttl_days: Math.round(ATTACHMENT_TTL_MS / 86400000),
       },
     };

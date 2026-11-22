@@ -729,7 +729,8 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("an upload needs Access", (await upload(attWork, "a.txt", "x", { origin: base })).status === 401);
   check("an upload needs this site's Origin", (await upload(attWork, "a.txt", "x", { ...jar })).status === 403);
   check("an upload with another Origin is refused", (await upload(attWork, "a.txt", "x", { ...jar, origin: "https://evil.example" })).status === 403);
-  check("an upload must be text", (await upload(attWork, "a.png", "x", undefined, "image/png")).status === 415);
+  check("an upload must be text or an image", (await upload(attWork, "a.svg", "<svg/>", undefined, "image/svg+xml")).status === 415);
+  check("an image whose bytes are not that type is refused", (await upload(attWork, "a.png", "x", undefined, "image/png")).status === 400);
   check("an empty upload is refused", (await upload(attWork, "a.txt", "")).status === 400);
   check("an upload that is not UTF-8 is refused", (await upload(attWork, "a.txt", new Uint8Array([0xff, 0xfe, 0x41, 0x80]))).status === 400);
   check("an upload with a NUL is refused", (await upload(attWork, "a.txt", "a\u0000b")).status === 400);
@@ -781,14 +782,46 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("an unknown attachment is not found for the worker", code(await call(K.vps, "board_chat_attachment", { attachment_id: "2".repeat(32) })) === "NOT_FOUND");
   check("the worker answers a turn that had an attachment", (await call(K.vps, "board_chat_reply", { item_id: attWork, seq: attTurn, text: "読みました" })).ok === true);
 
-  // limits: one file 1 MB, five on a message, 5 MiB and 20 in a conversation; unsent ones can be taken back
+  // --- image attachments: stored as sent (type checked by the first bytes), given to the worker as MCP image content
+  const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const pngOf = (size) => { const b = new Uint8Array(size); b.set(PNG_SIG); return b; };
+  check("a PNG sent as JPEG is refused", (await upload(attWork, "s.jpg", pngOf(64), undefined, "image/jpeg")).status === 400);
+  check("an image over 5 MB is refused", (await upload(attWork, "big.png", pngOf(5 * 1048576 + 1), undefined, "image/png")).status === 413);
+  const shot = pngOf(300);
+  r = await upload(attWork, "スクリーンショット.png", shot, undefined, "image/png");
+  const imgUp = await r.json();
+  const imgId = imgUp.attachment?.id ?? "";
+  check("an image is stored with its type", r.status === 200 && imgUp.attachment?.mime === "image/png" && imgUp.attachment?.bytes === 300 && imgUp.attachment?.chars === 0, JSON.stringify(imgUp));
+  check("the owner sends the image", (await ownerCode({ op: "chat_send", item_id: attWork, text: "これ見て", attachments: [imgId] })) === "200 OK");
+  const imgGet = await attGet(imgId);
+  check("the owner reads the image back as that type, sandboxed", imgGet.status === 200 && imgGet.headers.get("content-type") === "image/png" &&
+    imgGet.headers.get("content-security-policy") === "sandbox" && (await imgGet.arrayBuffer()).byteLength === 300);
+  chat = await chatOf(attWork);
+  const imgMsg = chat.body.messages?.at(-1);
+  check("the page sees the image's type", imgMsg?.attachments?.[0]?.mime === "image/png" && chat.body.attachment_limits?.image_max_bytes === 5242880);
+  const imgPending = await call(K.vps, "board_chat_pending", {});
+  const imgTurn = imgPending.turns?.find((t) => t.item_id === attWork)?.seq;
+  const imgTaken = await call(K.vps, "board_chat_take", { item_id: attWork, seq: imgTurn });
+  check("the worker's turn carries an image marker", imgTaken.ok === true && imgTaken.turn.text.includes("添付 画像") && imgTaken.turn.text.includes(imgId), imgTaken.turn?.text);
+  const rawImg = await rpc(K.vps, "tools/call", { name: "board_chat_attachment", arguments: { attachment_id: imgId } });
+  const parts = rawImg.body.result?.content ?? [];
+  const imgPart = parts.find((c) => c.type === "image");
+  check("the worker gets the image as MCP image content", rawImg.body.result?.isError === false && imgPart?.mimeType === "image/png" &&
+    Buffer.from(imgPart.data, "base64").equals(Buffer.from(shot)) && parts[0]?.type === "text" && JSON.parse(parts[0].text).name === "スクリーンショット.png", JSON.stringify(parts.map((c) => c.type)));
+  check("the worker answers the image turn", (await call(K.vps, "board_chat_reply", { item_id: attWork, seq: imgTurn, text: "画像を見ました" })).ok === true);
+
+  // limits: one file 1 MB (an image 5 MB), five on a message, 20 MiB and 20 in a conversation; unsent ones can be taken back
   r = await ownerPost({ op: "add", project: "demo", title: "添付の上限", day: dayOf(0) });
   const capWork = (await r.json()).item?.item_id ?? "";
   const mb = "a".repeat(1048576);
   const ids = [];
   for (let n = 0; n < 5; n++) { const x = await (await upload(capWork, `m${n}.txt`, mb)).json(); ids.push(x.attachment?.id); }
   check("five files of exactly 1 MB are accepted", ids.every((x) => typeof x === "string"), JSON.stringify(ids));
-  check("a sixth file is over the conversation's 5 MiB", (await upload(capWork, "m5.txt", "a")).status === 409);
+  const fiveMb = pngOf(5 * 1048576);
+  const bigImages = [];
+  for (let n = 0; n < 3; n++) bigImages.push((await upload(capWork, `i${n}.png`, fiveMb, undefined, "image/png")).status);
+  check("three 5 MB images fill the conversation to 20 MiB", bigImages.every((c) => c === 200), JSON.stringify(bigImages));
+  check("one more byte is over the conversation's 20 MiB", (await upload(capWork, "m5.txt", "a")).status === 409);
   check("more than five on one message is refused", (await ownerCode({ op: "chat_send", item_id: capWork, text: "x", attachments: [...ids, "3".repeat(32)] })) === "400 INVALID");
   r = await fetch(`${base}/api/board/attachment?item_id=${encodeURIComponent(capWork)}&id=${ids[4]}`, { method: "DELETE", headers: { ...jar, origin: base } });
   check("an unsent attachment can be taken back", r.status === 200 && (await attGet(ids[4])).status === 404);

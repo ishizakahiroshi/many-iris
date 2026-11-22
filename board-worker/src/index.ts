@@ -17,7 +17,7 @@ import { ExternalTokenError, OAuthProvider, type OAuthHelpers } from "@cloudflar
 import boardHtml from "../../iris/web/board.html";
 import chatHtml from "../web/chat.html";
 import { accessUser, type AccessResult } from "./access";
-import { ATTACHMENT_MAX_BYTES, attachmentKey, cleanName, parseText, sliceChars } from "./attachments";
+import { ATTACHMENT_MAX_BYTES, IMAGE_MAX_BYTES, attachmentKey, cleanName, isImageType, parseText, sliceChars, sniffImage, toBase64 } from "./attachments";
 import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
@@ -151,6 +151,13 @@ export class BoardStore extends DurableObject<Env> {
     }
     const object = await this.env.ATTACHMENTS.get(attachmentKey(checked.meta.id));
     if (object === null) return { ok: false, error: { code: "NOT_FOUND", detail: "The attachment's text is gone (expired)" } };
+    if (isImageType(checked.meta.mime)) {
+      const bytes = new Uint8Array(await object.arrayBuffer());
+      return {
+        ok: true, attachment_id: checked.meta.id, name: checked.meta.name, mime: checked.meta.mime, bytes: bytes.length,
+        image: { data: toBase64(bytes), mimeType: checked.meta.mime },
+      };
+    }
     const part = sliceChars(await object.text(), checked.offset, checked.limit);
     return {
       ok: true, attachment_id: checked.meta.id, name: checked.meta.name, offset: checked.offset,
@@ -158,8 +165,8 @@ export class BoardStore extends DurableObject<Env> {
     };
   }
   /** Reserve an attachment's record (see Store.attachmentAdd). */
-  async attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.attachmentAdd(itemId, id, name, bytes, chars, head));
+  async attachmentAdd(itemId: string, id: string, name: string, bytes: number, chars: number, head: string, mime: string | null = null): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.attachmentAdd(itemId, id, name, bytes, chars, head, mime));
   }
   async attachmentDrop(itemId: string, id: string): Promise<Record<string, unknown>> {
     return guarded(() => this.store.attachmentDrop(itemId, id));
@@ -314,7 +321,7 @@ const SECURITY_HEADERS: Record<string, string> = {
   "referrer-policy": "no-referrer",
   "strict-transport-security": "max-age=31536000",
   "content-security-policy":
-    "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
 };
 function respond(status: number, body: string | null, contentType: string, extra: Record<string, string> = {}): Response {
   return new Response(body, { status, headers: { "content-type": contentType, ...SECURITY_HEADERS, ...extra } });
@@ -466,9 +473,10 @@ const siteHandler = {
         if (meta.ok === false) return refusal(meta);
         const object = await env.ATTACHMENTS.get(attachmentKey(id));
         if (object === null) return failure(404, "NOT_FOUND", "The attachment's text is gone (expired)");
-        // Shown as plain text; the sandbox CSP keeps even a hostile file inert.
+        // Shown as plain text or as the checked image type; the sandbox CSP keeps even a hostile file inert.
+        const shownAs = isImageType(meta.mime) ? meta.mime : "text/plain; charset=utf-8";
         return new Response(object.body, { status: 200, headers: {
-          "content-type": "text/plain; charset=utf-8", ...SECURITY_HEADERS, "content-security-policy": "sandbox",
+          "content-type": shownAs, ...SECURITY_HEADERS, "content-security-policy": "sandbox",
         } });
       }
       if (request.headers.get("origin") !== url.origin) return failure(403, "ORIGIN", "Requests from other sites are refused");
@@ -483,15 +491,31 @@ const siteHandler = {
       }
       if (method !== "POST") return failure(405, "METHOD", "POST, GET or DELETE");
       const declared = Number(request.headers.get("content-length") ?? "0");
-      if (declared > ATTACHMENT_MAX_BYTES) return failure(413, "TOO_LARGE", "An attachment may be 1 MB");
       const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
-      if (type !== "text/plain" && type !== "text/markdown") return failure(415, "CONTENT_TYPE", "Send text/plain");
+      const id = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const name = cleanName(url.searchParams.get("name") ?? "");
+      if (isImageType(type)) {
+        // An image: its first bytes must say the same type it was sent as.
+        if (declared > IMAGE_MAX_BYTES) return failure(413, "TOO_LARGE", "An image may be 5 MB");
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        if (bytes.length > IMAGE_MAX_BYTES) return failure(413, "TOO_LARGE", "An image may be 5 MB");
+        if (sniffImage(bytes) !== type) return failure(400, "INVALID", "The image is not the type it was sent as");
+        const added = await boardStub(env).attachmentAdd(itemId, id, name, bytes.length, 0, "", type);
+        if (added.ok === false) return refusal(added);
+        try {
+          await env.ATTACHMENTS.put(attachmentKey(id), bytes, { httpMetadata: { contentType: type } });
+        } catch {
+          await boardStub(env).attachmentDrop(itemId, id);
+          return failure(503, "STORAGE", "The attachment could not be stored");
+        }
+        return json(200, added);
+      }
+      if (declared > ATTACHMENT_MAX_BYTES) return failure(413, "TOO_LARGE", "An attachment may be 1 MB");
+      if (type !== "text/plain" && type !== "text/markdown") return failure(415, "CONTENT_TYPE", "Send text/plain or an image");
       const bytes = new Uint8Array(await request.arrayBuffer());
       if (bytes.length > ATTACHMENT_MAX_BYTES) return failure(413, "TOO_LARGE", "An attachment may be 1 MB");
       const parsed = bytes.length > 0 ? parseText(bytes) : null;
       if (parsed === null) return failure(400, "INVALID", "An attachment is a non-empty UTF-8 text");
-      const id = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
-      const name = cleanName(url.searchParams.get("name") ?? "");
       const added = await boardStub(env).attachmentAdd(itemId, id, name, parsed.bytes, parsed.chars, parsed.head);
       if (added.ok === false) return refusal(added);
       try {

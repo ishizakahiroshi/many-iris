@@ -37,8 +37,8 @@
           <label class="sr-only" for="chat-start-text">最初のひとこと</label>
           <textarea id="chat-start-text" rows="3" maxlength="200" placeholder="例：昨日のキオクシアの終値を調べて" enterkeyhint="send"></textarea>
           <div class="chat-box-row">
-            <label class="chat-clip" title="テキストファイル（.txt .md .log）を添付">
-              <input id="chat-start-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown" multiple hidden>
+            <label class="chat-clip" title="テキストファイル（.txt .md .log）か画像を添付">
+              <input id="chat-start-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown,image/png,image/jpeg,image/webp,image/gif" multiple hidden>
               <span aria-hidden="true">＋</span><span class="sr-only">ファイルを添付</span>
             </label>
             <label class="chat-pick"><span>案件</span><select id="chat-start-project"><option value="chat">案件なし</option></select></label>
@@ -60,8 +60,8 @@
             <label class="sr-only" for="chat-text">送る文</label>
             <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>
             <div class="chat-box-row">
-              <label class="chat-clip" title="テキストファイル（.txt .md .log）を添付">
-                <input id="chat-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown" multiple hidden>
+              <label class="chat-clip" title="テキストファイル（.txt .md .log）か画像を添付">
+                <input id="chat-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown,image/png,image/jpeg,image/webp,image/gif" multiple hidden>
                 <span aria-hidden="true">＋</span><span class="sr-only">ファイルを添付</span>
               </label>
               <label class="chat-pick"><span>相手</span><select id="chat-partner"></select></label>
