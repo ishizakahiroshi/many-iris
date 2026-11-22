@@ -29,6 +29,7 @@
   let shown = null;       // the open conversation's data
   let chatTimer = null;
   let busy = false;
+  let chosenPartner = null; // the partner the owner picked in the open conversation (kept across the 8-second refresh)
   let pending = [];       // attachments uploaded for the next message: {id, name, bytes, chars}
   let uploading = 0;
   // The new chat has no conversation yet, so its attachments wait here (not uploaded)
@@ -233,7 +234,7 @@
     if (wait) log.append(el('div', 'chat-typing', wait));
     $('chat-state').textContent = '';
     const partner = $('chat-partner');
-    if (document.activeElement !== partner) partner.value = data.partner || 'vps-claude';
+    if (document.activeElement !== partner) partner.value = chosenPartner || data.partner || 'vps-claude';
     const blocked = Boolean(open);
     $('chat-text').disabled = blocked;
     $('chat-send').disabled = blocked;
@@ -258,6 +259,7 @@
   function route() {
     const id = decodeURIComponent(location.hash.slice(1));
     discardPending();
+    chosenPartner = null;
     clearInterval(chatTimer);
     chatTimer = null;
     closeSide();
@@ -597,6 +599,7 @@
     // A screenshot or a long paste becomes an attachment card; the page never puts it in the box.
     text.addEventListener('paste', (event) => onPaste(event, $('chat-status'), attach));
     $('chat-file').addEventListener('change', (event) => { attachFiles([...event.target.files]); event.target.value = ''; });
+    $('chat-partner').addEventListener('change', (event) => { chosenPartner = isPartner(event.target.value) ? event.target.value : null; });
     dropZone($('chat-talk'), $('chat-form'), attachFiles);
     $('chat-form').addEventListener('submit', async (event) => {
       event.preventDefault();
