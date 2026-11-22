@@ -178,11 +178,16 @@
       if (a.expired) { node.append(el('span', 'chat-card gone', label + '　期限切れ')); continue; }
       const href = '/api/board/attachment?id=' + encodeURIComponent(a.id);
       if (image) {
-        // A sent image is shown small; it opens full size in a new tab.
+        // A sent image is shown small; a tap shows it large (the link still opens it in a new tab).
         const card = el('a', 'chat-shot');
         card.href = href;
         card.target = '_blank';
         card.rel = 'noopener noreferrer';
+        card.addEventListener('click', (event) => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey || event.button !== 0) return;
+          event.preventDefault();
+          showImage(href, a.name);
+        });
         const img = el('img');
         img.src = href;
         img.alt = a.name;
@@ -308,7 +313,18 @@
   const cardLabel = (a) => a.name + '（' + (isImage(a.type || a.mime) ? '' : a.chars + ' 字・') + kb(a.bytes) + '）';
   function cardFor(a, fresh, onDrop) {
     const li = el('li', fresh ? 'chat-card fresh' : 'chat-card');
-    if (a.thumb) { const img = el('img', 'chat-thumb'); img.src = a.thumb; img.alt = ''; li.append(img); }
+    if (a.thumb) {
+      // The thumbnail is a button: it shows the image large before it is sent.
+      const view = el('button', 'chat-thumb-btn');
+      view.type = 'button';
+      view.setAttribute('aria-label', a.name + ' を大きく見る');
+      view.addEventListener('click', () => showImage(a.thumb, a.name));
+      const img = el('img', 'chat-thumb');
+      img.src = a.thumb;
+      img.alt = '';
+      view.append(img);
+      li.append(view);
+    }
     li.append(el('span', null, cardLabel(a)));
     const x = el('button', 'quiet chat-card-x', '×');
     x.type = 'button';
@@ -318,6 +334,27 @@
     return li;
   }
   const forget = (a) => { if (a.thumb) URL.revokeObjectURL(a.thumb); };
+  // The image large over the page; a tap anywhere or Esc closes it.
+  function showImage(src, name) {
+    const back = el('div', 'chat-lightbox');
+    back.setAttribute('role', 'dialog');
+    back.setAttribute('aria-modal', 'true');
+    back.setAttribute('aria-label', name);
+    const img = el('img');
+    img.src = src;
+    img.alt = name;
+    const close = el('button', 'chat-lightbox-x', '×');
+    close.type = 'button';
+    close.setAttribute('aria-label', '閉じる');
+    back.append(img, close);
+    const was = document.activeElement;
+    const shut = () => { back.remove(); document.removeEventListener('keydown', onKey); if (was && was.focus) was.focus(); };
+    const onKey = (event) => { if (event.key === 'Escape') shut(); };
+    back.addEventListener('click', shut);
+    document.addEventListener('keydown', onKey);
+    document.body.append(back);
+    close.focus();
+  }
   // Checks a file against the limits; '' when it may be attached.
   function tooBig(file) {
     if (isImage(file.type)) return file.bytes > limits().image_max_bytes ? '1 枚の画像は 5 MB までです。' : '';
