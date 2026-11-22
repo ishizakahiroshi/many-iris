@@ -4,7 +4,7 @@
 
 ## プロジェクト概要
 
-Many Iris は複数人・複数組織の協働を目指す公開 OSS です。Many Board や独立した OSS と連携し、外部の成果物を正本に残して参照する Junction を構想しています。いまは作者自身が使う範囲で、計画と実行の本体（`iris/`）と、進捗の看板（`board-worker/`）を実装しています。
+Many Iris は複数人・複数組織の協働を目指す公開 OSS です。Many Board や独立した OSS と連携し、外部の成果物を正本に残して参照する Junction を構想しています。いまは作者自身が使う範囲で、進捗の看板（`board-worker/`）を今の状態の正本として実装しています。Rust の `iris/` は 2026-11-22 に凍結した参照実装で、新しい機能を足しません（#46）。
 
 ## 開発上の境界
 
@@ -12,7 +12,7 @@ Many Iris は複数人・複数組織の協働を目指す公開 OSS です。Ma
 
 ## スタックとコマンド
 
-本体は Rust（`iris/`。試験は `iris/` で `cargo test`）、看板は Cloudflare Workers の TypeScript（`board-worker/`。試験は `board-worker/` で `pnpm test`）です。`prototype/` と `tests/` は旧 Python 試作、`experiments/` は言語比較の記録です。ガイドの構造検査は `node scripts/check-claude-md.mjs` を手動で実行します。
+看板は Cloudflare Workers の TypeScript（`board-worker/`。試験は `board-worker/` で `pnpm test`）、凍結した参照実装は Rust（`iris/`。試験は `iris/` で `cargo test`）です。`prototype/` と `tests/` は旧 Python 試作、`experiments/` は言語比較の記録です。ガイドの構造検査は `node scripts/check-claude-md.mjs` を手動で実行します。
 
 ## AI 作業共通ルール
 
