@@ -35,6 +35,7 @@
   // until the work is made and handed over: {key, name, text, bytes, chars}.
   let startPending = [];
   let startKey = 0;
+  let freshId = null;     // the card just added (it pops in once)
   let startNote = '';     // what the first send could not do, shown on the conversation it opens
 
   // Attachments (see the design: docs/local/design_chat-attachments_2026-11-22.md).
@@ -279,7 +280,7 @@
     const list = $('chat-attach');
     list.replaceChildren();
     for (const a of pending) {
-      const li = el('li', 'chat-card');
+      const li = el('li', a.id === freshId ? 'chat-card fresh' : 'chat-card');
       li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
       const x = el('button', 'quiet chat-card-x', '×');
       x.type = 'button';
@@ -289,6 +290,7 @@
       list.append(li);
     }
     list.hidden = !pending.length;
+    freshId = null;
   }
   const takeBack = (id) => fetch('/api/board/attachment?item_id=' + encodeURIComponent(current) + '&id=' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
   function dropPending(id) {
@@ -332,6 +334,7 @@
       if (!stored.ok) { status.textContent = stored.text; return false; }
       const a = stored.attachment;
       pending.push({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars });
+      freshId = a.id;
       renderPending();
       status.textContent = '';
       return true;
@@ -352,12 +355,29 @@
   }
   const attachFiles = (files) => readFiles(files, $('chat-status'), attach);
 
+  // Dragging files over an area lights up its box ("ここに置くと添付"); dropping attaches them.
+  // enter/leave fire for every child, so a counter tells when the drag really left.
+  function dropZone(area, box, onFiles) {
+    let depth = 0;
+    const hasFiles = (event) => event.dataTransfer && [...event.dataTransfer.types].includes('Files');
+    const off = () => { depth = 0; box.classList.remove('drop-over'); };
+    area.addEventListener('dragenter', (event) => { if (!hasFiles(event)) return; depth += 1; box.classList.add('drop-over'); });
+    area.addEventListener('dragover', (event) => { if (hasFiles(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; } });
+    area.addEventListener('dragleave', (event) => { if (!hasFiles(event)) return; depth -= 1; if (depth <= 0) off(); });
+    area.addEventListener('drop', (event) => {
+      off();
+      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      onFiles([...event.dataTransfer.files]);
+    });
+  }
+
   // --- attachments of the new chat (kept in the page until the first send)
   function renderStartPending() {
     const list = $('chat-start-attach');
     list.replaceChildren();
     for (const a of startPending) {
-      const li = el('li', 'chat-card');
+      const li = el('li', a.key === freshId ? 'chat-card fresh' : 'chat-card');
       li.append(el('span', null, a.name + '（' + a.chars + ' 字・' + kb(a.bytes) + '）'));
       const x = el('button', 'quiet chat-card-x', '×');
       x.type = 'button';
@@ -367,6 +387,7 @@
       list.append(li);
     }
     list.hidden = !startPending.length;
+    freshId = null;
   }
   function addStart(name, text) {
     const status = $('chat-start-status');
@@ -374,9 +395,16 @@
     const bytes = new Blob([text]).size;
     if (bytes > limits().max_bytes) { status.textContent = '1 ファイルは 1 MB までです。'; return false; }
     startPending.push({ key: ++startKey, name, text, bytes, chars: [...text].length });
+    freshId = startKey;
     renderStartPending();
     status.textContent = '';
     return true;
+  }
+  function startTitle() {
+    const first = startPending[0];
+    if (!first) return '';
+    const line = first.text.split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).find(Boolean) || '';
+    return [...(line || first.name)].slice(0, 80).join('');
   }
   // After the work is made and handed over, its attachments go as the first message.
   // Returns '' or why they could not be sent.
@@ -412,26 +440,22 @@
     });
     const addStartFiles = (files) => readFiles(files, $('chat-start-status'), addStart);
     $('chat-start-file').addEventListener('change', (event) => { addStartFiles([...event.target.files]); event.target.value = ''; });
-    const start = $('chat-start');
-    start.addEventListener('dragover', (event) => { if (event.dataTransfer && [...event.dataTransfer.types].includes('Files')) event.preventDefault(); });
-    start.addEventListener('drop', (event) => {
-      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
-      event.preventDefault();
-      addStartFiles([...event.dataTransfer.files]);
-    });
+    dropZone($('chat-start'), $('chat-start-form'), addStartFiles);
     $('chat-start-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const status = $('chat-start-status');
       const text = startText.value.trim().replace(/\s+/g, ' ');
       const project = $('chat-start-project').value;
-      if (!text) { status.textContent = '書いてから送ってください。'; return; }
+      // With only attachments, the first line of the first one (or its name) is the title.
+      const title = text || startTitle();
+      if (!title) { status.textContent = '書くか、添付してから送ってください。'; return; }
       if (!project) { status.textContent = '案件を選んでください。'; return; }
       const send = $('chat-start-send');
       send.disabled = true;
       status.textContent = '送っています…';
       try {
         const day = today();
-        const added = await write({ op: 'add', project, title: [...text].slice(0, 200).join(''), day });
+        const added = await write({ op: 'add', project, title: [...title].slice(0, 200).join(''), day });
         if (!added.ok) { status.textContent = added.text; return; }
         const itemId = added.answer.item.item_id;
         const to = $('chat-start-partner').value;
@@ -463,13 +487,7 @@
       attach('貼り付け.txt', pasted);
     });
     $('chat-file').addEventListener('change', (event) => { attachFiles([...event.target.files]); event.target.value = ''; });
-    const talk = $('chat-talk');
-    talk.addEventListener('dragover', (event) => { if (event.dataTransfer && [...event.dataTransfer.types].includes('Files')) event.preventDefault(); });
-    talk.addEventListener('drop', (event) => {
-      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
-      event.preventDefault();
-      attachFiles([...event.dataTransfer.files]);
-    });
+    dropZone($('chat-talk'), $('chat-form'), attachFiles);
     $('chat-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const status = $('chat-status');

@@ -91,3 +91,11 @@ a.chat-card:hover{text-decoration:underline}
 .chat-card-x{padding:0 4px;font-size:.9rem;line-height:1}
 .chat-clip{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid var(--line);border-radius:999px;cursor:pointer;color:var(--soft)}
 .chat-clip:hover{color:inherit}
+/* dragging files over the box: it lights up and says where they go */
+.chat-box{position:relative;transition:border-color .15s,box-shadow .15s,background-color .15s}
+.chat-box.drop-over{border:2px dashed var(--ink);background:#fffdf4;box-shadow:0 0 0 4px #241f1a14}
+.chat-box.drop-over::after{content:"ここに置くと添付";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;border-radius:inherit;background:#fffdf4e6;color:var(--ink);font-size:.95rem;font-weight:600;pointer-events:none}
+/* the card just added pops in */
+.chat-card.fresh{animation:card-in .28s ease-out}
+@keyframes card-in{0%{opacity:0;transform:translateY(4px) scale(.92);background:#f3e3b0}60%{opacity:1;transform:none;background:#f3e3b0}100%{background:#ffffff66}}
+@media (prefers-reduced-motion:reduce){.chat-card.fresh{animation:none}.chat-box{transition:none}}
