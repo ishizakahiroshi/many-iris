@@ -4,12 +4,11 @@ Many Iris の看板（board-worker）で自分宛てに任された仕事を拾�
 実行系に渡し、結果を看板へ返すための独立した Node.js プログラムです。
 設計と調査の記録は `docs/ipad-picker.md` にあります。
 
-看板の行き先のうち、`devin` は看板自身の cron dispatcher が、
-`local-claude` は many-ai-cli の Hub（手元 PC）が拾います。この
+看板の行き先のうち、`devin` は看板自身の cron dispatcher が拾います。この
 picker はそれ以外の行き先（`vps-claude`・`vps-devin`・`muse`・`grokbot` など、
-鍵の担当者名で決まります）を、PC の常時稼働に頼らずに拾うための
-ものです。VPS の cron から数分おきに `--once` を叩く運用を想定
-しています。
+鍵の担当者名で決まります）を拾います。VPS では常駐（`--watch`）か cron の `--once` で、
+手元の PC の `local-claude` も、下の「手元の PC で動かす」の作業役で拾えます
+（many-ai-cli の Hub の `local_taker` の代わり）。
 
 ## 前提
 
