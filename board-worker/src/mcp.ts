@@ -9,6 +9,12 @@ const SERVER_INFO = { name: "many-iris-board", version: "0.1.0" };
 
 type Json = Record<string, unknown>;
 export type ToolRunner = (tool: string, args: Json) => Promise<Json>;
+export type ToolPolicy = "trusted" | "restricted";
+
+const RESTRICTED_TOOLS = new Set([
+  "board_my_work", "board_accept_handoff",
+  "board_heartbeat_handoff", "board_progress_handoff", "board_complete_handoff",
+]);
 
 function tool(name: string, description: string, properties: Json, required: string[]): Json {
   return { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false } };
@@ -255,7 +261,7 @@ function argumentsMatchSchema(definition: Json, args: Json): boolean {
 
 /** Handles one JSON-RPC message. Returns `null` for a notification (the HTTP
  * layer answers 202 with no body), otherwise the HTTP status and body. */
-export async function handle(request: unknown, run: ToolRunner): Promise<{ status: number; body: Json } | null> {
+export async function handle(request: unknown, run: ToolRunner, policy: ToolPolicy = "trusted"): Promise<{ status: number; body: Json } | null> {
   if (request === null || typeof request !== "object" || Array.isArray(request))
     return { status: 400, body: errorResponse(null, -32600, "Invalid JSON-RPC request") };
   const r = request as Json;
@@ -291,11 +297,13 @@ export async function handle(request: unknown, run: ToolRunner): Promise<{ statu
       return ok({});
     case "tools/list":
       if ("cursor" in p) return { status: 200, body: errorResponse(r.id, -32602, "Pagination cursor is not supported") };
-      return ok({ tools: TOOLS });
+      return ok({ tools: policy === "restricted" ? TOOLS.filter((t) => RESTRICTED_TOOLS.has(t.name as string)) : TOOLS });
     case "tools/call": {
       const name = p.name;
       const definition = TOOLS.find((t) => t.name === name);
       if (typeof name !== "string" || definition === undefined)
+        return { status: 200, body: errorResponse(r.id, -32602, "Unknown or invalid tool") };
+      if (policy === "restricted" && !RESTRICTED_TOOLS.has(name))
         return { status: 200, body: errorResponse(r.id, -32602, "Unknown or invalid tool") };
       const args = p.arguments === undefined ? {} : p.arguments;
       if (args === null || typeof args !== "object" || Array.isArray(args))

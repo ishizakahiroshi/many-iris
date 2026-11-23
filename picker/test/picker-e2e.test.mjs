@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BoardClient } from "../src/board-client.mjs";
+import { BoardClient, BoardUnreachable } from "../src/board-client.mjs";
 import { RecordExecutor } from "../src/executors.mjs";
 import { runPass } from "../src/picker.mjs";
 
@@ -29,12 +29,13 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), picker: key() };
+const K = { alpha: key(), picker: key(), restricted: key() };
 const writers = {
   schema_version: 1,
   writers: [
     { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
     { actor: "muse", token_sha256: sha(K.picker), enabled: true },
+    { actor: "grokbot", token_sha256: sha(K.restricted), enabled: true, policy: "restricted" },
   ],
 };
 
@@ -117,6 +118,23 @@ try {
   check("the run's start and record are events on job1",
     texts.some((t) => t.includes("開始")) && texts.some((t) => t.includes("記録のみ")),
     JSON.stringify(texts));
+
+  const restrictedClient = new BoardClient({ url: `${base}/board/mcp`, key: K.restricted });
+  const restrictedMine = await restrictedClient.listMine();
+  check("restricted picker discovery uses the restricted credential successfully", restrictedMine.items.length === 0);
+  const fallbackCalls = [];
+  const oldBoardFallback = new BoardClient({ url: `${base}/board/mcp`, key: K.restricted, fetchImpl: async (url, init) => {
+    const request = JSON.parse(init.body);
+    const tool = request.params.name;
+    fallbackCalls.push(tool);
+    if (tool === "board_my_work") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Unknown or invalid tool" } }), { status: 200 });
+    }
+    return fetch(url, init);
+  } });
+  let fallbackRefused = false;
+  try { await oldBoardFallback.listMine(); } catch (error) { fallbackRefused = error instanceof BoardUnreachable; }
+  check("legacy picker fallback is denied by the actual restricted Worker", fallbackRefused && fallbackCalls.join(",") === "board_my_work,board_list");
 } finally {
   stop();
   // Windows keeps the state directory locked for a moment after wrangler dev is killed

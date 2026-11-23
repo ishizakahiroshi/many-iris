@@ -79,7 +79,7 @@ export class BoardStore extends DurableObject<Env> {
     this.store = new Store(ctx.storage, limitsFrom(env));
     ctx.blockConcurrencyWhile(async () => this.store.init());
   }
-  async run(tool: string, actor: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted"): Promise<Record<string, unknown>> {
     // Every call with a writer's key says that writer is running (the owner's
     // order passes over takers that stopped coming). A failure here must not
     // cost the call itself.
@@ -96,23 +96,23 @@ export class BoardStore extends DurableObject<Env> {
         case "board_list":
           return this.store.listForTool(args);
         case "board_my_work":
-          return this.store.myWork(actor, args);
+          return this.store.myWork(actor, args, policy === "restricted");
         case "board_request_status":
           return this.store.requestStatus(args);
         case "board_request_handoff":
           return this.store.requestHandoff(actor, args, newBacklogId);
         case "board_accept_handoff":
-          return this.store.acceptHandoff(actor, args);
+          return this.store.acceptHandoff(actor, args, policy === "restricted");
         case "board_route_handoff":
           return this.store.routeForTool(actor, args);
         case "board_take_back_handoff":
           return this.store.takeBackForTool(actor, args);
         case "board_heartbeat_handoff":
-          return this.store.heartbeatHandoff(actor, args);
+          return this.store.heartbeatHandoff(actor, args, policy === "restricted");
         case "board_progress_handoff":
-          return this.store.progressHandoff(actor, args);
+          return this.store.progressHandoff(actor, args, policy === "restricted");
         case "board_complete_handoff":
-          return this.store.completeHandoff(actor, args);
+          return this.store.completeHandoff(actor, args, policy === "restricted");
         case "board_mark_handoff_unknown":
           return this.store.markUnknownForTool(actor, args);
         case "board_release_handoff":
@@ -386,8 +386,12 @@ const mcpHandler = {
     const watchPath = url.pathname === MCP_PATH || url.pathname === `${MCP_PATH}/watch`;
     if (!watchPath) return failure(404, "NOT_FOUND", "Not found");
     if (foreignOrigin(request, url)) return failure(403, "ORIGIN", "Requests from other sites are refused");
-    const actor = (ctx as ExecutionContext & { props?: { actor?: unknown } }).props?.actor;
+    const props = (ctx as ExecutionContext & { props?: { actor?: unknown; policy?: unknown } }).props;
+    const actor = props?.actor;
     if (typeof actor !== "string" || !validActor(actor)) return failure(401, "AUTH", "A valid key is required");
+    const policy = props?.policy === "restricted" ? "restricted" : "trusted";
+    if (policy === "restricted" && request.method === "GET" && (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket")
+      return failure(404, "NOT_FOUND", "Not found");
 
     // A picker watching for work: GET + Upgrade on the same protected path
     // (or /board/mcp/watch), so the same Bearer check and the same Access
@@ -401,7 +405,7 @@ const mcpHandler = {
     const body = await readBody(request);
     if (body instanceof Response) return body;
     const stub = boardStub(env);
-    const result = await handle(body.value, (tool, args) => stub.run(tool, actor, args));
+    const result = await handle(body.value, (tool, args) => stub.run(tool, actor, args, policy), policy);
     if (result === null) return respond(202, null, "text/plain");
     return json(result.status, result.body);
   },
@@ -596,7 +600,7 @@ function providerFor(origin: string): OAuthProvider<Env> {
     // checked against the hashes in BOARD_WRITERS, never forwarded anywhere.
     resolveExternalToken: async ({ token, env }) => {
       const who = await authenticate(env.BOARD_WRITERS, token);
-      if (who.ok) return { props: { actor: who.actor }, audience: resource };
+      if (who.ok) return { props: { actor: who.actor, policy: who.policy }, audience: resource };
       if (who.reason === "disabled") {
         throw new ExternalTokenError("invalid_token", { description: "This key is switched off", statusCode: 403 });
       }

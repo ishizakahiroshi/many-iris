@@ -1,15 +1,16 @@
 // Keys. Only the SHA-256 of a key is stored (in a Worker secret holding the
 // same JSON as the Rust board's writers file). The actor always comes from the
 // key, never from the request body.
-import { MAX_KEYS, validActor } from "./rules";
+import { HANDOFF_TARGETS, MAX_KEYS, validActor } from "./rules";
 
 interface KeyEntry {
   actor: string;
   hash: Uint8Array;
   enabled: boolean;
+  policy: "trusted" | "restricted";
 }
 export type AuthResult =
-  | { ok: true; actor: string }
+  | { ok: true; actor: string; policy: "trusted" | "restricted" }
   | { ok: false; reason: "missing" | "unknown" | "disabled" | "unavailable" };
 
 function fromHex(hex: string): Uint8Array {
@@ -37,15 +38,20 @@ export function parseKeys(raw: string | undefined): KeyEntry[] | null {
   for (const entry of obj.writers) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
     const e = entry as Record<string, unknown>;
-    if (Object.keys(e).some((k) => !["actor", "token_sha256", "enabled"].includes(k))) return null;
+    if (Object.keys(e).some((k) => !["actor", "token_sha256", "enabled", "policy"].includes(k))) return null;
     if (typeof e.actor !== "string" || !validActor(e.actor)) return null;
     if (typeof e.token_sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(e.token_sha256)) return null;
     if (typeof e.enabled !== "boolean") return null;
+    if (e.policy !== undefined && e.policy !== "trusted" && e.policy !== "restricted") return null;
+    const policy = (e.policy ?? "trusted") as "trusted" | "restricted";
+    // OAuth-generated actor names share these reserved identities. A restricted
+    // key must never inherit a broader OAuth principal through an actor collision.
+    if (policy === "restricted" && (!HANDOFF_TARGETS.includes(e.actor as typeof HANDOFF_TARGETS[number]) || e.actor === "owner" || e.actor === "hold")) return null;
     const hash = e.token_sha256.toLowerCase();
     if (seen.has("a:" + e.actor) || seen.has("h:" + hash)) return null;
     seen.add("a:" + e.actor);
     seen.add("h:" + hash);
-    entries.push({ actor: e.actor, hash: fromHex(hash), enabled: e.enabled });
+    entries.push({ actor: e.actor, hash: fromHex(hash), enabled: e.enabled, policy });
   }
   return entries;
 }
@@ -63,7 +69,7 @@ export async function authenticate(raw: string | undefined, token: string | null
   }
   if (found === null) return { ok: false, reason: "unknown" };
   if (!found.enabled) return { ok: false, reason: "disabled" };
-  return { ok: true, actor: found.actor };
+  return { ok: true, actor: found.actor, policy: found.policy };
 }
 
 export function bearer(request: Request): string | null {

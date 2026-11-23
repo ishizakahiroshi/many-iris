@@ -19,13 +19,15 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), local: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), local: key(), restricted: key(), restrictedRevoked: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
   { actor: "muse", token_sha256: sha(K.muse), enabled: true },
   { actor: "vps-claude", token_sha256: sha(K.vps), enabled: true },
   { actor: "local-claude", token_sha256: sha(K.local), enabled: true },
+  { actor: "grokbot", token_sha256: sha(K.restricted), enabled: true, policy: "restricted" },
+  { actor: "vps-devin", token_sha256: sha(K.restrictedRevoked), enabled: false, policy: "restricted" },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -113,10 +115,13 @@ async function call(token, tool, args) {
 }
 const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 
+function writeTestEnv() {
+  writeFileSync(join(temp, "test.env"),
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=27\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+}
 async function main() {
   mkdirSync(temp, { recursive: true });
-  writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=26\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+  writeTestEnv();
   await new Promise((r) => certsServer.listen(certsPort, "127.0.0.1", r));
   await start();
 
@@ -152,6 +157,7 @@ async function main() {
   // --- writer keys and the MCP handshake
   check("MCP without a key is refused", (await mcpRaw(null, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
   check("MCP with a switched-off key is refused", (await mcpRaw(K.beta, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 403);
+  check("a revoked restricted credential is refused", (await mcpRaw(K.restrictedRevoked, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 403);
   check("MCP with an unknown key is refused", (await mcpRaw(K.stranger, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
   check("MCP from a browser on another site is refused",
     (await mcpRaw(K.alpha, { jsonrpc: "2.0", id: 1, method: "ping", params: {} }, { origin: "https://evil.example" })).status === 403);
@@ -169,6 +175,12 @@ async function main() {
   check("unsupported per-request version is refused",
     (await rpc(K.alpha, "ping", { _meta: { "io.modelcontextprotocol/protocolVersion": "1999-01-01" } })).status === 400);
   check("unknown tool", code(await call(K.alpha, "board_delete", {})) === -32602);
+  res = await rpc(K.restricted, "tools/list");
+  check("restricted discovery exposes only own-work and run reporting",
+    res.body.result?.tools?.map((t) => t.name).join(",") === "board_my_work,board_accept_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff");
+  check("restricted call cannot reach legacy attachment reads", code(await call(K.restricted, "board_chat_attachment", { attachment_id: "0".repeat(32) })) === -32602);
+  check("restricted call cannot reach board_list", code(await call(K.restricted, "board_list", {})) === -32602);
+  check("restricted call cannot reach request status", code(await call(K.restricted, "board_request_status", { item_id: "synthetic-b" })) === -32602);
 
   // --- items
   let out = await call(K.alpha, "board_upsert_item", { item_id: "p1", project: "demo", kind: "project", title: "Demo", state: "in_progress" });
@@ -471,8 +483,8 @@ async function main() {
   const writerHand2 = await call(K.alpha, "board_request_handoff", { item_id: "pile2" });
   const writerRequest2 = writerHand2.handoff?.request_id ?? "";
   check("a re-request gets a new id", writerRequest2 !== "" && writerRequest2 !== writerRequest);
-  const writerAccepted = await call(K.alpha, "board_accept_handoff", { item_id: "pile2", request_id: writerRequest2 });
-  check("a writer accepts its own request", writerAccepted.handoff?.state === "accepted" && writerAccepted.item?.state === "in_progress", JSON.stringify(writerAccepted));
+  const writerAccepted = await call(K.muse, "board_accept_handoff", { item_id: "pile2", request_id: writerRequest2 });
+  check("a writer accepts the unaddressed request", writerAccepted.handoff?.state === "accepted" && writerAccepted.item?.state === "in_progress", JSON.stringify(writerAccepted));
   check("a request without a destination says so", writerAccepted.handoff?.to === null, JSON.stringify(writerAccepted.handoff));
 
   // --- the destination of a request (handoff.to)
@@ -771,6 +783,8 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("the transcript stays far smaller than the attachment", transcriptText.length < 2000, String(transcriptText.length));
   check("a writer that is not a server worker cannot read an attachment", code(await call(K.alpha, "board_chat_attachment", { attachment_id: attId })) === "FORBIDDEN");
   const part1 = await call(K.vps, "board_chat_attachment", { attachment_id: attId, offset: 0, limit: 10 });
+  check("the restricted writer cannot read the other worker's stored attachment",
+    code(await call(K.restricted, "board_chat_attachment", { attachment_id: attId })) === -32602);
   check("the worker reads a part by characters", part1.ok === true && part1.text === "一行目\n二行目\n三行目".slice(0, 10) && part1.returned === 10 && part1.next_offset === 10 && part1.total_chars === bodyText.length, JSON.stringify(part1).slice(0, 300));
   const sentinelAt = bodyText.indexOf("ZZ-SENTINEL-BODY");
   const part2 = await call(K.vps, "board_chat_attachment", { attachment_id: attId, offset: sentinelAt, limit: 16 });
@@ -906,14 +920,60 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
   check("the page data no longer lists it", page.scopes?.scoped === undefined);
 
-  // --- the item limit (26 in this run)
+  // --- restricted external actor: assigned request and fenced result only
+  const localMine = await call(K.local, "board_my_work", { project: "scoped" });
+  const localRun = localMine.items.find((item) => item.item_id === "stop1");
+  const foreignFence = { item_id: "stop1", request_id: localRun.handoff.request_id, generation: localRun.handoff.generation };
+  const hiddenForeign = await call(K.restricted, "board_accept_handoff", { item_id: "stop1", request_id: foreignFence.request_id });
+  check("restricted credentials receive the same generic refusal for a foreign accepted request",
+    code(hiddenForeign) === "NOT_FOUND" && !JSON.stringify(hiddenForeign).includes("local-claude") && !JSON.stringify(hiddenForeign).includes("stop1"));
+  check("the assigned writer can stop its own prior run", (await call(K.local, "board_release_handoff", foreignFence)).ok === true);
+  check("the owner assigns the synthetic request directly to grokbot", (await ownerCode({ op: "hand", item_id: "stop1", to: "grokbot" })) === "200 OK");
+  const ownRequest = (await call(K.alpha, "board_request_status", { item_id: "stop1" })).request_id;
+  const other = { item_id: "foreign-p0", project: "other-project-p0", title: "Other writer's private task" };
+  check("the other writer has a simultaneous assignment",
+    (await call(K.alpha, "board_upsert_item", { ...other, kind: "task", state: "planned" })).ok &&
+    (await ownerCode({ op: "hand", item_id: other.item_id, to: "muse" })) === "200 OK");
+  const otherRequest = (await call(K.alpha, "board_request_status", { item_id: other.item_id })).request_id;
+  const ownWork = await call(K.restricted, "board_my_work", {});
+  check("unfiltered discovery hides the other project, task and request",
+    typeof otherRequest === "string" && [...Object.values(other), otherRequest].every(value => !JSON.stringify(ownWork).includes(value)));
+  check("restricted my_work returns only its assignment and no global or parent metadata",
+    ownWork.items?.length === 1 && ownWork.items[0]?.item_id === "stop1" && !("scopes" in ownWork) && !("chat_turns" in ownWork) && !("parent_id" in ownWork.items[0]));
+  const ownAccepted = await call(K.restricted, "board_accept_handoff", { item_id: "stop1", request_id: ownRequest });
+  const ownFence = { item_id: "stop1", request_id: ownRequest, generation: ownAccepted.handoff?.generation };
+  check("restricted accept returns the own item without parent_id", ownAccepted.handoff?.accepted_by === "grokbot" && !("parent_id" in ownAccepted.item));
+  await ownerPost({ op: "pause", paused: true });
+  const ownerStopSignal = await call(K.restricted, "board_heartbeat_handoff", ownFence);
+  check("owner stop reaches the restricted run", ownerStopSignal.stop === true && ownerStopSignal.stop_reason === "paused");
+  await ownerPost({ op: "pause", paused: false });
+  const staleOwnHeartbeat = await call(K.restricted, "board_heartbeat_handoff", { ...ownFence, generation: ownFence.generation + 1 });
+  check("restricted heartbeat rejects a stale generation", code(staleOwnHeartbeat) === "STALE_GENERATION", JSON.stringify(staleOwnHeartbeat));
+  const ownHeartbeat = await call(K.restricted, "board_heartbeat_handoff", ownFence);
+  check("restricted heartbeat renews its own live lease", ownHeartbeat.ok === true, JSON.stringify(ownHeartbeat));
+  const ownProgress = await call(K.restricted, "board_progress_handoff", { ...ownFence, kind: "note", text: "Synthetic restricted result" });
+  check("restricted progress reports the authenticated actor", ownProgress.event?.actor === "grokbot", JSON.stringify(ownProgress));
+  const ownCompleted = await call(K.restricted, "board_complete_handoff", { ...ownFence, outcome: "done" });
+  check("restricted completion keeps parent_id out of the response", ownCompleted.handoff?.state === "completed" && !("parent_id" in ownCompleted.item), JSON.stringify(ownCompleted));
+  await call(K.alpha, "board_upsert_item", { item_id: "stop1", state: "planned" });
+  await ownerPost({ op: "hand", item_id: "stop1", to: "grokbot" });
+  const expiringRequest = (await call(K.alpha, "board_request_status", { item_id: "stop1" })).request_id;
+  const expiringAccept = await call(K.restricted, "board_accept_handoff", { item_id: "stop1", request_id: expiringRequest });
+  const expiringFence = { item_id: "stop1", request_id: expiringRequest, generation: expiringAccept.handoff.generation };
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  const expiredHeartbeat = await call(K.restricted, "board_heartbeat_handoff", expiringFence);
+  check("an expired restricted lease cannot be renewed", code(expiredHeartbeat) === "STALE_GENERATION", JSON.stringify(expiredHeartbeat));
+  check("the owner can quarantine and release the expired run", (await ownerCode({ op: "mark_unknown", item_id: "stop1", request_id: expiringRequest })) === "200 OK" &&
+    (await ownerCode({ op: "release", item_id: "stop1", request_id: expiringRequest })) === "200 OK");
+
+  // --- the item limit (27 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 26 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 27 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 26, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 27, String(list.counts.items));
   // The counts are kept by triggers (issue #38), not counted per call: they must
   // still match the rows. Events are never deleted and seq is the rowid, so
   // the newest seq is the number of events.
@@ -932,9 +992,15 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
 
   // --- survives a restart
   const before = list.counts;
+  const hasLegacyAssignment = (work) => work.items?.some(i => i.item_id === "pile2" && i.handoff?.to === null);
+  check("trusted writer sees its previously accepted unaddressed task", hasLegacyAssignment(await call(K.muse, "board_my_work", {})));
   stop();
+  writers.writers.find(w => w.actor === "muse").policy = "restricted";
+  writeTestEnv();
   await new Promise((r) => setTimeout(r, 1500));
   await start();
+  const narrowed = await call(K.muse, "board_my_work", {});
+  check("downgrading the writer hides previously accepted unaddressed tasks", narrowed.ok && !narrowed.items.some(item => item.item_id === "pile2"));
   list = await call(K.alpha, "board_list", {});
   check("data survives a restart", list.counts.items === before.items && list.counts.events === before.events,
     `${JSON.stringify(before)} -> ${JSON.stringify(list.counts)}`);
