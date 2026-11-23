@@ -100,6 +100,25 @@ JSON 1 行で標準入力に渡します。題名は作業の「名前（デー�
 看板に残ります。そのコマンドが使う認証情報は、このプログラムの
 外（コマンド自身の環境）で用意してください。
 
+## 手元の PC で動かす（`workers/local-claude.mjs`）
+
+持ち主の PC の書き手 `local-claude` の仕事も、この picker で拾えます（many-ai-cli の
+`local_taker` と同じ動きを、picker の作業役として書いたもの）。`PICKER_EXECUTOR=command`、
+`PICKER_COMMAND` に node、`PICKER_COMMAND_ARGS` に `["<このフォルダ>/workers/local-claude.mjs"]`
+を指定し、`LOCAL_WORKER_BOARD_JSON` に many-ai-cli の `board.json` の絶対パスを渡します。
+
+- 作業するフォルダは、`board.json` の `repos` にその案件で最初に書いた `path` です。
+  載っていない案件は断ります（`PICKER_PROJECTS` を `repos` の案件にそろえると、受ける前に外せます）。
+- `claude -p` は `local_taker.env_file` の `ANTHROPIC_API_KEY` の行だけで動かし、
+  サブスクリプションのログインは使いません。権限の段階は `local_taker.permission_mode`
+  （`default`・`acceptEdits`・`plan`。既定 `acceptEdits`）。
+- push・公開・送信・削除・commit はしません。結果は文だけを返します。
+- 書き手の鍵・`env_file`・`board.json` は、claude のファイルの道具から読めないようにし
+  （Windows では `//c/...` の形で書く）、picker の設定（`PICKER_*`）は claude の環境に渡しません。
+- 続き（takeover）は扱いません。
+- 止めるのは看板の「全部止める」か `PICKER_STOP_FILE` です。Windows で実行を止めるときは、
+  作業役の下のプロセスまで `taskkill /T` で止めます。
+
 ## 安全の既定
 
 - 拾うのは `handoff.to` が自分宛てで、持ち主が画面から任せ、

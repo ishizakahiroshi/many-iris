@@ -40,6 +40,24 @@ export class RecordExecutor {
 // conversation answer may be 20,000 characters long.
 const OUTPUT_MAX = 256 * 1024;
 
+// Stops the command and what it started. On Windows a kill ends only the
+// process itself and its SIGTERM handler never runs. A node worker's own
+// children still end with it (node keeps them in a job that closes with it;
+// seen 2026-11-23), but a worker that is not node would leave its `claude`
+// working, so the whole tree is ended with taskkill.
+export function stopTree(child, { platform = process.platform, run = spawn } = {}) {
+  if (platform === "win32" && child.pid) {
+    try {
+      const killer = run("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.on?.("error", () => child.kill("SIGTERM"));
+      return;
+    } catch {
+      /* fall back to the plain kill */
+    }
+  }
+  child.kill("SIGTERM");
+}
+
 export class CommandExecutor {
   /**
    * @param {{ command: string, args?: string[], cwd?: string, timeoutMs?: number }} opts
@@ -64,6 +82,7 @@ export class CommandExecutor {
           cwd: this.cwd,
           stdio: ["pipe", "pipe", "pipe"],
           env: process.env,
+          windowsHide: true,
         });
       } catch (error) {
         resolve({ outcome: "stopped", text: `command could not be started: ${error.message}` });
@@ -79,11 +98,11 @@ export class CommandExecutor {
         resolve(value);
       };
       const onAbort = () => {
-        child.kill("SIGTERM");
+        stopTree(child);
         finish({ outcome: "stopped", text: "run aborted (the picker was fenced out or lost the board)" });
       };
       const timer = setTimeout(() => {
-        child.kill("SIGTERM");
+        stopTree(child);
         finish({ outcome: "stopped", text: `command did not finish within ${Math.round(this.timeoutMs / 1000)}s and was stopped` });
       }, this.timeoutMs);
       if (signal) {
