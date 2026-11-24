@@ -311,6 +311,7 @@ async function main() {
   check("consent page for the owner", page1.res.status === 200 && page1.handle.length > 0 && page1.text.includes("client.example.com"));
   check("consent page escapes the client's name", page1.text.includes("Test &#60;App&#62;") && !page1.text.includes("Test <App>"));
   check("consent page names the actor", page1.text.includes("oauth-test-app"));
+  check("the owner can consent specifically to the dots role", page1.text.includes('name="decision" value="approve-dots"'));
   check("consent page has no scripts and posts only here and to the client",
     csp.includes("default-src 'none'") && csp.includes("form-action 'self' https://client.example.com") && csp.includes("frame-ancestors 'none'"), csp);
   check("approval without Access is refused", (await answer(page1, "approve", {})).status === 401);
@@ -347,6 +348,22 @@ async function main() {
   check("the code works once", (await tokenRequest({ ...grant, code: code2, code_verifier: verifier })).status === 400);
   check("a replayed code revokes the tokens it gave",
     (await mcpRaw(tokens.access_token, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
+
+  async function newGrant(decision = "approve") {
+    const auth = await answer(await consent("confirmation"), decision);
+    const value = new URL(auth.headers.get("location")).searchParams.get("code");
+    return (await tokenRequest({ ...grant, code: value, code_verifier: verifier })).json();
+  }
+  const betaGrant = await newGrant();
+  const dotsGrant = await newGrant("approve-dots");
+  const dotsRefresh = await (await tokenRequest({ grant_type: "refresh_token", refresh_token: dotsGrant.refresh_token, client_id: client.client_id, resource })).json();
+  const dotsToken = dotsRefresh.access_token;
+  const dotsTools = (await rpc(dotsToken, "tools/list")).body.result?.tools.map(t => t.name) ?? [];
+  check("the refreshed dots grant only offers restricted worker tools",
+    ["board_my_work", "board_accept_handoff", "board_complete_handoff"].every(t => dotsTools.includes(t)) &&
+    !dotsTools.includes("board_list") && (await call(dotsToken, "board_list", {})).rpcError !== undefined);
+  check("consenting to dots keeps this client's ordinary board grant usable",
+    (await call(betaGrant.access_token, "board_list", {})).ok === true);
 
   page1 = await consent("s3");
   r = await answer(page1, "deny");
@@ -665,7 +682,7 @@ async function main() {
   let route = await routeOf();
   check("the page shows the default order until the owner sets one", route?.order?.join(",") === "vps-claude,local-claude,devin" && route?.set_by_owner === false, JSON.stringify(route));
   check("the page lists every destination that can be in the order, with tool and place apart",
-    ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot"].every((t) => route?.targets?.some((x) => x.target === t)) &&
+    ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "dots"].every((t) => route?.targets?.some((x) => x.target === t)) &&
     !route?.targets?.some((x) => x.target === "owner" || x.target === "hold"), JSON.stringify(route?.targets));
   check("without a Devin key, Devin in the cloud is not picking up", route?.targets?.find((x) => x.target === "devin")?.alive === false);
   for (const bad of [{ op: "order" }, { op: "order", order: ["owner"] }, { op: "order", order: ["devin", "devin"] }, { op: "order", order: ["someone"] }, { op: "order", order: "devin" }, { op: "order", order: [], extra: 1 }])
@@ -955,6 +972,7 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
   check("the page data lists the 手元だけ projects", page.scopes?.scoped === "local");
   check("a 手元だけ project refuses a destination outside the PC", (await ownerCode({ op: "route", item_id: "stop1", to: "vps-claude" })) === "403 FORBIDDEN");
+  check("a 手元だけ project cannot be routed to dots", (await ownerCode({ op: "route", item_id: "stop1", to: "dots" })) === "403 FORBIDDEN");
   check("a writer cannot route 手元だけ work outside the PC either", code(await call(K.alpha, "board_route_handoff", { item_id: "stop1", to: "devin" })) === "FORBIDDEN");
   check("a 手元だけ project may still go on hold", (await ownerCode({ op: "route", item_id: "stop1", to: "hold" })) === "200 OK");
   // The board's choice for a 手元だけ project goes down the PC's part of the order only.
@@ -1020,6 +1038,24 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   check("an expired restricted lease cannot be renewed", code(expiredHeartbeat) === "STALE_GENERATION", JSON.stringify(expiredHeartbeat));
   check("the owner can quarantine and release the expired run", (await ownerCode({ op: "mark_unknown", item_id: "stop1", request_id: expiringRequest })) === "200 OK" &&
     (await ownerCode({ op: "release", item_id: "stop1", request_id: expiringRequest })) === "200 OK");
+
+  check("the owner can assign directly to dots", (await ownerCode({ op: "hand", item_id: "stop1", to: "dots" })) === "200 OK");
+  const dotsWork = await call(dotsToken, "board_my_work", {});
+  check("dots sees only its own assignment", dotsWork.items?.length === 1 && dotsWork.items[0].item_id === "stop1" &&
+    !("scopes" in dotsWork) && !JSON.stringify(dotsWork).includes(otherRequest));
+  check("dots cannot accept another worker's assignment", code(await call(dotsToken, "board_accept_handoff",
+    { item_id: other.item_id, request_id: otherRequest })) === "NOT_FOUND");
+  const dotsRequest = { item_id: "stop1", request_id: dotsWork.items[0].handoff.request_id };
+  const dotsAccept = await call(dotsToken, "board_accept_handoff", dotsRequest);
+  const dotsFence = { ...dotsRequest, generation: dotsAccept.handoff.generation };
+  check("the MCP grant accepts as dots", dotsAccept.handoff.accepted_by === "dots");
+  const dotsResult = await call(dotsToken, "board_complete_handoff", { ...dotsFence, outcome: "done", text: "15 / 3 = 5" });
+  const dotsPage = await (await fetch(`${base}/api/board`, { headers: jar })).json();
+  const dotsItem = dotsPage.items.find(item => item.item_id === dotsRequest.item_id);
+  check("the owner sees the direct MCP result on the original request", dotsResult.ok === true &&
+    dotsItem?.handoff?.request_id === dotsRequest.request_id && dotsItem.handoff.state === "completed" &&
+    dotsItem.last_note?.actor === "dots" && dotsItem.last_note.text === "15 / 3 = 5");
+  check("dots has no outstanding work after completion", (await call(dotsToken, "board_my_work", {})).items?.length === 0);
 
   // --- the item limit (27 in this run)
   let lastCode = "OK";

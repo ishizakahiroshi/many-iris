@@ -45,7 +45,7 @@
 
 ### 任せた作業の振り分け
 
-任せた作業には、行き先が付きます。行き先は「道具 × 動く場所」で 9 つです：`vps-claude`（VPS の claude -p）・`local-claude`（手元 PC の claude -p）・`devin`（Devin、クラウド。看板がセッションを起こす）・`vps-devin`（Devin、VPS）・`local-devin`（Devin、手元 PC）・`muse`（Muse）・`grokbot`（GrokBot）・`owner`（自分）・`hold`（保留）。Devin を動く場所で分けたのは 2026-11-21 の作者の判断です（VPS に入れた Devin を看板から呼べるようにするため）。
+任せた作業には、行き先が付きます。行き先は「道具 × 動く場所」で 10 個です：`vps-claude`（VPS の claude -p）・`local-claude`（手元 PC の claude -p）・`devin`（Devin、クラウド。看板がセッションを起こす）・`vps-devin`（Devin、VPS）・`local-devin`（Devin、手元 PC）・`muse`（Muse）・`grokbot`（GrokBot）・`dots`（dots）・`owner`（自分）・`hold`（保留）。Devin を動く場所で分けたのは 2026-11-21 の作者の判断です（VPS に入れた Devin を看板から呼べるようにするため）。
 
 - 行き先を付けた依頼は、その名前の書き手（鍵の `actor`）だけが受けられます。`owner` と `hold` は誰も受けられず、行き先が付け直されるか、取り下げられるのを待ちます。違う相手が拾う事故を、仕組みで起こさないためです。
 - 行き先は、持ち主が画面の「行き先を変える」で、書き手が `board_route_handoff` で付け直せます（2026-11-14 の作者の判断。画面を開かずに AI へ頼めるようにするため）。書き手は、保留の作業を自分宛てに付け替えて受けることもできます。誰が付け替えたかは、出来事に「routed … to …」として書き手の名前つきで残ります。
@@ -55,6 +55,14 @@
 - 受けた書き手は、使っている版（拾い手・決まり・Skills の commit）を `board_accept_handoff` の `versions` で伝えられ、看板は依頼と受けた出来事に残します。終えた実行は `board_complete_handoff` の `ref`（PR などの https のリンク）と `commit` で結果を残せ、カードに「結果」として出ます（#46 の Q8・段 2）。
 - 依頼には、誰が任せたか（`handoff.requested_by`。画面からなら `page:owner`、MCP からなら書き手の名前）、今の行き先を誰が決めたか（`handoff.to_set_by`。持ち主が任せた仕事を持ち主の順番で渡したときは `page:owner`、保留にしたときと書き手が任せた仕事は `dispatcher`）、任せた時点の題名（`handoff.title`）が残ります。後から題名が書き換えられても、任せた時点の題名は変わりません。人の見ていない所で作業を始める拾い手は、これを見て「持ち主が任せ、持ち主が行き先を決めた依頼」だけを動かせます。
 - 行き先が `devin` の依頼だけ、同じ処理（画面で押した直後と、10 分ごとの cron）が Devin のセッションを起こします（秘密 `DEVIN_API_KEY` があるときだけ。1 件につき 2 回・1 日 6 回まで）。起こす前に看板へ予約を書くので、同じ依頼を 2 つ起こすことはありません。Devin の応答が届かなかったときは、起きたかどうか分からないので自動では起こし直さず、人が Devin の側を見て `board_resolve_dispatch` で片付けます。Devin が断ったとき（鍵の誤りなどの 4xx）は、起きていないことが確かなので、人の片付けは要りません（回数には数えます）。それ以外の行き先は、その相手が自分で拾います（拾う側として `picker/` があります。看板の fenced ツールを使うため、この節の受理とリースの仕組みが前提です）。
+
+### dots が MCP で依頼を受け取る
+
+1. dots 用に独立したリモート MCP 接続を作り、自分の看板の `https://board.example.com/board/mcp` を登録します。OAuth の本人確認後に「dots の担当として許可する」を選びます。接続先のツールを更新し、`board_my_work`・`board_accept_handoff`・`board_complete_handoff` が表示されることを確認します。
+2. 看板で予定の仕事を選び、行き先を「dots」にして「任せる」を押します。dots が MCP の `board_my_work` を呼ぶと、その担当分を取得できます。空または一時停止なら新しい仕事を始めません。
+3. dots は `item_id` と `request_id` で受け付け、返された `generation` を使って同じ依頼に結果を返します。長い作業では `board_heartbeat_handoff` で実行を更新します。看板で受付と完了、結果の本文を確認できます。
+
+この経路は HTTPS と MCP で完結します。依頼を置いても dots が見に来るまでは受付待ちです。定期巡回は、利用するクライアントで別途設定・確認します。
 
 ### 自分の Cloudflare に置く
 
