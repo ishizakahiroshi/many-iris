@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "public");
 const sources = [
-  [join(root, "web"), ["_headers", "app.css", "board.css", "board.js", "board-activity.js", "chat.css", "chat.js"]],
+  [join(root, "web"), ["_headers", "app.css", "board.css", "board.js", "board-activity.js", "confirmations.js", "chat.css", "chat.js"]],
 ];
 
 mkdirSync(out, { recursive: true });

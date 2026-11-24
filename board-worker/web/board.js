@@ -1,4 +1,5 @@
 import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './board-activity.js';
+import { mountConfirmations } from './confirmations.js';
 
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -1053,6 +1054,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
       if (reloadQueued) { reloadQueued = false; load(true); }
     }
   }
+  mountConfirmations();
   $('board-refresh').addEventListener('click', () => load(true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
   setInterval(() => { if (!document.hidden) load(); }, 60000);

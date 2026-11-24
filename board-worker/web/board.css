@@ -156,3 +156,12 @@ body.chat-open::before{content:"";position:fixed;inset:0;background:rgba(36,31,2
   .board-summary { grid-template-columns: minmax(2.2rem,.65fr) auto minmax(5rem,2fr) minmax(2.1rem,.65fr) minmax(3.2rem,.7fr); gap: .3rem; padding-inline: .3rem; }
   .board-summary .badge { padding-inline: .35rem; }
 }
+.board-confirmations { padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 16px; background: var(--card); }
+.board-confirmations ul { list-style: none; margin: 0; padding: 0; }
+.board-confirmations li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border-top: 1px solid var(--line); padding: 12px 0; overflow-wrap: anywhere; }
+.board-confirmations li h3, .board-confirmations li p { margin: 2px 0; }
+.board-confirmations li p { white-space: pre-wrap; }
+.board-confirmations small { color: var(--soft); }
+.board-confirmations button { min-height: 44px; min-width: 54px; }
+#confirmation-status { margin: 5px 0 0; }
+#confirmation-status:empty { display: none; }

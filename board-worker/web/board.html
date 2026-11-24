@@ -21,6 +21,11 @@
     <button id="board-refresh" type="button" class="quiet">読み直す</button>
   </section>
   <main id="board-main" tabindex="-1" class="board-main">
+    <section class="board-confirmations" aria-labelledby="confirmation-heading">
+      <div class="section-heading"><h2 id="confirmation-heading">確認待ち</h2><span class="count" id="confirmation-count">—</span></div>
+      <p id="confirmation-status" role="status">読み込み中…</p>
+      <ul id="confirmation-list"></ul>
+    </section>
     <section id="board-pause" class="board-pause" aria-label="全部止める" hidden></section>
     <section id="board-route" class="board-route" aria-label="おまかせの順番" hidden></section>
     <section id="board-find" class="board-find" aria-label="案件で絞る・番号で探す" hidden>
