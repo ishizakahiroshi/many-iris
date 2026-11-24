@@ -611,6 +611,14 @@ async function main() {
   check("a heartbeat from the run extends the lease", (await call(K.muse, "board_heartbeat_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1 })).ok === true);
   check("progress from another writer is refused", code(await call(K.alpha, "board_progress_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1, kind: "note", text: "not my run" })) === "FORBIDDEN");
   check("progress from the run is written", (await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: reRequest, generation: gen1, kind: "note", text: "halfway" })).event?.text === "halfway");
+  const phaseFence = { item_id: "pile4", request_id: reRequest, generation: gen1 };
+  const stageNote = await call(K.muse, "board_progress_handoff", { ...phaseFence, kind: "note", text: "工程：回答待ち" });
+  await call(K.muse, "board_heartbeat_handoff", phaseFence);
+  const awaiting = await call(K.alpha, "board_request_status", { item_id: "pile4" });
+  check("a heartbeat preserves the last phase and its time; a reply is required",
+    awaiting.lifecycle?.reported_phase?.at === stageNote.event.at && awaiting.lifecycle?.reported_phase?.label === "回答待ち" && awaiting.lifecycle?.needs_attention === true);
+  const repeat = await call(K.muse, "board_progress_handoff", { ...phaseFence, kind: "note", text: "工程：回答待ち" });
+  check("repeating a phase does not change the milestone time", repeat.handoff?.phase_at === stageNote.event.at);
   check("the run's plain event without its fence is refused", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain, no fence" })) === "FENCE_REQUIRED");
   check("the run's plain update without its fence is refused", code(await call(K.muse, "board_upsert_item", { item_id: "pile4", title: "plain rename" })) === "FENCE_REQUIRED");
   check("the run's plain event with a wrong generation is stale", code(await call(K.muse, "board_add_event", { item_id: "pile4", kind: "note", text: "plain, wrong fence", request_id: reRequest, generation: gen1 + 9 })) === "STALE_GENERATION");
@@ -636,6 +644,7 @@ async function main() {
   check("confirmed release puts the work back on the pile", released.handoff === null && released.item?.state === "planned", JSON.stringify(released));
   const hand2 = await call(K.alpha, "board_request_handoff", { item_id: "pile4", to: "muse" });
   const request2 = hand2.handoff?.request_id ?? "";
+  check("a new request has no former run's phase", hand2.handoff.phase === null && hand2.handoff.phase_at === null);
   check("the next request's generation is higher", hand2.handoff?.generation === gen1 + 1, JSON.stringify(hand2.handoff));
   await call(K.muse, "board_accept_handoff", { item_id: "pile4", request_id: request2 });
   check("a write with the old generation is stale", code(await call(K.muse, "board_progress_handoff", { item_id: "pile4", request_id: request2, generation: gen1, kind: "note", text: "old run" })) === "STALE_GENERATION");

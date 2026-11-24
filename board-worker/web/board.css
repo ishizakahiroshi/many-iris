@@ -115,6 +115,10 @@ body.chat-open::before{content:"";position:fixed;inset:0;background:rgba(36,31,2
 .board-summary:hover:not(:disabled), .board-summary[aria-expanded="true"] { background: #fff1e6; }
 .board-summary[aria-expanded="true"] { box-shadow: inset 3px 0 0 var(--accent); }
 .board-summary-name { overflow-wrap: anywhere; }
+.board-run-progress { display: block; margin-top: .25rem; color: var(--ink); font-size: .81rem; font-weight: 500; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .dated-row:has(.board-run-progress) .board-summary-name { grid-column: 1 / -1; grid-row: 2; }
+}
 .board-summary-id, .board-summary time, .board-summary-who, .board-summary-name small {
   display: block; color: var(--soft); font-size: .73rem; font-weight: 400; overflow-wrap: anywhere;
 }

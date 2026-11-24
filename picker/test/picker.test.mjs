@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardRefusal, BoardUnreachable } from "../src/board-client.mjs";
-import { RecordExecutor } from "../src/executors.mjs";
+import { CommandExecutor, RecordExecutor } from "../src/executors.mjs";
 import { acquireLock, configFromEnv, versionsFromEnv } from "../src/main.mjs";
 import { chatAnswer, eligible, fetchAttachments, privateTurnDir, runChatPass, runPass, runResult } from "../src/picker.mjs";
 
@@ -132,6 +132,21 @@ class FakeBoard {
 
 const state = (runs = 0) => ({ runs, runsToday() { return this.runs; }, recordRun() { this.runs += 1; } });
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A short-lived worker can exit before the board acknowledges its launch.
+{
+  const phases = [];
+  const command = new CommandExecutor({
+    command: process.execPath,
+    args: ["-e", "require('node:fs').writeSync(3, 'testing\\n')"],
+  });
+  const result = await command.run({ title: "fixture" }, { progress: async text => {
+    phases.push(text);
+    if (phases.length === 1) await wait(400);
+  } });
+  check("a short command keeps its buffered phase until the launch is acknowledged",
+    result.outcome === "done" && phases.join("/") === "工程：作業コマンド起動/工程：テスト中", JSON.stringify(phases));
+}
 
 // --- eligibility ---------------------------------------------------
 {
@@ -269,6 +284,22 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   check("losing the board aborts the run", aborted === true);
   check("the pass reports unreachable", outcome.kind === "unreachable", JSON.stringify(outcome));
   check("no completion was attempted while the board was gone", board.callsOf("board_complete_handoff").length === 0);
+}
+
+// --- an unacknowledged milestone leaves the result unwritten ----------
+{
+  const board = new FakeBoard([item()]);
+  let aborted = false;
+  const executor = {
+    async run(job, { signal, progress }) {
+      board.drop.set("board_progress_handoff", 1);
+      await progress("工程：テスト中");
+      aborted = signal.aborted;
+      return { outcome: "done", text: "must not be written" };
+    },
+  };
+  const outcome = await runPass({ client: board, config: baseConfig, executor, state: state() });
+  check("losing a phase acknowledgement aborts without completing", aborted && outcome.kind === "unreachable" && board.callsOf("board_complete_handoff").length === 0);
 }
 
 // --- a board without generations (pre-PR#4) --------------------------

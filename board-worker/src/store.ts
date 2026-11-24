@@ -175,8 +175,10 @@ const num = (v: SqlStorageValue) => Number(v);
 const HANDOFF_COLUMNS = [
   "handoff_state", "handoff_request", "handoff_at", "handoff_actor", "handoff_accepted_at", "handoff_to", "handoff_by",
   "handoff_to_by", "handoff_title", "handoff_generation", "handoff_heartbeat_at", "handoff_lease_until",
-  "handoff_versions", "handoff_result_ref", "handoff_result_commit",
+  "handoff_versions", "handoff_result_ref", "handoff_result_commit", "handoff_phase", "handoff_phase_at",
 ];
+// Only exact notes from the current, fenced run can change its reported phase.
+const PHASE_NOTE = /^工程：(作業コマンド起動|調査中|実装中|テスト中|回答待ち)$/u;
 /** A finished run's result link and commit, or null when it gave neither. */
 function resultOf(r: Row, prefix: string): { ref: string | null; commit: string | null } | null {
   const ref = r[prefix + "handoff_result_ref"] ?? null;
@@ -269,6 +271,8 @@ export class Store {
     this.addColumn("handoff_versions", "TEXT");
     this.addColumn("handoff_result_ref", "TEXT");
     this.addColumn("handoff_result_commit", "TEXT");
+    this.addColumn("handoff_phase", "TEXT");
+    this.addColumn("handoff_phase_at", "INTEGER");
     // Every tool call looks for requested handoffs (watchTargets, after each
     // answer) and the dispatcher does every ten minutes; without this index
     // each look read the whole item table (issue #38).
@@ -907,6 +911,8 @@ export class Store {
       title: strOrNull(r[prefix + "handoff_title"] ?? null),
       generation: view.generation,
       heartbeat_at: heartbeatAt === null ? null : num(heartbeatAt),
+      phase: r[prefix + "handoff_phase"] ?? null,
+      phase_at: r[prefix + "handoff_phase_at"] ?? null,
       lease_until: view.lease_until,
       lease_expired: leaseExpired(view, Date.now()),
       legacy_run: isLegacyRun(view),
@@ -940,7 +946,7 @@ export class Store {
   /** Clears a handoff back to the pile. The generation stays, on purpose. */
   private clearHandoff(itemId: string): void {
     this.sql.exec(
-      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL WHERE item_id=?",
       itemId,
     );
   }
@@ -1235,6 +1241,8 @@ export class Store {
       this.checkRun(itemId, actor, request, generation, restricted);
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
+      const phase = kind === "note" && reference === null ? PHASE_NOTE.exec(text)?.[1] : null;
+      if (phase) this.sql.exec("UPDATE board_items SET handoff_phase=?,handoff_phase_at=? WHERE item_id=? AND handoff_phase IS NOT ?", phase, at, itemId, phase);
       this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", at, at + this.leaseMs, itemId);
       return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference }, handoff: this.loadHandoff(itemId), ...this.stopSignal() };
     });
@@ -1428,7 +1436,7 @@ export class Store {
     const request = newId(day, "REQ-");
     const now = Date.now();
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL WHERE item_id=?",
       request, now, to, actor, to === null ? null : actor, item.title, nextGeneration(this.loadGeneration(item.item_id)), item.item_id,
     );
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null, "requested");
@@ -1858,9 +1866,9 @@ export class Store {
    * first when `newestFirst` is set. */
   list(project: string | null, sinceSeq: number, eventLimit: number, newestFirst: boolean): Record<string, unknown> {
     const itemCols = ITEM_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
+    const handoffCols = HANDOFF_COLUMNS.map((c) => `i.${c} AS i_${c}`).join(",");
     const itemRows = this.sql.exec(
-      `SELECT ${itemCols},i.pile_rank AS i_pile_rank,i.handoff_state AS i_handoff_state,i.handoff_request AS i_handoff_request,
-              i.handoff_at AS i_handoff_at,i.handoff_actor AS i_handoff_actor,i.handoff_accepted_at AS i_handoff_accepted_at,i.handoff_to AS i_handoff_to,i.handoff_by AS i_handoff_by,i.handoff_to_by AS i_handoff_to_by,i.handoff_title AS i_handoff_title,i.handoff_generation AS i_handoff_generation,i.handoff_heartbeat_at AS i_handoff_heartbeat_at,i.handoff_lease_until AS i_handoff_lease_until,i.handoff_versions AS i_handoff_versions,i.handoff_result_ref AS i_handoff_result_ref,i.handoff_result_commit AS i_handoff_result_commit,e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
+      `SELECT ${itemCols},i.pile_rank AS i_pile_rank,${handoffCols},e.seq AS e_seq,e.at AS e_at,e.actor AS e_actor,e.kind AS e_kind,e.text AS e_text,e.ref AS e_ref
        FROM board_items i
        LEFT JOIN board_events e ON e.seq=(SELECT MAX(seq) FROM board_events WHERE item_id=i.item_id)
        WHERE (? IS NULL OR i.project=?) ORDER BY i.project,

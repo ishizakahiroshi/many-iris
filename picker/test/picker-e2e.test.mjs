@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardClient, BoardUnreachable } from "../src/board-client.mjs";
-import { RecordExecutor } from "../src/executors.mjs";
+import { CommandExecutor, RecordExecutor } from "../src/executors.mjs";
 import { runPass } from "../src/picker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -118,6 +118,25 @@ try {
   check("the run's start and record are events on job1",
     texts.some((t) => t.includes("開始")) && texts.some((t) => t.includes("記録のみ")),
     JSON.stringify(texts));
+
+  await alpha.call("board_upsert_item", { item_id: "phase-job", project: "demo", kind: "task", title: "Check fixtures", state: "planned" });
+  await alpha.call("board_request_handoff", { item_id: "phase-job", to: "muse" });
+  const fixture = `
+    const { writeSync } = require('node:fs');
+    console.error('awaiting_input');
+    writeSync(3, 'investig');
+    writeSync(3, 'ating\\n' + 'x'.repeat(128) + 'testing\\n' + 'testing\\ntesting\\n');
+    console.log('fixture result');
+  `;
+  const command = new CommandExecutor({ command: process.execPath, args: ["-e", fixture] });
+  const phaseRun = await runPass({ client: pickerClient, config, executor: command, state: freshState() });
+  check("a real command with milestones still completes", phaseRun.finished === true);
+  const phaseBoard = await alpha.call("board_list", { since_seq: 0 });
+  const phaseNotes = phaseBoard.events.filter(e => e.item_id === "phase-job" && e.text.startsWith("工程："));
+  check("only explicit changes are published, in order, before completion",
+    phaseNotes.map(e => e.text).join("/") === "工程：作業コマンド起動/工程：調査中/工程：テスト中", JSON.stringify(phaseNotes));
+  const latest = phaseBoard.items.find(i => i.item_id === "phase-job").handoff;
+  check("the stored phase has its own report time", latest.phase === "テスト中" && latest.phase_at === phaseNotes.at(-1)?.at);
 
   const restrictedClient = new BoardClient({ url: `${base}/board/mcp`, key: K.restricted });
   const restrictedMine = await restrictedClient.listMine();

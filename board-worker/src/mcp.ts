@@ -127,7 +127,7 @@ export const TOOLS: Json[] = [
   ),
   tool(
     "board_progress_handoff",
-    "Append an event as the current run (progress or a result), fenced by request_id and generation: a late write from an old run is refused instead of landing on work somebody else took over. Also extends the lease, like a heartbeat.",
+    "Append an event as the current run, fenced by request_id and generation. Also extends the lease. Report a change of work phase with kind=note, no ref, and exactly one of 工程：調査中, 工程：実装中, 工程：テスト中 or 工程：回答待ち. Report only a phase you actually reached. The board shows the phase separately from the last heartbeat.",
     {
       item_id: text("The item that was handed over"),
       request_id: text("handoff.request_id of that item"),

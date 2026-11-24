@@ -99,6 +99,12 @@ JSON 1 行で標準入力に渡します。題名は作業の「名前（デー�
 看板に残ります。そのコマンドが使う認証情報は、このプログラムの
 外（コマンド自身の環境）で用意してください。
 
+### 看板に作業工程を返す
+
+コマンドを起動すると、picker は「作業コマンド起動」を報告します。作業役は工程が変わったときに、専用のファイル記述子 3 へ `investigating`（調査中）、`implementing`（実装中）、`testing`（テスト中）、`awaiting_input`（回答待ち）のいずれかを改行付きで書けます。たとえばテストを開始するときは、シェルなら `printf 'testing\n' >&3`、Node.jsなら `writeSync(3, "testing\n")` です。通常のコマンド出力やエラーの内容から工程を推測しません。
+
+看板は工程の報告時刻と担当との最終通信時刻を別々に表示します。以前の担当から工程が届いていない依頼には「工程未報告」と表示します。MCPで照会する場合は `board_request_status` の `lifecycle.reported_phase` で確認できます。
+
 ## 手元の PC で動かす（`workers/local-claude.mjs`）
 
 持ち主の PC の書き手 `local-claude` の仕事も、この picker で拾えます（many-ai-cli の

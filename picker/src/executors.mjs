@@ -20,6 +20,8 @@
 //   operator's step, outside this repository's code.
 
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 export class RecordExecutor {
   constructor() {
@@ -39,6 +41,38 @@ export class RecordExecutor {
 // The tail of the output is kept: the last line is the answer, and a
 // conversation answer may be 20,000 characters long.
 const OUTPUT_MAX = 256 * 1024;
+
+// fd 3 is for explicit milestones. Worker stdout/stderr may contain private data.
+const phases = new Map([
+  ["investigating", "調査中"], ["implementing", "実装中"], ["testing", "テスト中"], ["awaiting_input", "回答待ち"],
+]);
+async function forwardPhases(pipe, progress, signal) {
+  if (signal?.aborted) return;
+  // Consume fd 3 immediately. Node drains child stdio on exit, even when
+  // the board has not acknowledged the launch note yet.
+  await pipeline(pipe, new PassThrough(), input => reportPhases(input, progress, signal));
+}
+async function reportPhases(input, progress, signal) {
+  await progress("工程：作業コマンド起動");
+  let last = "";
+  let line = "";
+  for await (const chunk of input) {
+    for (const byte of chunk) {
+      if (signal?.aborted) return;
+      if (byte !== 10) {
+        // Keep an oversized line invalid until its newline without buffering it all.
+        if (line.length <= 32) line += String.fromCharCode(byte);
+        continue;
+      }
+      const label = phases.get(line.replace(/\r$/, ""));
+      line = "";
+      if (label && label !== last) {
+        await progress("工程：" + label);
+        last = label;
+      }
+    }
+  }
+}
 
 // Stops the command and what it started. On Windows a kill ends only the
 // process itself and its SIGTERM handler never runs. A node worker's own
@@ -74,13 +108,15 @@ export class CommandExecutor {
     this.timeoutMs = timeoutMs;
   }
 
-  async run(job, { signal } = {}) {
+  async run(job, { signal, progress } = {}) {
+    if (signal?.aborted) return { outcome: "stopped", text: "run aborted before the command started" };
     return new Promise((resolve) => {
+      const report = !job.turn && typeof progress === "function";
       let child;
       try {
         child = spawn(this.command, this.args, {
           cwd: this.cwd,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio: report ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
           env: process.env,
           windowsHide: true,
         });
@@ -116,8 +152,17 @@ export class CommandExecutor {
         output = (output + chunk.toString("utf8")).slice(-OUTPUT_MAX);
       });
       child.stderr.on("data", () => {});
+      let reported = Promise.resolve();
+      if (report) child.once("spawn", () => {
+        reported = forwardPhases(child.stdio[3], progress, signal).catch(() => {
+          if (settled) return;
+          stopTree(child);
+          finish({ outcome: "stopped", text: "工程を看板に報告できなかったため停止しました" });
+        });
+      });
       child.on("error", (error) => finish({ outcome: "stopped", text: `command failed to run: ${error.message}` }));
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
+        await reported;
         const lastLine = output.trim().split("\n").filter((line) => line.trim().length > 0).at(-1) ?? "";
         if (code === 0) finish({ outcome: "done", text: lastLine || "command finished without output" });
         else finish({ outcome: "stopped", text: `command exited with code ${code}${lastLine ? `: ${lastLine}` : ""}` });

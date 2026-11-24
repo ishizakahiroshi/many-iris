@@ -72,6 +72,28 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     else if (state === 'in_progress') node.classList.add('active');
     return node;
   }
+  const phaseTime = new Intl.DateTimeFormat('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  function runProgress(item) {
+    const h = item.handoff;
+    if (!h || h.state === 'requested') return null;
+    const line = el('span', 'board-run-progress');
+    if (h.state === 'completed') {
+      if (item.state === 'stopped') line.textContent = '要確認：作業が停止しました';
+      else if (h.result?.ref) line.textContent = '提出済み・詳細で成果を見る';
+      else return null;
+      return line;
+    }
+    const parts = [];
+    if (h.phase) parts.push('最終報告：' + h.phase + (Number.isFinite(h.phase_at) ? ' ' + phaseTime.format(h.phase_at) : ''));
+    else parts.push('工程未報告');
+    if (h.state === 'unknown' || h.lease_expired) parts.push('要確認：担当の状態を確認');
+    else if (h.phase === '回答待ち') parts.push('あなたの回答が必要');
+    else if (item.state === 'waiting') parts.push('待ち理由を確認');
+    else parts.push('続報待ち');
+    if (Number.isFinite(h.heartbeat_at)) parts.push('最終通信 ' + phaseTime.format(h.heartbeat_at));
+    line.textContent = parts.join(' ／ ');
+    return line;
+  }
   function sourceNode(ref) {
     // Only an https URL becomes a link; a repository path is shown as text.
     if (typeof ref === 'string' && ref.startsWith('https://')) {
@@ -654,6 +676,8 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     meta.append(el('span', null, '更新：' + when(item.updated_at) + ' / ' + item.updated_by));
     if (item.source_ref) { const s = el('span', null, '原本：'); s.append(sourceNode(item.source_ref)); meta.append(s); }
     box.append(meta);
+    const progress = runProgress(item);
+    if (progress) box.append(progress);
     if (item.last_event) {
       const last = el('div', 'board-last');
       // The result a run wrote comes just before it closed the item: show it,
@@ -819,6 +843,8 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
       else if (item.kind === 'task') context.push('まだ結ばれていない作業');
       if (kids.length) context.push('直属 ' + kids.length + ' 件（' + [...counts].map(([s, n]) => (states[s] || s) + n).join('・') + '）');
       if (context.length) title.append(el('small', null, context.join(' ／ ')));
+      const progress = runProgress(item);
+      if (progress) title.append(progress);
       if (!isClosed) title.style.paddingInlineStart = Math.min(depth, 4) * 0.55 + 'rem';
       const assignee = item.handoff?.accepted_by || item.handoff?.to;
       const id = el('span', 'board-summary-id', item.item_id);

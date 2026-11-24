@@ -34,7 +34,7 @@ export interface LifecycleInput {
   handoff: {
     state: string; request_id: string | null; requested_at: number | null; accepted_by: string | null;
     accepted_at: number | null; to: string | null; generation: number | null; heartbeat_at: number | null;
-    lease_until: number | null;
+    lease_until: number | null; phase?: string | null; phase_at?: number | null;
   } | null;
   /** The dispatcher's newest row for this request (devin only), or null. */
   dispatch: { status: string; at: number; session_id: string | null; attempts: number } | null;
@@ -56,6 +56,7 @@ export interface Lifecycle {
   options: string[];
   times: { requested_at: number | null; accepted_at: number | null; heartbeat_at: number | null; lease_until: number | null };
   accepted_by: string | null;
+  reported_phase: { label: string; at: number } | null;
   outcome: "done" | "stopped" | null;
   result_refs: { at: number; actor: string; ref: string }[];
 }
@@ -71,6 +72,7 @@ export function deriveLifecycle(input: LifecycleInput, now: number): Lifecycle {
       heartbeat_at: h?.heartbeat_at ?? null, lease_until: h?.lease_until ?? null,
     },
     accepted_by: h?.accepted_by ?? null,
+    reported_phase: h?.phase && typeof h.phase_at === "number" ? { label: h.phase, at: h.phase_at } : null,
     outcome: null,
     result_refs: input.refs,
   };
@@ -144,14 +146,17 @@ export function deriveLifecycle(input: LifecycleInput, now: number): Lifecycle {
       out.options.push("担当に状況を確かめる。確認が取れないなら board_mark_handoff_unknown で『不明』に記録（自動では再実行されません）");
       return out;
     }
-    if (reported) {
+    if (reported || out.reported_phase !== null) {
       out.stage = "running";
-      out.summary = `${h.accepted_by ?? "担当"} が受け付け、その後も連絡が続いています（実行中と見られます）。`;
+      out.summary = out.reported_phase
+        ? `${h.accepted_by ?? "担当"} の最新の工程報告：${out.reported_phase.label}。`
+        : `${h.accepted_by ?? "担当"} から連絡があります。作業工程は未報告です。`;
     } else {
       out.stage = "accepted";
       out.summary = `${h.accepted_by ?? "担当"} が受け付けました。ただし、受付のあとの連絡（進捗・心拍）はまだありません。`;
       out.unconfirmed.push("着手したかどうかは、受付のあとの連絡が来るまで確認できません");
     }
+    if (h.phase === "回答待ち") out.needs_attention = true;
     return out;
   }
 

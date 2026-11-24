@@ -224,28 +224,31 @@ export async function runPass({ client, config, executor, state, log = () => {},
       abort.abort();
     }
   };
-  const heartbeat = async () => {
+  const reportToBoard = async (tool, args) => {
     try {
-      heedStop(await client.call("board_heartbeat_handoff", fence));
+      heedStop(await client.call(tool, args));
     } catch (error) {
-      if (isFenceRefusal(error)) stopReason = "fenced-out";
-      else if (error instanceof BoardUnreachable) stopReason = "unreachable";
+      if (isFenceRefusal(error)) stopReason ??= "fenced-out";
+      else if (error instanceof BoardUnreachable) stopReason ??= "unreachable";
       else throw error;
       abort.abort();
     }
   };
+  const heartbeat = () => reportToBoard("board_heartbeat_handoff", fence);
   const timer = timers.setInterval(() => { void heartbeat(); }, config.heartbeatMs);
   const progress = async (text) => {
-    heedStop(await client.call("board_progress_handoff", { ...fence, kind: "note", text: truncate(text) }));
+    await reportToBoard("board_progress_handoff", { ...fence, kind: "note", text: truncate(text) });
   };
 
   let result;
   try {
     await progress(`開始（picker、${config.writer}。任された仕事 ${chosen.requestId} を受けた）`);
-    const job = { itemId: chosen.itemId, project: chosen.project, requestId: chosen.requestId, title: chosen.title };
-    const takeover = await lookUpTakeover(client, job, listed);
-    if (takeover !== null) job.takeover = takeover;
-    result = await executor.run(job, { signal: abort.signal, progress });
+    if (!abort.signal.aborted) {
+      const job = { itemId: chosen.itemId, project: chosen.project, requestId: chosen.requestId, title: chosen.title };
+      const takeover = await lookUpTakeover(client, job, listed);
+      if (takeover !== null) job.takeover = takeover;
+      result = await executor.run(job, { signal: abort.signal, progress });
+    }
   } catch (error) {
     result = { outcome: "stopped", text: `executor failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
