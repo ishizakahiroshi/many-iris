@@ -274,6 +274,23 @@ export class Store {
     // each look read the whole item table (issue #38).
     this.sql.exec("CREATE INDEX IF NOT EXISTS board_items_handoff ON board_items(handoff_state)");
     this.initCounts();
+    // The snapshot covers items, events and the chat summary. Presence and
+    // owner settings are cheap live fields, independent of this revision.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS page_revision(id INTEGER PRIMARY KEY CHECK(id=1), epoch TEXT NOT NULL, version INTEGER NOT NULL)");
+    this.sql.exec("INSERT OR IGNORE INTO page_revision VALUES(1,lower(hex(randomblob(16))),0)");
+    for (const [table, operations] of [
+      ["board_items", ["INSERT", "UPDATE"]],
+      ["board_events", ["INSERT"]],
+      ["chat_messages", ["INSERT", "UPDATE", "DELETE"]],
+    ] as const) {
+      for (const op of operations) this.sql.exec(`CREATE TRIGGER IF NOT EXISTS page_${table}_${op} AFTER ${op} ON ${table}
+        BEGIN UPDATE page_revision SET version=version+1 WHERE id=1; END`);
+    }
+    // Older notes remain activity. Only a recorded handoff operation may
+    // label a note as a request or an acceptance on the historical timeline.
+    try { this.sql.exec("SELECT milestone FROM board_events LIMIT 0"); } catch {
+      this.sql.exec("ALTER TABLE board_events ADD COLUMN milestone TEXT");
+    }
   }
   /** The item and event counts the limits are checked against, kept in
    * `board_counts` by insert triggers (rows are never deleted, see the
@@ -550,8 +567,7 @@ export class Store {
   }
 
   /** The order and, for every destination that can be in it, whether it is picking up now (for the page). */
-  routeView(devinReady: boolean, now: number): Record<string, unknown> {
-    const route = this.routeOrder();
+  private routeView(route: Record<string, unknown>, devinReady: boolean, now: number): Record<string, unknown> {
     const seen = route.seen as Record<string, number>;
     const targets = ORDERABLE.map((target) => ({
       target, alive: isAlive(target, seen, now, devinReady), seen_at: target === "devin" ? null : (seen[target] ?? null),
@@ -1144,7 +1160,7 @@ export class Store {
         versions === null ? null : Object.entries(versions).map(([k, v]) => `${k}=${v}`).join(","), itemId,
       );
       const withVersions = versions === null ? "" : ` (versions: ${Object.entries(versions).map(([k, v]) => `${k} ${v}`).join(", ")})`;
-      this.insertEvent(itemId, now, actor, "note", `accepted ${request}${withVersions}`, null);
+      this.insertEvent(itemId, now, actor, "note", `accepted ${request}${withVersions}`, null, "accepted");
     });
     if (again) {
       const item = this.loadItem(itemId);
@@ -1415,7 +1431,7 @@ export class Store {
       "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL WHERE item_id=?",
       request, now, to, actor, to === null ? null : actor, item.title, nextGeneration(this.loadGeneration(item.item_id)), item.item_id,
     );
-    this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null);
+    this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null, "requested");
   }
 
   /** Withdraws a request that nobody has taken yet, so the work is back on the pile. Runs inside a transaction. */
@@ -1565,8 +1581,14 @@ export class Store {
 
   /** The data of the page. `can_write` tells the page that this board takes
    * the owner's own writes (`ownerWrite`); the Rust board does not send it. */
-  pageData(devinReady = false): Record<string, unknown> {
+  pageData(devinReady = false, since: string | null = null): Record<string, unknown> {
     const now = Date.now();
+    const { epoch, version } = this.sql.exec("SELECT epoch,version FROM page_revision WHERE id=1").one();
+    const revision = `${epoch}.${version}`;
+    const route = this.routeOrder();
+    const live = { revision, history_epoch: epoch, generated_at: now, can_write: true,
+      route: this.routeView(route, devinReady, now), paused: this.pauseState(), scopes: route.scopes };
+    if (since === revision) return { ok: true, unchanged: true, ...live };
     const data = this.list(null, 0, PAGE_EVENT_LIMIT, true);
     // A run reports its result as a note and then closes the item, so the
     // item's last event is the state change and the result is just before
@@ -1595,10 +1617,24 @@ export class Store {
       const chat = chats.get(item.item_id);
       return chat ? { ...withNote, chat } : withNote;
     });
-    return {
-      ...data, items, generated_at: now, can_write: true, route: this.routeView(devinReady, now),
-      paused: this.pauseState(), scopes: this.projectScopes(),
-    };
+    return { ...data, items, ...live };
+  }
+
+  /** A bounded slice of the append-only history up to the page's observed
+   * head. Never send free-form note text, actors or refs into the timeline. */
+  activity(after: number, through: number): Record<string, unknown> {
+    const { epoch } = this.sql.exec("SELECT epoch FROM page_revision WHERE id=1").one();
+    const rows = this.sql.exec(
+      `SELECT seq,item_id,at,kind,milestone,
+        CASE WHEN kind='state_change' THEN substr(text,1,48) END AS transition
+       FROM board_events WHERE seq>? AND seq<=? ORDER BY seq LIMIT 500`, after, through,
+    ).toArray() as Row[];
+    const events = rows.map(r => {
+      const change = /^(planned|in_progress|waiting|done|stopped) -> (planned|in_progress|waiting|done|stopped)(?: |$)/.exec(String(r.transition));
+      return { seq: r.seq, item_id: r.item_id, at: r.at, kind: r.milestone ?? r.kind,
+        ...(change ? { from: change[1], to: change[2] } : {}) };
+    });
+    return { ok: true, history_epoch: epoch, events };
   }
 
   /**
@@ -1861,12 +1897,12 @@ export class Store {
     };
   }
 
-  private insertEvent(itemId: string, at: number, actor: string, kind: string, text: string, ref: string | null): number {
+  private insertEvent(itemId: string, at: number, actor: string, kind: string, text: string, ref: string | null, milestone: "requested" | "accepted" | null = null): number {
     if (this.count("board_events") >= this.limits.events)
       throw new BoardError("BOARD_EVENT_LIMIT", `The board holds ${this.limits.events} events already; nothing was added`);
     const row = this.sql.exec(
-      "INSERT INTO board_events(item_id,at,actor,kind,text,ref) VALUES(?,?,?,?,?,?) RETURNING seq",
-      itemId, at, actor, kind, text, ref,
+      "INSERT INTO board_events(item_id,at,actor,kind,text,ref,milestone) VALUES(?,?,?,?,?,?,?) RETURNING seq",
+      itemId, at, actor, kind, text, ref, milestone,
     ).one() as Row;
     return num(row.seq);
   }

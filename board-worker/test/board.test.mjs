@@ -148,6 +148,15 @@ async function main() {
   const jar = asOwner();
   r = await fetch(`${base}/api/board`, { headers: jar });
   let page = await r.json();
+  const snapshot = async (since) => (await fetch(base + '/api/board' + (since ? '?since=' + encodeURIComponent(since) : ''), { headers: jar })).json();
+  const firstRevision = page.revision;
+  const idle = await snapshot(firstRevision);
+  check("unchanged board omits expensive collections but refreshes live state", idle.unchanged && idle.revision === firstRevision &&
+    idle.generated_at >= page.generated_at && idle.paused && idle.scopes && idle.route && !("items" in idle) && !("events" in idle));
+  const activity = (after, through) => fetch(base + '/api/board/activity?after=' + after + '&through=' + through, { headers: jar });
+  check("owner access is required for activity", (await fetch(base + '/api/board/activity?after=0&through=1')).status === 401);
+  check("invalid history window is rejected", (await activity(2, 1)).status === 400 && (await activity('x', 1)).status === 400);
+  check("the page serves its activity module", (await fetch(base + '/board-activity.js')).status === 200);
   check("empty board reads", r.status === 200 && page.ok === true && page.items.length === 0 && page.counts.items === 0);
   check("owner email matches without case", (await status(asOwner(jwt({ email: "Owner@Example.com" })))) === 200);
   check("the sign-in by key is gone", (await fetch(`${base}/session`, { method: "POST", headers: { "content-type": "application/json", origin: base }, body: "{}" })).status === 404);  for (const f of ["/board.js", "/board.css", "/app.css"]) {
@@ -186,8 +195,11 @@ async function main() {
   // --- items
   let out = await call(K.alpha, "board_upsert_item", { item_id: "p1", project: "demo", kind: "project", title: "Demo", state: "in_progress" });
   check("create a project", out.ok === true && out.changed === true && out.item.revision === 1 && out.item.updated_by === "alpha");
+  const created = await snapshot(firstRevision);
+  check("new item invalidates snapshot even without an event", created.items?.length === 1 && created.revision !== firstRevision && created.next_since_seq === 0);
   out = await call(K.alpha, "board_upsert_item", { item_id: "p1", project: "demo", kind: "project", title: "Demo", state: "in_progress" });
   check("same content changes nothing", out.ok === true && out.changed === false && out.item.revision === 1);
+  check("presence or a no-op upsert does not reload the board", (await snapshot(created.revision)).unchanged);
   check("actor in the body is refused", code(await call(K.alpha, "board_upsert_item", { item_id: "p1", actor: "someone" })) === -32602);
   check("missing fields on create", code(await call(K.alpha, "board_upsert_item", { item_id: "new1", title: "x" })) === "INVALID");
   check("bad kind", code(await call(K.alpha, "board_upsert_item", { item_id: "x1", project: "demo", kind: "epic", title: "x", state: "planned" })) === "INVALID");
@@ -699,7 +711,9 @@ async function main() {
   check("a bad partner is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "hi", to: "devin" })) === "400 INVALID");
   check("an empty message is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "  " })) === "400 INVALID");
   check("a message over 20000 characters is refused", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "あ".repeat(20001) })) === "400 INVALID");
+  const beforeMessage = await snapshot();
   check("the owner sends a message", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "もう少し短くして" })) === "200 OK");
+  check("chat summary invalidates snapshot", (await snapshot(beforeMessage.revision)).items?.some(i => i.item_id === orderWork && i.chat?.open));
   check("one open turn per item", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "まだ?" })) === "409 HANDOFF_CONFLICT");
   chat = await chatOf(orderWork);
   const turnSeq = chat.body.open?.seq;
@@ -894,7 +908,10 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     mine.items[0].handoff?.to === "vps-claude" && mine.items[0].kind === "task", JSON.stringify(mine).slice(0, 400));
   check("board_my_work leaves out work for others", (await call(K.alpha, "board_my_work", { project: "scoped" })).items.length === 0);
   const req1 = mine.items[0]?.handoff?.request_id;
+  const beforePause = await snapshot();
   check("the owner stops everything", (await ownerCode({ op: "pause", paused: true })) === "200 OK");
+  const pausedPoll = await snapshot(beforePause.revision);
+  check("an idle snapshot immediately reflects the owner's pause", pausedPoll.unchanged && pausedPoll.paused?.paused === true);
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
   check("the page data says everything is stopped", page.paused?.paused === true && page.paused?.by === "page:owner", JSON.stringify(page.paused));
   check("board_my_work says it is stopped", (await call(K.vps, "board_my_work", { project: "scoped" })).paused === true);
@@ -1027,6 +1044,18 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   // --- page data
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
   check("page lists newest event first", page.events[0].seq > page.events[page.events.length - 1].seq);
+  const fresh = await snapshot(page.revision);
+  const bytes = value => Buffer.byteLength(JSON.stringify(value));
+  check("idle polling response is smaller than a populated page", fresh.unchanged && bytes(fresh) < bytes(page));
+  console.log(`board poll (local fixture: ${page.items.length} items, ${page.counts.events} events): ${bytes(page)} -> ${bytes(fresh)} JSON bytes`);
+  const cut = Math.floor(page.next_since_seq / 2);
+  const prefix = await (await activity(0, cut)).json();
+  const suffix = await (await activity(cut, page.next_since_seq)).json();
+  const timeline = [...prefix.events, ...suffix.events];
+  check("adjacent history windows join without gaps", prefix.history_epoch === page.history_epoch &&
+    timeline.length === page.counts.events && timeline.every((e, i) => e.seq === i + 1));
+  check("history contains typed actuals without note bodies", timeline.some(e => e.kind === 'requested') &&
+    timeline.some(e => e.kind === 'accepted') && timeline.some(e => e.from && e.to) && timeline.every(e => !('text' in e) && !('ref' in e)));
 
   // --- survives a restart
   const before = list.counts;
@@ -1037,6 +1066,7 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   writeTestEnv();
   await new Promise((r) => setTimeout(r, 1500));
   await start();
+  check("an unchanged revision survives a worker restart", (await snapshot(page.revision)).unchanged);
   const narrowed = await call(K.muse, "board_my_work", {});
   check("downgrading the writer hides previously accepted unaddressed tasks", narrowed.ok && !narrowed.items.some(item => item.item_id === "pile2"));
   list = await call(K.alpha, "board_list", {});
@@ -1044,6 +1074,21 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     `${JSON.stringify(before)} -> ${JSON.stringify(list.counts)}`);
   const afterRestart = list.items.map((i) => i.item_id);
   check("the order of the pile survives a restart", afterRestart.indexOf("late1") < afterRestart.indexOf("d3"));
+
+  // Go past both limits: 100 recent events on the board and 500 compact
+  // events per history request. The page's watermark bounds both reads.
+  for (let seq = page.next_since_seq; seq < 501; seq += 10) {
+    const batch = Array.from({ length: Math.min(10, 501 - seq) }, () => call(K.alpha, "board_add_event",
+      { item_id: "p1", kind: "note", text: "accepted REQ-20261120-aaaaaaaa" }));
+    if (!(await Promise.all(batch)).every(result => result.ok)) throw new Error("Could not seed local activity fixture");
+  }
+  const busy = await snapshot(page.revision);
+  const firstBatch = await (await activity(0, busy.next_since_seq)).json();
+  const rest = await (await activity(firstBatch.events.at(-1).seq, busy.next_since_seq)).json();
+  check("a note-only write invalidates the board, the recent feed stays capped", busy.events?.length === 100 && busy.events_truncated);
+  check("older activity is complete across the 500-event page boundary", firstBatch.events.length === 500 && rest.events.length >= 1 &&
+    [...firstBatch.events, ...rest.events].every((e, i) => e.seq === i + 1) && rest.events.at(-1).seq === busy.next_since_seq);
+  check("a writer's free-form note does not claim a historical acceptance", rest.events.at(-1).kind === "note");
 }
 
 let crashed = null;

@@ -136,8 +136,11 @@ export class BoardStore extends DurableObject<Env> {
     this.pokeWatchers();
     return result;
   }
-  async page(): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY)));
+  async page(since: string | null = null): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY), since));
+  }
+  async activity(after: number, through: number): Promise<Record<string, unknown>> {
+    return guarded(() => this.store.activity(after, through));
   }
   /** One conversation for the page (see Store.chatView). */
   async chat(itemId: string): Promise<Record<string, unknown>> {
@@ -451,7 +454,21 @@ const siteHandler = {
     if (path === "/api/board" && method === "GET") {
       const who = await accessUser(request, env);
       if (!who.ok) return accessFailure(who);
-      const data = await boardStub(env).page();
+      const data = await boardStub(env).page(url.searchParams.get("since"));
+      return data.ok === false ? failure(503, "STORAGE", "Board unavailable") : json(200, data);
+    }
+
+    if (path === "/api/board/activity" && method === "GET") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      const cursor = (name: string) => {
+        const raw = url.searchParams.get(name);
+        return raw && /^\d+$/.test(raw) ? Number(raw) : NaN;
+      };
+      const after = cursor("after"), through = cursor("through");
+      if (!Number.isSafeInteger(after) || !Number.isSafeInteger(through) || after > through)
+        return failure(400, "INVALID", "Expected an ordered pair of event sequence numbers");
+      const data = await boardStub(env).activity(after, through);
       return data.ok === false ? failure(503, "STORAGE", "Board unavailable") : json(200, data);
     }
 

@@ -1,4 +1,4 @@
-'use strict';
+import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './board-activity.js';
 
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -42,8 +42,13 @@
   let lastData = null;
   let selectedItemId = null;
   let clearDetail = null;
+  let history = null;
+  let renderedHistoryCursor = null;
+  let weekEnd = null;
+  let reloadQueued = false;
   try {
-    if (localStorage.getItem('iris-board-view') === 'list') $('board-view').value = 'list';
+    const view = localStorage.getItem('iris-board-view');
+    if (view === 'list' || view === 'gantt') $('board-view').value = view;
   } catch { /* Use the default view when storage is unavailable. */ }
   // True when the board says it takes the owner's writes from this page.
   let canWrite = false;
@@ -709,7 +714,53 @@
     };
     return { tree: list(roots, 0), unlinked: list(unlinked, 0), unlinkedCount: unlinked.length };
   }
-  function compactList(items) {
+  function weekCells(days, first) {
+    const cells = el('span', 'board-days');
+    for (let day = first; day < first + 7; day++) {
+      const labels = days.get(day);
+      const date = dateLabel(day);
+      const cell = el('span', labels ? 'recorded' : '', labels ? '●' : '·');
+      cell.title = date + '　' + (labels ? [...labels].join('・') : '記録なし');
+      cell.setAttribute('aria-label', cell.title);
+      cells.append(cell);
+    }
+    return cells;
+  }
+  function ganttTrack(facts, range) {
+    const track = el('span', 'board-track');
+    const length = range.end - range.start + 1;
+    const place = (node, day) => { node.style.left = ((day - range.start) / length * 100) + '%'; };
+    for (const period of facts.periods) {
+      const bar = el('span', 'board-period' + (period.ongoing ? ' ongoing' : ''));
+      place(bar, period.start);
+      bar.style.width = ((period.end - period.start + 1) / length * 100) + '%';
+      bar.title = dateLabel(period.start) + ' 〜 ' + dateLabel(period.end) + (period.ongoing ? '（継続中）' : '');
+      bar.setAttribute('aria-label', bar.title);
+      track.append(bar);
+    }
+    for (const [day, labels] of facts.days) {
+      if (!['作成', '依頼', '受理', '完了', '停止', '再開'].some(label => labels.has(label))) continue;
+      const pin = el('span', 'board-milestone');
+      place(pin, day + .5);
+      pin.title = dateLabel(day) + '　' + [...labels].join('・');
+      pin.setAttribute('aria-label', pin.title);
+      track.append(pin);
+    }
+    if (facts.unknownEnd) track.append(el('span', 'board-unknown', '終了日不明'));
+    return track;
+  }
+  function activityDetail(facts) {
+    const details = el('details', 'board-actual-detail');
+    details.append(el('summary', null, '実績日の内訳（' + facts.days.size + '日）'));
+    const list = el('ul');
+    for (const day of [...facts.days.keys()].sort((a, b) => b - a))
+      list.append(el('li', null, dateLabel(day) + '　' + [...facts.days.get(day)].join('・')));
+    if (facts.unknownEnd) list.append(el('li', null, '終了日不明'));
+    details.append(list);
+    return details;
+  }
+  function compactList(items, factsById, range) {
+    const gantt = $('board-view').value === 'gantt';
     const layout = el('div', 'board-list-layout');
     const rows = el('div', 'board-list-groups');
     const pane = el('section', 'board-detail-pane');
@@ -744,6 +795,7 @@
         if (event.key === 'Escape' && !event.defaultPrevented) dismiss();
       };
       pane.replaceChildren(close, el('p', 'board-detail-id', item.item_id), card(item, items));
+      if (factsById) pane.append(activityDetail(factsById.get(item.item_id)));
       pane.hidden = false;
       if (focus) close.focus({ preventScroll: true });
     }
@@ -751,7 +803,7 @@
       if (visited.has(item.item_id)) return;
       visited.add(item.item_id);
       const isClosed = item.state === 'done' || item.state === 'stopped';
-      const button = el('button', 'board-summary');
+      const button = el('button', 'board-summary ' + (gantt ? 'gantt-row' : 'dated-row'));
       button.type = 'button';
       button.setAttribute('aria-controls', pane.id);
       button.setAttribute('aria-expanded', 'false');
@@ -770,7 +822,14 @@
       const id = el('span', 'board-summary-id', item.item_id);
       id.title = item.item_id;
       const time = el('time', null, when(item.updated_at));
-      button.append(id, stateBadge(item.state), title, el('span', 'board-summary-who', assignee ? targetLabel(assignee) : '—'), time);
+      const facts = factsById?.get(item.item_id);
+      if (gantt) {
+        title.prepend(id);
+        button.append(title, stateBadge(item.state), facts ? ganttTrack(facts, range) : el('span', 'board-track'));
+      } else {
+        button.append(id, stateBadge(item.state), title, el('span', 'board-summary-who', assignee ? targetLabel(assignee) : '—'), time);
+        button.append(facts ? weekCells(facts.days, range.start) : el('span', 'board-days'));
+      }
       button.addEventListener('click', () => select(item, button, true));
       (isClosed ? closed : open).append(button);
       if (selectedItemId === item.item_id) select(item, button, false);
@@ -781,7 +840,22 @@
     for (const [label, group] of [['進行中・予定・待ち', open], ['完了・停止', closed]]) {
       const heading = el('h3', 'board-list-heading', label);
       heading.append(el('span', 'count', group.childElementCount + ' 件'));
-      rows.append(heading, group);
+      rows.append(heading);
+      if (group.childElementCount) {
+        const axis = el('div', 'board-axis ' + (gantt ? 'gantt-row' : 'dated-row'));
+        axis.setAttribute('aria-hidden', 'true');
+        const ticks = el('span', gantt ? 'board-range' : 'board-days');
+        if (gantt) {
+          ticks.append(el('span', null, dateLabel(range.start)));
+          if (range.end - range.start >= 14) ticks.append(el('span', null, dateLabel(Math.floor((range.start + range.end) / 2)).slice(5)));
+          if (range.start !== range.end) ticks.append(el('span', null, dateLabel(range.end)));
+        } else {
+          for (let day = range.start; day <= range.end; day++) ticks.append(el('span', null, Number(dateLabel(day).slice(-2)) + '日'));
+        }
+        axis.append(ticks);
+        rows.append(axis);
+      }
+      rows.append(group);
     }
     layout.append(rows, pane);
     return layout;
@@ -807,6 +881,32 @@
       byProject.get(item.project).push(item);
     }
     projectChoices([...byProject.keys()]);
+    const view = $('board-view').value;
+    const today = boardDay(data.generated_at);
+    const end = weekEnd ?? today;
+    const range = view === 'gantt' ? { start: Infinity, end: -Infinity } : { start: end - 6, end };
+    const ready = history && history.epoch === data.history_epoch && history.cursor === data.next_since_seq;
+    renderedHistoryCursor = ready && view !== 'cards' ? history.cursor : null;
+    const facts = ready && view !== 'cards' ? new Map() : null;
+    if (facts) for (const item of items) {
+      if (shownProject && item.project !== shownProject) continue;
+      const entry = actuals(item, history.items.get(item.item_id), data.generated_at);
+      facts.set(item.item_id, entry);
+      if (view === 'gantt') {
+        for (const day of entry.days.keys()) {
+          range.start = Math.min(range.start, day);
+          range.end = Math.max(range.end, day);
+        }
+        for (const period of entry.periods) range.end = Math.max(range.end, period.end);
+      }
+    }
+    if (!Number.isFinite(range.start)) range.start = range.end = today;
+    $('board-calendar').hidden = view === 'cards';
+    $('board-week').hidden = view !== 'list';
+    $('board-date').value = dateLabel(end);
+    $('board-history-status').textContent = !ready ? '実績の履歴を読み込み中…' : view === 'gantt'
+      ? '実績ガント（日本時間）　棒は作成・再開から完了・停止まで。点線の棒は継続中、点は節目の日。行を選ぶと詳細で実績日を確認できます。'
+      : dateLabel(range.start) + ' 〜 ' + dateLabel(range.end) + '（日本時間）　● は記録のある日。行を選ぶと実績日の内訳を確認できます。';
     for (const [project, list] of byProject) {
       if (shownProject && project !== shownProject) continue;
       const section = el('section', 'board-project');
@@ -816,8 +916,8 @@
       section.append(title);
       if (canWrite && data.scopes) section.append(scopeControl(project, scoped));
       if (canWrite) section.append(addControl(project, list));
-      if ($('board-view').value === 'list') {
-        section.append(compactList(list));
+      if (view !== 'cards') {
+        section.append(compactList(list, facts, range));
         host.append(section);
         continue;
       }
@@ -845,7 +945,10 @@
     }
     if (!events.length) eventList.append(el('li', 'empty', 'まだ出来事がありません。'));
     $('board-event-count').textContent = String(events.length);
-    $('board-status').textContent = '項目 ' + items.length + ' 件 / 出来事の合計 ' + (data.counts?.events ?? '未確認') + ' 件';
+    updateConnection(data);
+  }
+  function updateConnection(data) {
+    $('board-status').textContent = '項目 ' + data.items.length + ' 件 / 出来事の合計 ' + (data.counts?.events ?? '未確認') + ' 件';
     $('board-observed').textContent = '確認時点：' + when(data.generated_at);
   }
   // The project list on top: choosing one shows only that project, so its
@@ -879,7 +982,7 @@
     selectedItemId = hit.item_id;
     status.textContent = '見つかりました：' + hit.project + ' ／ ' + short(hit.title);
     showProject(hit.project);
-    const target = $('board-view').value === 'list'
+    const target = $('board-view').value !== 'cards'
       ? document.querySelector('.board-summary[aria-expanded="true"]')
       : [...document.querySelectorAll('.board-card')].find((n) => n.dataset.itemId === hit.item_id);
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -888,22 +991,64 @@
   $('board-view').addEventListener('change', () => {
     try { localStorage.setItem('iris-board-view', $('board-view').value); } catch { /* Device preference only. */ }
     if (lastData) render(lastData);
+    if ($('board-view').value !== 'cards' && (!history || history.cursor !== lastData?.next_since_seq)) load(true);
   });
+  function setWeek(end) {
+    weekEnd = end;
+    if (lastData) render(lastData);
+  }
+  $('board-date').addEventListener('change', () => {
+    const value = $('board-date').valueAsNumber;
+    setWeek(Number.isFinite(value) ? Math.floor(value / 86400000) : null);
+  });
+  $('board-prev').addEventListener('click', () => setWeek((weekEnd ?? boardDay(lastData.generated_at)) - 7));
+  $('board-next').addEventListener('click', () => setWeek((weekEnd ?? boardDay(lastData.generated_at)) + 7));
+  $('board-today').addEventListener('click', () => setWeek(null));
   $('board-search').addEventListener('submit', (event) => { event.preventDefault(); search($('board-search-input').value); });
   // `force` is a reload the person asked for, or one that follows their own write.
   async function load(force) {
-    if (loading) return;
+    if (loading) { if (force === true) reloadQueued = true; return; }
     if (force !== true && editing()) return;
     loading = true;
     try {
-      const response = await fetch('/api/board', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      const options = { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' };
+      const query = lastData?.revision ? '?since=' + encodeURIComponent(lastData.revision) : '';
+      const response = await fetch('/api/board' + query, options);
       if (response.status === 401) { $('board-status').textContent = '本人用キーでの接続が切れています。このページを開き直してください。'; return; }
       if (!response.ok) { $('board-status').textContent = '看板を取得できませんでした。'; return; }
-      lastData = await response.json();
-      render(lastData);
+      const previous = lastData;
+      const next = mergeBoard(previous, await response.json());
+      if (force !== true && editing()) return;
+      lastData = next;
+      if (!history || history.epoch !== next.history_epoch || history.cursor > next.next_since_seq)
+        history = new ActivityHistory(next.history_epoch);
+      // Preserve focus and expanded details when a poll changes only the clock.
+      const clockOnly = next.unchanged && previous.items === next.items && previous.can_write === next.can_write &&
+        ($('board-view').value === 'cards' || renderedHistoryCursor === next.next_since_seq) &&
+        boardDay(previous.generated_at) === boardDay(next.generated_at) &&
+        ['paused', 'route', 'scopes'].every(key => JSON.stringify(previous[key]) === JSON.stringify(next[key]));
+      if (clockOnly) updateConnection(next);
+      else render(next);
+      const through = next.next_since_seq;
+      if ($('board-view').value !== 'cards' && history.cursor < through) {
+        $('board-history-status').textContent = '実績の履歴を読み込み中…';
+        try {
+          while ($('board-view').value !== 'cards' && history.cursor < through) {
+            const page = await fetch('/api/board/activity?after=' + history.cursor + '&through=' + through, options);
+            if (!page.ok) throw new Error('History unavailable');
+            history.append(await page.json(), through);
+          }
+          if (!editing()) render(lastData);
+        } catch {
+          $('board-history-status').textContent = '実績の履歴を取得できませんでした。「読み直す」で続きを取得できます。';
+        }
+      }
     } catch {
       $('board-status').textContent = '接続できません。Many Irisが起動しているか確認してください。';
-    } finally { loading = false; }
+    } finally {
+      loading = false;
+      if (reloadQueued) { reloadQueued = false; load(true); }
+    }
   }
   $('board-refresh').addEventListener('click', () => load(true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });

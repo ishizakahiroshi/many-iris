@@ -117,6 +117,31 @@ body.chat-open::before{content:"";position:fixed;inset:0;background:rgba(36,31,2
 }
 .board-detail-pane > button { margin-bottom: .6rem; }
 .board-detail-id { margin: 0 0 .4rem; color: var(--soft); font-size: .78rem; overflow-wrap: anywhere; }
+.board-list-layout:has(.board-detail-pane[hidden]) { grid-template-columns: minmax(0, 1fr); }
+.board-calendar { margin: 1rem 0; color: var(--soft); font-size: .88rem; }
+.board-calendar p { margin: .5rem 0; }
+#board-week:not([hidden]) { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.board-axis { display: grid; align-items: end; padding: .3rem .55rem; gap: .55rem; color: var(--soft); font-size: .72rem; font-variant-numeric: tabular-nums; }
+.board-summary.dated-row, .board-axis.dated-row { grid-template-columns: minmax(2.5rem,.8fr) 3.8rem minmax(5rem,2fr) minmax(2rem,.6fr) minmax(3.3rem,.85fr) minmax(12rem,1.65fr); }
+.board-summary.gantt-row, .board-axis.gantt-row { grid-template-columns: minmax(6rem,1fr) 4.4rem minmax(7rem,3fr); }
+.board-axis .board-days { grid-column: 6; }
+.board-days { display: grid; grid-template-columns: repeat(7, minmax(0,1fr)); text-align: center; align-items: center; }
+.board-days > span { padding: .12rem 0; }
+.board-summary .board-days > span { color: var(--soft); border-inline-start: 1px solid var(--line); }
+.board-summary .board-days .recorded { color: #176a64; background: #e2f2ed; }
+.board-range { grid-column: 3; display: flex; justify-content: space-between; gap: .3rem; }
+.board-track { position: relative; display: block; height: 1.65rem; background: repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px 25%); }
+.board-period { position: absolute; top: .54rem; height: .58rem; min-width: 1px; border-radius: 2px; background: #29796e; }
+.board-period.ongoing { background: #d3ebe3; border: 1px dashed #286457; box-sizing: border-box; }
+.board-milestone { position: absolute; top: .62rem; width: .42rem; height: .42rem; background: #1e4944; transform: translateX(-50%) rotate(45deg); }
+.board-unknown { position: absolute; inset: 0 .4rem auto auto; color: var(--soft); background: var(--card); font-size: .73rem; }
+.board-actual-detail { margin-top: .7rem; }
+.board-actual-detail ul { padding-inline-start: 1.25rem; font-size: .84rem; }
+@media (max-width: 1000px) {
+  .board-summary.dated-row, .board-axis.dated-row { grid-template-columns: minmax(2.4rem,.7fr) auto minmax(5rem,2fr) minmax(2rem,.6fr) minmax(3rem,.8fr); }
+  .dated-row > .board-days { grid-column: 1 / -1; }
+  .board-axis.dated-row { position: sticky; top: 0; z-index: 1; background: var(--card); }
+}
 @media (max-width: 800px) {
   .board-list-layout { display: block; }
   .board-detail-pane { position: fixed; inset: auto .5rem .5rem; max-height: 62dvh; z-index: 12; box-shadow: 0 -4px 22px #241f1a33; }
