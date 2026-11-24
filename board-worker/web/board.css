@@ -53,7 +53,15 @@
 .board-find-field{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;flex:1 1 300px;min-width:0;margin:0;font-size:.9rem}
 .board-find-field label{display:inline-flex;margin:0}
 .board-find-field>span,.board-find-field label span{font-weight:650;white-space:nowrap}
-.board-find select,.board-find input{font:inherit;font-size:.9rem;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);flex:1 1 auto;width:auto;min-width:0;margin:0}
+.board-find select,.board-find input[type=search]{font:inherit;font-size:.9rem;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);flex:1 1 auto;width:auto;min-width:0;margin:0}
+.board-view-options{display:flex;flex-wrap:wrap;gap:2px;min-width:0;margin:0;padding:2px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.board-view-options label{position:relative;flex:1 0 auto}
+.board-view-options input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}
+.board-view-options span{display:grid;place-items:center;width:100%;min-height:40px;padding:0 9px;border-radius:7px;font-size:.86rem}
+.board-view-options label:hover span{background:var(--card)}
+.board-view-options input:checked+span{background:var(--ink);color:var(--card)}
+.board-view-options input:focus-visible+span{outline:2px solid var(--accent);outline-offset:1px}
+@media(forced-colors:active){.board-view-options input:checked+span{outline:2px solid Highlight;outline-offset:-3px}}
 .board-find button{font-size:.82rem;padding:5px 14px;white-space:nowrap;flex:0 0 auto;margin:0}
 .board-write-status#board-search-status{margin:0}
 .board-card.found{outline:3px solid var(--accent);outline-offset:2px}

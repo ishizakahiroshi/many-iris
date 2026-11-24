@@ -46,9 +46,11 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
   let renderedHistoryCursor = null;
   let weekEnd = null;
   let reloadQueued = false;
+  const viewOptions = $('board-view');
+  const selectedView = () => viewOptions.querySelector('input:checked').value;
   try {
     const view = localStorage.getItem('iris-board-view');
-    if (view === 'list' || view === 'gantt') $('board-view').value = view;
+    if (view === 'list' || view === 'gantt') viewOptions.querySelector('input[value="' + view + '"]').checked = true;
   } catch { /* Use the default view when storage is unavailable. */ }
   // True when the board says it takes the owner's writes from this page.
   let canWrite = false;
@@ -760,7 +762,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     return details;
   }
   function compactList(items, factsById, range) {
-    const gantt = $('board-view').value === 'gantt';
+    const gantt = selectedView() === 'gantt';
     const layout = el('div', 'board-list-layout');
     const rows = el('div', 'board-list-groups');
     const pane = el('section', 'board-detail-pane');
@@ -881,7 +883,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
       byProject.get(item.project).push(item);
     }
     projectChoices([...byProject.keys()]);
-    const view = $('board-view').value;
+    const view = selectedView();
     const today = boardDay(data.generated_at);
     const end = weekEnd ?? today;
     const range = view === 'gantt' ? { start: Infinity, end: -Infinity } : { start: end - 6, end };
@@ -982,16 +984,17 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     selectedItemId = hit.item_id;
     status.textContent = '見つかりました：' + hit.project + ' ／ ' + short(hit.title);
     showProject(hit.project);
-    const target = $('board-view').value !== 'cards'
+    const target = selectedView() !== 'cards'
       ? document.querySelector('.board-summary[aria-expanded="true"]')
       : [...document.querySelectorAll('.board-card')].find((n) => n.dataset.itemId === hit.item_id);
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   $('board-project').addEventListener('change', (event) => { foundId = null; $('board-search-status').textContent = ''; showProject(event.target.value); });
-  $('board-view').addEventListener('change', () => {
-    try { localStorage.setItem('iris-board-view', $('board-view').value); } catch { /* Device preference only. */ }
+  viewOptions.addEventListener('change', () => {
+    const view = selectedView();
+    try { localStorage.setItem('iris-board-view', view); } catch { /* Device preference only. */ }
     if (lastData) render(lastData);
-    if ($('board-view').value !== 'cards' && (!history || history.cursor !== lastData?.next_since_seq)) load(true);
+    if (view !== 'cards' && (!history || history.cursor !== lastData?.next_since_seq)) load(true);
   });
   function setWeek(end) {
     weekEnd = end;
@@ -1024,16 +1027,16 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
         history = new ActivityHistory(next.history_epoch);
       // Preserve focus and expanded details when a poll changes only the clock.
       const clockOnly = next.unchanged && previous.items === next.items && previous.can_write === next.can_write &&
-        ($('board-view').value === 'cards' || renderedHistoryCursor === next.next_since_seq) &&
+        (selectedView() === 'cards' || renderedHistoryCursor === next.next_since_seq) &&
         boardDay(previous.generated_at) === boardDay(next.generated_at) &&
         ['paused', 'route', 'scopes'].every(key => JSON.stringify(previous[key]) === JSON.stringify(next[key]));
       if (clockOnly) updateConnection(next);
       else render(next);
       const through = next.next_since_seq;
-      if ($('board-view').value !== 'cards' && history.cursor < through) {
+      if (selectedView() !== 'cards' && history.cursor < through) {
         $('board-history-status').textContent = '実績の履歴を読み込み中…';
         try {
-          while ($('board-view').value !== 'cards' && history.cursor < through) {
+          while (selectedView() !== 'cards' && history.cursor < through) {
             const page = await fetch('/api/board/activity?after=' + history.cursor + '&through=' + through, options);
             if (!page.ok) throw new Error('History unavailable');
             history.append(await page.json(), through);
