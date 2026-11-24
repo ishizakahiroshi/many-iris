@@ -80,14 +80,16 @@ function consentPage(details: ConsentDescription, handle: string, actor: string)
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Many Iris 看板への接続の許可</title>
-<h1>${name} に、看板への書き込みを許可しますか?</h1>
+<h1>${name} に許可する接続を選んでください</h1>
 ${origin}
 <p>鍵の送り先: <strong>${escape(details.redirectHost)}</strong></p>
 ${loopback}
-<p>許可すると、この app が書いた項目と出来事は、書いた人「${escape(actor)}」として記録されます。看板の読み取りもできるようになります。</p>
 <form method="post">
 <input type="hidden" name="handle" value="${escape(handle)}">
-<p><button name="decision" value="approve">許可する</button> <button name="decision" value="deny">許可しない</button></p>
+<p>dots 専用の接続では、dots 宛ての仕事を受け取り、その結果と確認依頼を返せます。</p>
+<p><button name="decision" value="approve-dots">dots の担当として許可する</button></p>
+<p>通常の接続では、看板全体を読み書きできます。操作は「${escape(actor)}」として記録されます。</p>
+<p><button name="decision" value="approve">看板全体への接続を許可する</button> <button name="decision" value="deny">許可しない</button></p>
 </form>
 </html>`;
 }
@@ -141,19 +143,26 @@ export async function authorize(request: Request, env: AuthorizeEnv): Promise<Re
     if (declared > 4096) return plain(413, "Request body is too large");
     const form = await request.formData();
     const handle = String(form.get("handle") ?? "");
-    if (form.get("decision") !== "approve") {
+    const decision = form.get("decision");
+    if (decision !== "approve" && decision !== "approve-dots") {
       const denied = await oauth.denyConsent(request, handle);
       return redirect(denied.redirectTo, denied.headers);
     }
     const approved = await oauth.approveConsent(request, handle, { scope: [SCOPE] });
     const details = await oauth.describeConsent(approved.request);
-    const actor = actorFor(details);
+    // Only this owner's explicit consent can select the worker role. Client
+    // names and request parameters cannot assign a handoff identity.
+    const restricted = decision === "approve-dots";
+    const actor = restricted ? "dots" : actorFor(details);
+    const ownerId = encodeURIComponent(who.email);
     const { redirectTo } = await oauth.completeAuthorization({
       request: approved.request,
-      userId: encodeURIComponent(who.email),
+      // Reconnecting one role replaces its previous grant for this client
+      // without revoking the owner's other connection to the same resource.
+      userId: restricted ? "dots@" + ownerId : ownerId,
       metadata: { actor },
       scope: [SCOPE],
-      props: { actor, confirmationSource: "grant:" + crypto.randomUUID() },
+      props: { actor, policy: restricted ? "restricted" : "trusted", confirmationSource: "grant:" + crypto.randomUUID() },
     });
     return redirect(redirectTo, approved.headers);
   } catch (error) {

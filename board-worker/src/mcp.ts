@@ -309,7 +309,9 @@ export async function handle(request: unknown, run: ToolRunner, policy: ToolPoli
         protocolVersion: version,
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
-        instructions: "Many Iris board. Read with board_list. Work you take with board_accept_handoff is reported with the fenced tools (board_progress_handoff, board_complete_handoff); plain writes with board_upsert_item and board_add_event stay for everything else, and for your own writes on an item you are running they must carry the run's request_id and generation. Your name on the board comes from your key.",
+        instructions: policy === "restricted"
+          ? "Use board_my_work for your assigned work. If paused or empty, do not start. Accept a requested item with its item_id and request_id; use the returned generation with board_heartbeat_handoff, board_progress_handoff and board_complete_handoff."
+          : "Many Iris board. Read with board_list. Work you take with board_accept_handoff is reported with the fenced tools (board_progress_handoff, board_complete_handoff); plain writes with board_upsert_item and board_add_event stay for everything else, and for your own writes on an item you are running they must carry the run's request_id and generation. Your name on the board comes from your key.",
       });
     }
     case "server/discover":

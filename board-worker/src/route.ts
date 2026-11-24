@@ -13,7 +13,7 @@
  * server, `local-*` on the owner's PC. `owner` and `hold` are not writers.
  */
 export const HANDOFF_TARGETS = [
-  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "owner", "hold",
+  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "dots", "owner", "hold",
 ] as const;
 export type HandoffTarget = (typeof HANDOFF_TARGETS)[number];
 
