@@ -4,7 +4,7 @@
 // registration (CIMD and DCR), the token endpoint, PKCE and token storage. This
 // file owns /authorize: the person must be signed in through Cloudflare Access
 // as a board owner, and then approves the client on a consent page. The grant
-// carries only the actor name the board records for the client's writes.
+// carries the writer name and a private confirmation namespace unique to this consent.
 import {
   AuthorizationError,
   CimdFetchError,
@@ -153,7 +153,7 @@ export async function authorize(request: Request, env: AuthorizeEnv): Promise<Re
       userId: encodeURIComponent(who.email),
       metadata: { actor },
       scope: [SCOPE],
-      props: { actor },
+      props: { actor, confirmationSource: "grant:" + crypto.randomUUID() },
     });
     return redirect(redirectTo, approved.headers);
   } catch (error) {

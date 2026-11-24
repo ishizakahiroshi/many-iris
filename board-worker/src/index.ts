@@ -19,6 +19,7 @@ import chatHtml from "../web/chat.html";
 import { accessUser, type AccessResult } from "./access";
 import { ATTACHMENT_MAX_BYTES, IMAGE_MAX_BYTES, attachmentKey, cleanName, isImageType, parseText, sliceChars, sniffImage, toBase64 } from "./attachments";
 import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } from "./dispatch.ts";
+import { ConfirmationInbox } from "./confirmations";
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
@@ -74,12 +75,21 @@ function limitsFrom(env: Env): Limits {
 
 export class BoardStore extends DurableObject<Env> {
   private store: Store;
+  private inbox: ConfirmationInbox;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN));
-    ctx.blockConcurrencyWhile(async () => this.store.init());
+    this.inbox = new ConfirmationInbox(ctx.storage);
+    ctx.blockConcurrencyWhile(async () => {
+      this.store.init();
+      this.inbox.init();
+    });
   }
-  async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted"): Promise<Record<string, unknown>> {
+  async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted", source: string | null = null): Promise<Record<string, unknown>> {
+    if (tool === "iris_request_confirmation" || tool === "iris_confirmation_status" || tool === "iris_close_confirmation") {
+      if (!source) return { ok: false, error: { code: "SOURCE_REQUIRED", detail: "Reconnect the client to register its confirmation identity" } };
+      return guarded(() => this.inbox.forSource(tool, source, actor, args, this.store.pauseState().paused));
+    }
     // Every call with a writer's key says that writer is running (the owner's
     // order passes over takers that stopped coming). A failure here must not
     // cost the call itself.
@@ -138,6 +148,12 @@ export class BoardStore extends DurableObject<Env> {
   }
   async page(since: string | null = null): Promise<Record<string, unknown>> {
     return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY), since));
+  }
+  async confirmations(): Promise<Record<string, unknown>> {
+    return guarded(() => this.inbox.list());
+  }
+  async approveConfirmation(args: unknown): Promise<Record<string, unknown>> {
+    return guarded(() => this.inbox.approve(args, this.store.pauseState().paused));
   }
   async activity(after: number, through: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.activity(after, through));
@@ -305,6 +321,7 @@ function ownerWriteStatus(code: unknown): number {
       return 404;
     case "FORBIDDEN":
       return 403;
+    case "CONFIRMATION_CONFLICT":
     case "REVISION_CONFLICT":
     case "HANDOFF_CONFLICT":
     case "STALE_GENERATION":
@@ -389,7 +406,7 @@ const mcpHandler = {
     const watchPath = url.pathname === MCP_PATH || url.pathname === `${MCP_PATH}/watch`;
     if (!watchPath) return failure(404, "NOT_FOUND", "Not found");
     if (foreignOrigin(request, url)) return failure(403, "ORIGIN", "Requests from other sites are refused");
-    const props = (ctx as ExecutionContext & { props?: { actor?: unknown; policy?: unknown } }).props;
+    const props = (ctx as ExecutionContext & { props?: { actor?: unknown; policy?: unknown; confirmationSource?: unknown } }).props;
     const actor = props?.actor;
     if (typeof actor !== "string" || !validActor(actor)) return failure(401, "AUTH", "A valid key is required");
     const policy = props?.policy === "restricted" ? "restricted" : "trusted";
@@ -408,7 +425,8 @@ const mcpHandler = {
     const body = await readBody(request);
     if (body instanceof Response) return body;
     const stub = boardStub(env);
-    const result = await handle(body.value, (tool, args) => stub.run(tool, actor, args, policy), policy);
+    const source = typeof props?.confirmationSource === "string" ? props.confirmationSource : null;
+    const result = await handle(body.value, (tool, args) => stub.run(tool, actor, args, policy, source), policy);
     if (result === null) return respond(202, null, "text/plain");
     return json(result.status, result.body);
   },
@@ -451,6 +469,21 @@ const siteHandler = {
       return html(chatHtml);
     }
 
+    if (path === "/api/confirmations") {
+      const who = await accessUser(request, env);
+      if (!who.ok) return accessFailure(who);
+      const stub = boardStub(env);
+      if (method === "GET") {
+        const result = await stub.confirmations();
+        return result.ok ? json(200, result) : refusal(result);
+      }
+      if (method !== "POST") return failure(405, "METHOD", "Use GET or POST");
+      if (request.headers.get("origin") !== url.origin) return failure(403, "ORIGIN", "Requests from other sites are refused");
+      const body = await readBody(request);
+      if (body instanceof Response) return body;
+      const result = await stub.approveConfirmation(body.value);
+      return result.ok ? json(200, result) : refusal(result);
+    }
     if (path === "/api/board" && method === "GET") {
       const who = await accessUser(request, env);
       if (!who.ok) return accessFailure(who);
@@ -617,7 +650,7 @@ function providerFor(origin: string): OAuthProvider<Env> {
     // checked against the hashes in BOARD_WRITERS, never forwarded anywhere.
     resolveExternalToken: async ({ token, env }) => {
       const who = await authenticate(env.BOARD_WRITERS, token);
-      if (who.ok) return { props: { actor: who.actor, policy: who.policy }, audience: resource };
+      if (who.ok) return { props: { actor: who.actor, policy: who.policy, confirmationSource: who.confirmationSource }, audience: resource };
       if (who.reason === "disabled") {
         throw new ExternalTokenError("invalid_token", { description: "This key is switched off", statusCode: 403 });
       }

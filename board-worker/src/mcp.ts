@@ -12,6 +12,7 @@ export type ToolRunner = (tool: string, args: Json) => Promise<Json>;
 export type ToolPolicy = "trusted" | "restricted";
 
 const RESTRICTED_TOOLS = new Set([
+  "iris_request_confirmation", "iris_confirmation_status", "iris_close_confirmation",
   "board_my_work", "board_accept_handoff",
   "board_heartbeat_handoff", "board_progress_handoff", "board_complete_handoff",
 ]);
@@ -224,6 +225,26 @@ export const TOOLS: Json[] = [
       session_id: text("The running session's id (required for resolution started)"),
     },
     ["request_id", "resolution"],
+  ),
+  tool(
+    "iris_request_confirmation",
+    "Ask the board owner to approve this specific question. Retry using the same request_id and identical fields. Set local_only for questions that must be answered at the source.",
+    { request_id: text("A random 32-digit lowercase hexadecimal id"), project: text("Project, 1 to 80 characters"),
+      agent: text("Agent, 1 to 80 characters"), task: text("Task, 1 to 160 characters"), question: text("Question, 1 to 1000 characters"),
+      local_only: { type: "boolean", description: "Show in the inbox with no remote approval button" } },
+    ["request_id", "project", "agent", "task", "question"],
+  ),
+  tool(
+    "iris_confirmation_status",
+    "Check one of this source's questions. Only approved permits this source to deliver the answer to the matching live prompt.",
+    { request_id: text("The question's request_id") },
+    ["request_id"],
+  ),
+  tool(
+    "iris_close_confirmation",
+    "Close this source's question after delivery or when it is no longer actionable.",
+    { request_id: text("The question's request_id"), outcome: { type: "string", enum: ["applied", "expired", "unknown"] } },
+    ["request_id", "outcome"],
   )
 ];
 

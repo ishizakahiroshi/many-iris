@@ -10,7 +10,7 @@ interface KeyEntry {
   policy: "trusted" | "restricted";
 }
 export type AuthResult =
-  | { ok: true; actor: string; policy: "trusted" | "restricted" }
+  | { ok: true; actor: string; confirmationSource: string; policy: "trusted" | "restricted" }
   | { ok: false; reason: "missing" | "unknown" | "disabled" | "unavailable" };
 
 function fromHex(hex: string): Uint8Array {
@@ -69,7 +69,8 @@ export async function authenticate(raw: string | undefined, token: string | null
   }
   if (found === null) return { ok: false, reason: "unknown" };
   if (!found.enabled) return { ok: false, reason: "disabled" };
-  return { ok: true, actor: found.actor, policy: found.policy };
+  const fingerprint = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return { ok: true, actor: found.actor, policy: found.policy, confirmationSource: "writer:" + fingerprint };
 }
 
 export function bearer(request: Request): string | null {

@@ -3,6 +3,7 @@
 // folder is removed at the end.
 //
 //   node test/board.test.mjs
+import { checkConfirmations, ageTestConfirmations } from "./confirmation-cases.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -179,7 +180,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("twenty tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
+  check("twenty-three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch,iris_request_confirmation,iris_confirmation_status,iris_close_confirmation",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -187,10 +188,12 @@ async function main() {
   check("unknown tool", code(await call(K.alpha, "board_delete", {})) === -32602);
   res = await rpc(K.restricted, "tools/list");
   check("restricted discovery exposes only own-work and run reporting",
-    res.body.result?.tools?.map((t) => t.name).join(",") === "board_my_work,board_accept_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff");
+    res.body.result?.tools?.map((t) => t.name).join(",") === "board_my_work,board_accept_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,iris_request_confirmation,iris_confirmation_status,iris_close_confirmation");
   check("restricted call cannot reach legacy attachment reads", code(await call(K.restricted, "board_chat_attachment", { attachment_id: "0".repeat(32) })) === -32602);
   check("restricted call cannot reach board_list", code(await call(K.restricted, "board_list", {})) === -32602);
   check("restricted call cannot reach request status", code(await call(K.restricted, "board_request_status", { item_id: "synthetic-b" })) === -32602);
+
+  await checkConfirmations({ base, asOwner, call, code, check, source: K.alpha, other: K.restricted });
 
   // --- items
   let out = await call(K.alpha, "board_upsert_item", { item_id: "p1", project: "demo", kind: "project", title: "Demo", state: "in_progress" });
@@ -347,6 +350,22 @@ async function main() {
   check("the code works once", (await tokenRequest({ ...grant, code: code2, code_verifier: verifier })).status === 400);
   check("a replayed code revokes the tokens it gave",
     (await mcpRaw(tokens.access_token, { jsonrpc: "2.0", id: 1, method: "ping", params: {} })).status === 401);
+
+  // A second grant for the same client and owner has its own confirmation namespace.
+  async function newGrant() {
+    const auth = await answer(await consent("confirmation"), "approve");
+    const value = new URL(auth.headers.get("location")).searchParams.get("code");
+    return (await tokenRequest({ ...grant, code: value, code_verifier: verifier })).json();
+  }
+  const alphaGrant = await newGrant();
+  const consentRequest = { request_id: randomBytes(16).toString("hex") };
+  const oauthQuestion = { ...consentRequest, project: "demo", agent: "AI", task: "Choose", question: "Continue?" };
+  check("OAuth grant can register", (await call(alphaGrant.access_token, "iris_request_confirmation", oauthQuestion)).state === "pending");
+  const refreshed = await (await tokenRequest({ grant_type: "refresh_token", refresh_token: alphaGrant.refresh_token, client_id: client.client_id, resource })).json();
+  check("refresh preserves its questions", (await call(refreshed.access_token, "iris_confirmation_status", consentRequest)).state === "pending");
+  const betaGrant = await newGrant();
+  check("separate OAuth consent with same actor cannot read its predecessor",
+    code(await call(betaGrant.access_token, "iris_confirmation_status", consentRequest)) === "NOT_FOUND");
 
   page1 = await consent("s3");
   r = await answer(page1, "deny");
@@ -908,8 +927,19 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     mine.items[0].handoff?.to === "vps-claude" && mine.items[0].kind === "task", JSON.stringify(mine).slice(0, 400));
   check("board_my_work leaves out work for others", (await call(K.alpha, "board_my_work", { project: "scoped" })).items.length === 0);
   const req1 = mine.items[0]?.handoff?.request_id;
+  const pauseRef = { request_id: randomBytes(16).toString("hex") };
+  const pausePrompt = { ...pauseRef, project: "demo", agent: "CLI", task: "Pause example", question: "Continue?" };
+  await call(K.alpha, "iris_request_confirmation", pausePrompt);
+  const pauseItems = await (await fetch(base + "/api/confirmations", { headers: asOwner() })).json();
+  const pauseId = pauseItems.items.find(item => item.task === pausePrompt.task).id;
+  const approveExample = () => fetch(base + "/api/confirmations", { method: "POST", headers: {
+    ...asOwner(), origin: base, "content-type": "application/json" }, body: JSON.stringify({ id: pauseId, op: "approve" }) });
+  check("owner approves example", (await approveExample()).status === 200);
   const beforePause = await snapshot();
   check("the owner stops everything", (await ownerCode({ op: "pause", paused: true })) === "200 OK");
+  check("pause prevents owner approval", (await approveExample()).status === 409);
+  check("pause withholds a saved approval", code(await call(K.alpha, "iris_confirmation_status", pauseRef)) === "PAUSED");
+  check("registration retry cannot deliver a paused approval", code(await call(K.alpha, "iris_request_confirmation", pausePrompt)) === "PAUSED");
   const pausedPoll = await snapshot(beforePause.revision);
   check("an idle snapshot immediately reflects the owner's pause", pausedPoll.unchanged && pausedPoll.paused?.paused === true);
   page = await (await fetch(`${base}/api/board`, { headers: jar })).json();
@@ -1061,12 +1091,17 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   const before = list.counts;
   const hasLegacyAssignment = (work) => work.items?.some(i => i.item_id === "pile2" && i.handoff?.to === null);
   check("trusted writer sees its previously accepted unaddressed task", hasLegacyAssignment(await call(K.muse, "board_my_work", {})));
+  const ageRef = { request_id: randomBytes(16).toString("hex") };
+  await call(K.alpha, "iris_request_confirmation", { ...pausePrompt, ...ageRef });
   stop();
   writers.writers.find(w => w.actor === "muse").policy = "restricted";
   writeTestEnv();
   await new Promise((r) => setTimeout(r, 1500));
+  ageTestConfirmations(temp, [ageRef.request_id, pauseRef.request_id]);
   await start();
   check("an unchanged revision survives a worker restart", (await snapshot(page.revision)).unchanged);
+  check("stale approved result becomes unknown", (await call(K.alpha, "iris_confirmation_status", pauseRef)).state === "unknown");
+  check("stale unanswered request expires", (await call(K.alpha, "iris_confirmation_status", ageRef)).state === "expired");
   const narrowed = await call(K.muse, "board_my_work", {});
   check("downgrading the writer hides previously accepted unaddressed tasks", narrowed.ok && !narrowed.items.some(item => item.item_id === "pile2"));
   list = await call(K.alpha, "board_list", {});

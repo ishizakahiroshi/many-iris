@@ -11,7 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const mcp = readFileSync(join(here, "..", "src", "mcp.ts"), "utf8");
 const readme = readFileSync(join(here, "..", "..", "README.md"), "utf8");
 
-const tools = [...mcp.matchAll(/^ {2}tool\(\s*\n\s*"(board_[a-z_]+)"/gm)].map((m) => m[1]);
+const tools = [...mcp.matchAll(/^ {2}tool\(\s*\n\s*"((?:board|iris)_[a-z_]+)"/gm)].map((m) => m[1]);
 const failures = [];
 if (tools.length === 0) failures.push("no tools found in src/mcp.ts (did the declaration format change?)");
 for (const name of tools) if (!readme.includes(`\`${name}\``)) failures.push(`README does not name ${name}`);
