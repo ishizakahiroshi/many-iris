@@ -377,7 +377,9 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
         const t = this.turns.find((x) => x.seq === args.seq);
         if (!t || t.taken) throw new BoardRefusal("HANDOFF_CONFLICT", "not open");
         t.taken = true;
+        if (t.contextWaiting) throw new BoardRefusal("CHAT_CONFIRMATION_REQUIRED", "the owner must confirm");
         return { ok: true, turn: { item_id: t.item_id, seq: t.seq, text: t.text, attachments: t.attachments ?? [] }, item: { item_id: t.item_id, project: "demo", title: "Item title" },
+          ...t.context,
           handoff: { request_id: "REQ-9", title: "Handed title" }, transcript: [{ at: 1, who: "owner", actor: "page:owner", text: t.text }] };
       }
       if (tool === "board_chat_reply") { this.replies.push(args); return { ok: true }; }
@@ -404,6 +406,21 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const job = ex.jobs[0];
   check("the chat job carries the turn, the handed-over title, the request and the transcript",
     job?.kind === "chat" && job.turn.text === "もう少し短くして" && job.title === "Handed title" && job.requestId === "REQ-9" && job.transcript.length === 1, JSON.stringify(job));
+
+  const held = new ChatBoard([{ item_id: "task1", seq: 20, text: "continue", contextWaiting: true }]);
+  const heldExecutor = executorOf({ outcome: "done", text: "should not run" });
+  const heldResult = await runChatPass({ client: held, executor: heldExecutor });
+  check("a context refusal never starts the executor or sends a worker reply",
+    heldResult.code === "CHAT_CONFIRMATION_REQUIRED" && heldExecutor.jobs.length === 0 && held.replies.length === 0);
+  const resumed = new ChatBoard([{ item_id: "task1", seq: 21, text: "read only", context: {
+    transcript_truncated: true, chat_url: "https://example.com/chat#task1", result_refs: ["https://example.com/result"],
+  } }]);
+  const resumedExecutor = executorOf({ outcome: "done", text: "read only" });
+  await runChatPass({ client: resumed, executor: resumedExecutor });
+  const resumedJob = resumedExecutor.jobs[0];
+  check("the executor gets the truncation flag and original refs without changing the owner's latest instruction",
+    resumedJob?.transcriptTruncated === true && resumedJob.chatUrl === "https://example.com/chat#task1" &&
+      resumedJob.resultRefs[0] === "https://example.com/result" && resumedJob.turn.text === "read only");
 
   const failing = new ChatBoard([{ item_id: "task1", seq: 8, text: "x" }]);
   await runChatPass({ client: failing, executor: executorOf({ outcome: "stopped", text: "command exited with code 4: [失敗] だめだった" }) });

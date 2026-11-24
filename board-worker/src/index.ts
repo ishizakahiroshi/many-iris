@@ -76,7 +76,7 @@ export class BoardStore extends DurableObject<Env> {
   private store: Store;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new Store(ctx.storage, limitsFrom(env));
+    this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN));
     ctx.blockConcurrencyWhile(async () => this.store.init());
   }
   async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted"): Promise<Record<string, unknown>> {

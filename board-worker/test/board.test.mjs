@@ -19,7 +19,7 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), local: key(), restricted: key(), restrictedRevoked: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), devin: key(), local: key(), restricted: key(), restrictedRevoked: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
@@ -27,7 +27,8 @@ const writers = { schema_version: 1, writers: [
   { actor: "vps-claude", token_sha256: sha(K.vps), enabled: true },
   { actor: "local-claude", token_sha256: sha(K.local), enabled: true },
   { actor: "grokbot", token_sha256: sha(K.restricted), enabled: true, policy: "restricted" },
-  { actor: "vps-devin", token_sha256: sha(K.restrictedRevoked), enabled: false, policy: "restricted" },
+  { actor: "vps-devin", token_sha256: sha(K.devin), enabled: true },
+  { actor: "local-devin", token_sha256: sha(K.restrictedRevoked), enabled: false, policy: "restricted" },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -732,6 +733,43 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     (await chatOf(orderWork)).body.open?.to === "vps-devin");
   check("a worker cannot take a turn for the other worker", code(await call(K.vps, "board_chat_take", { item_id: orderWork, seq: (await chatOf(orderWork)).body.open.seq })) === "FORBIDDEN");
   check("a conversation of an unknown item is not found", (await chatOf("nope")).status === 404);
+
+  const currentDevinTurn = async () => ({ item_id: orderWork, seq: (await chatOf(orderWork)).body.open.seq });
+  await call(K.devin, "board_chat_take", await currentDevinTurn());
+  await call(K.devin, "board_chat_reply", { ...await currentDevinTurn(), text: long });
+  for (let i = 0; i < 2; i++) {
+    check("long owner message is accepted", await ownerCode({ op: "chat_send", item_id: orderWork, text: long, to: "vps-devin" }) === "200 OK");
+    const turn = await currentDevinTurn();
+    check("a complete context can be taken normally", (await call(K.devin, "board_chat_take", turn)).transcript_truncated === false);
+    check("long reply is accepted", (await call(K.devin, "board_chat_reply", { ...turn, text: long })).ok);
+  }
+  check("confirmation needs a previously held turn", await ownerCode({ op: "chat_send", item_id: orderWork, text: "確認", context_confirmed: 1 }) === "409 HANDOFF_CONFLICT");
+  check("a new long-message turn is queued", await ownerCode({ op: "chat_send", item_id: orderWork, text: long, to: "vps-devin" }) === "200 OK");
+  const heldTurn = await currentDevinTurn();
+  check("an unconfirmed truncated turn cannot start, even for an old client",
+    code(await call(K.devin, "board_chat_take", heldTurn)) === "CHAT_CONFIRMATION_REQUIRED");
+  const heldChat = (await chatOf(orderWork)).body;
+  check("the refusal persists on the page, leaving the owner free to send a new turn",
+    heldChat.open === null && heldChat.messages.at(-1)?.status === "context_waiting" &&
+      heldChat.messages.some((m) => m.ref === "https://github.com/example/repo/pull/1"));
+  check("the held message is neither retried nor answered by the worker",
+    !(await call(K.devin, "board_chat_pending", {})).turns.some((t) => t.seq === heldTurn.seq) &&
+      code(await call(K.devin, "board_chat_take", heldTurn)) === "HANDOFF_CONFLICT" &&
+      code(await call(K.devin, "board_chat_reply", { ...heldTurn, text: "not started" })) === "HANDOFF_CONFLICT");
+  check("a stale confirmation is rejected", await ownerCode({ op: "chat_send", item_id: orderWork, text: "確認", context_confirmed: heldTurn.seq - 1 }) === "409 HANDOFF_CONFLICT");
+  check("the owner can send a new instruction confirming the held turn", await ownerCode({
+    op: "chat_send", item_id: orderWork, text: "今回は下書きを読むだけで進めてください。", to: "vps-devin", context_confirmed: heldTurn.seq,
+  }) === "200 OK");
+  const resumedTurn = await currentDevinTurn();
+  const resumed = await call(K.devin, "board_chat_take", resumedTurn);
+  check("the resumed turn carries missing-context notice and old result refs to the same worker",
+    resumed.ok && resumed.transcript_truncated === true && resumed.chat_url === `${base}/chat#${encodeURIComponent(orderWork)}` &&
+      resumed.result_refs.includes("https://github.com/example/repo/pull/1") &&
+      resumed.transcript[0]?.who === "system" && resumed.transcript[0]?.text.includes(resumed.chat_url) &&
+      resumed.transcript[0]?.text.includes("https://github.com/example/repo/pull/1") &&
+      resumed.transcript[1]?.who !== "system" && !resumed.transcript.slice(1).some((m) => m.ref === "https://github.com/example/repo/pull/1"));
+  check("only the new confirmed turn may receive a reply", resumedTurn.seq !== heldTurn.seq &&
+    (await call(K.devin, "board_chat_reply", { ...resumedTurn, text: "下書きだけ確認済み" })).ok);
 
   // --- text attachments of a conversation (R2: local simulation under wrangler dev)
   r = await ownerPost({ op: "add", project: "demo", title: "添付の会話", day: dayOf(0) });

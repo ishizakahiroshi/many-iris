@@ -423,6 +423,9 @@ export async function runChatPass({ client, executor, log = () => {}, attachDir 
     title: truncate(taken?.handoff?.title ?? taken?.item?.title ?? "", 200),
     turn: { seq: turn.seq, text: String(taken?.turn?.text ?? "") },
     transcript: Array.isArray(taken?.transcript) ? taken.transcript : [],
+    transcriptTruncated: taken?.transcript_truncated === true,
+    chatUrl: taken?.chat_url ?? null,
+    resultRefs: Array.isArray(taken?.result_refs) ? taken.result_refs : [],
   };
   // The owner's files on this turn: fetched here (this picker holds the board key, the
   // worker does not) and handed over as paths. Removed when the run ends.

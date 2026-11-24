@@ -59,6 +59,10 @@
             <ul id="chat-attach" class="chat-attach" aria-label="添付" hidden></ul>
             <label class="sr-only" for="chat-text">送る文</label>
             <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>
+            <label id="chat-reconfirm" class="chat-reconfirm" hidden>
+              <input id="chat-context-confirmed" type="checkbox">
+              元の会話を確認し、今回必要な指示と承認を書き直しました
+            </label>
             <div class="chat-box-row">
               <label class="chat-clip" title="テキストファイル（.txt .md .log）か画像を添付">
                 <input id="chat-file" type="file" accept=".txt,.md,.log,text/plain,text/markdown,image/png,image/jpeg,image/webp,image/gif" multiple hidden>

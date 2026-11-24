@@ -222,17 +222,27 @@
       entries.push({ at: n.at, role: 'agent', who: partnerLabel(n.actor), text: n.text, ref: n.ref });
     }
     for (const m of data.messages || []) {
-      entries.push({ at: m.at, role: m.role, who: m.role === 'owner' ? '→ ' + partnerLabel(m.to) : partnerLabel(m.actor), text: m.text, ref: m.ref, attachments: m.attachments });
+      entries.push({ at: m.at, role: m.role, who: m.role === 'owner' ? '→ ' + partnerLabel(m.to) : partnerLabel(m.actor), text: m.text, ref: m.ref, attachments: m.attachments, status: m.status });
     }
     entries.sort((a, b) => a.at - b.at);
-    for (const e of entries) log.append(bubble(e.role, e.who, e.at, e.text, e.ref, e.attachments));
+    for (const e of entries) {
+      log.append(bubble(e.role, e.who, e.at, e.text, e.ref, e.attachments));
+      if (e.status === 'context_waiting') log.append(el('div', 'chat-typing', '判断待ち · 会話の一部が作業役に渡らないため、作業は開始していません。'));
+    }
     const open = data.open;
     let wait = '';
     if (open && open.status === 'waiting') wait = partnerLabel(open.to) + ' が 1 分以内に拾います…';
     else if (open && open.status === 'taken') wait = partnerLabel(open.to) + ' が考えています（' + Math.max(1, Math.round((Date.now() - open.at) / 60000)) + ' 分）…';
     else if (data.handoff && ['requested', 'accepted'].includes(data.handoff.state)) wait = partnerLabel(data.handoff.accepted_by || data.handoff.to) + ' が作業しています。終わると、ここに結果が出ます…';
     if (wait) log.append(el('div', 'chat-typing', wait));
-    $('chat-state').textContent = '';
+    const lastOwner = (data.messages || []).findLast(m => m.role === 'owner');
+    const needsConfirmation = !open && lastOwner?.status === 'context_waiting';
+    $('chat-state').textContent = needsConfirmation ? '前の会話を確認し、今回必要な指示と承認を書いて送り直してください。' : '';
+    $('chat-reconfirm').hidden = !needsConfirmation;
+    const confirm = $('chat-context-confirmed');
+    const confirmationSeq = needsConfirmation ? String(lastOwner.seq) : '';
+    if (confirm.dataset.seq !== confirmationSeq) confirm.checked = false;
+    confirm.dataset.seq = confirmationSeq;
     const partner = $('chat-partner');
     if (document.activeElement !== partner) partner.value = chosenPartner || data.partner || 'vps-claude';
     const blocked = Boolean(open);
@@ -260,6 +270,9 @@
     const id = decodeURIComponent(location.hash.slice(1));
     discardPending();
     chosenPartner = null;
+    $('chat-reconfirm').hidden = true;
+    $('chat-context-confirmed').checked = false;
+    $('chat-context-confirmed').dataset.seq = '';
     clearInterval(chatTimer);
     chatTimer = null;
     closeSide();
@@ -607,9 +620,15 @@
       const body = text.value.trim();
       if (uploading) { status.textContent = '添付を保管しています。少し待ってください。'; return; }
       if (!current || (!body && !pending.length)) { status.textContent = '書いてから送ってください。'; return; }
+      const reconfirm = !$('chat-reconfirm').hidden;
+      if (reconfirm && (!body || !$('chat-context-confirmed').checked)) {
+        status.textContent = '今回の指示を書き、確認欄にチェックを入れてください。';
+        return;
+      }
       $('chat-send').disabled = true;
       status.textContent = '送っています…';
       const message = { op: 'chat_send', item_id: current, text: body, to: $('chat-partner').value };
+      if (reconfirm) message.context_confirmed = Number($('chat-context-confirmed').dataset.seq);
       if (pending.length) message.attachments = pending.map((a) => a.id);
       const done = await write(message);
       $('chat-send').disabled = false;

@@ -114,7 +114,8 @@ const SCHEMA = [
 /** Conversations with the server's AI workers ("話す"), kept apart from the
  * events: a message may be far longer than an event (CHAT_TEXT_MAX), and the
  * events keep the Rust board's limits. Owner messages are turns waiting for
- * an answer (status waiting → taken → answered | failed); agent messages
+ * an answer (status waiting → taken → answered | failed, or context_waiting
+ * when the owner must confirm a new turn); agent messages
  * are the answers. Never deleted. */
 const CHAT_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS chat_messages(
@@ -128,7 +129,8 @@ const CHAT_SCHEMA = [
     ref TEXT,
     status TEXT,
     taken_by TEXT,
-    taken_at INTEGER
+    taken_at INTEGER,
+    context_confirmed INTEGER NOT NULL DEFAULT 0
   )`,
   `CREATE INDEX IF NOT EXISTS chat_messages_item ON chat_messages(item_id, seq)`,
   `CREATE INDEX IF NOT EXISTS chat_messages_open ON chat_messages(status, to_target)`,
@@ -158,6 +160,7 @@ export const CHAT_TAKE_MS = 40 * 60 * 1000;
 const MAX_CHAT_MESSAGES = 100000;
 /** What a worker is given as the conversation so far: the newest entries up to this many characters. */
 const CHAT_TRANSCRIPT_CHARS = 120000;
+const CHAT_RESULT_LINKS = 10;
 const isChatTarget = (v: unknown): v is string => typeof v === "string" && (CHAT_TARGETS as readonly string[]).includes(v);
 
 /** writer_seen is written at most this often per writer, not on every call. */
@@ -206,6 +209,7 @@ export class Store {
   constructor(
     private storage: DurableObjectStorage,
     private limits: Limits,
+    private chatOrigin: string | null = null,
   ) {}
 
   private get sql() {
@@ -218,6 +222,9 @@ export class Store {
   init(): void {
     for (const statement of SCHEMA) this.sql.exec(statement);
     for (const statement of CHAT_SCHEMA) this.sql.exec(statement);
+    try { this.sql.exec("SELECT context_confirmed FROM chat_messages LIMIT 0"); } catch {
+      this.sql.exec("ALTER TABLE chat_messages ADD COLUMN context_confirmed INTEGER NOT NULL DEFAULT 0");
+    }
     // The owner's order of the pile. Added after the first boards were made, so
     // an existing table gets the column here (NULL = not ordered yet). It is not
     // one of the writers' fields: the Rust board does not have it.
@@ -681,7 +688,7 @@ export class Store {
   }
   /** The owner sends a message (from the page only: ownerWrite). One open turn per item. */
   private chatSend(actor: string, obj: Record<string, unknown>): Record<string, unknown> {
-    onlyKeys(obj, ["op", "item_id", "text", "to", "attachments"]);
+    onlyKeys(obj, ["op", "item_id", "text", "to", "attachments", "context_confirmed"]);
     const itemId = requiredStr(obj, "item_id");
     // Attachments (ids from the upload). With at least one, the text may be empty.
     const ids = has(obj, "attachments") ? obj.attachments : [];
@@ -691,6 +698,10 @@ export class Store {
     if (typeof typed !== "string") throw invalid("text must be text");
     const text = ids.length > 0 && typed.trim() === "" ? "" : requiredStr(obj, "text");
     if (text !== "" && !validLine(text, CHAT_TEXT_MAX, true)) throw invalid(`text must be 1 to ${CHAT_TEXT_MAX} characters`);
+    const confirmed = has(obj, "context_confirmed") ? obj.context_confirmed : 0;
+    if (!nonNegativeInteger(confirmed) || (has(obj, "context_confirmed") && confirmed === 0))
+      throw invalid("context_confirmed must be the number of the waiting turn");
+    if (confirmed && text.trim() === "") throw invalid("A confirmation needs a new written instruction");
     const to = has(obj, "to") ? obj.to : null;
     if (to !== null && !isChatTarget(to)) throw invalid(`to must be one of ${CHAT_TARGETS.join(", ")}`);
     return this.tx(() => {
@@ -704,12 +715,17 @@ export class Store {
         "SELECT COUNT(*) AS n FROM chat_messages WHERE item_id=? AND status IN ('waiting','taken')", itemId,
       ).one() as Row).n);
       if (open > 0) throw new BoardError("HANDOFF_CONFLICT", "The last message has not been answered yet");
+      if (confirmed) {
+        const lastOwner = this.sql.exec("SELECT seq,status FROM chat_messages WHERE item_id=? AND role='owner' ORDER BY seq DESC LIMIT 1", itemId).toArray() as Row[];
+        if (lastOwner[0]?.status !== "context_waiting" || num(lastOwner[0].seq) !== confirmed)
+          throw new BoardError("HANDOFF_CONFLICT", "The turn waiting for confirmation has changed");
+      }
       if (num((this.sql.exec("SELECT COUNT(*) AS n FROM chat_messages").one() as Row).n) >= MAX_CHAT_MESSAGES)
         throw new BoardError("BOARD_EVENT_LIMIT", "The conversations are full");
       const target = (to as string | null) ?? this.chatPartner(itemId, this.loadHandoff(itemId));
       this.sql.exec(
-        "INSERT INTO chat_messages(item_id,at,actor,role,to_target,text,status) VALUES(?,?,?,'owner',?,?,'waiting')",
-        itemId, Date.now(), actor, target, text,
+        "INSERT INTO chat_messages(item_id,at,actor,role,to_target,text,status,context_confirmed) VALUES(?,?,?,'owner',?,?,'waiting',?)",
+        itemId, Date.now(), actor, target, text, confirmed,
       );
       if (ids.length > 0) {
         const seq = num((this.sql.exec("SELECT MAX(seq) AS s FROM chat_messages").one() as Row).s);
@@ -746,23 +762,27 @@ export class Store {
     return this.tx(() => {
       this.refuseWhilePaused();
       const rows = this.sql.exec(
-        "SELECT role,to_target,status,taken_by,taken_at FROM chat_messages WHERE seq=? AND item_id=?", seq, itemId,
+        "SELECT role,to_target,status,taken_by,context_confirmed FROM chat_messages WHERE seq=? AND item_id=?", seq, itemId,
       ).toArray() as Row[];
       if (!rows.length || rows[0].role !== "owner") throw new BoardError("NOT_FOUND", "No such turn");
       const r = rows[0];
       if (r.to_target !== actor) throw new BoardError("FORBIDDEN", `This turn is for ${String(r.to_target)}, not for ${actor}`);
       const mine = r.status === "taken" && r.taken_by === actor;
       if (!(r.status === "waiting" || mine)) throw new BoardError("HANDOFF_CONFLICT", "This turn is not open");
-      const now = Date.now();
-      this.sql.exec("UPDATE chat_messages SET status='taken',taken_by=?,taken_at=? WHERE seq=?", actor, now, seq);
       const item = this.loadItem(itemId) as Item;
       const handoff = this.loadHandoff(itemId);
       // The conversation so far, oldest first: the work as handed over, what
       // the workers reported on the item, and the messages. The newest
       // entries are kept when it is longer than CHAT_TRANSCRIPT_CHARS.
-      const entries: { at: number; who: string; actor: string; text: string }[] = [];
-      for (const n of this.workerNotes(itemId)) entries.push({ at: n.at as number, who: "agent", actor: n.actor as string, text: n.text as string });
-      for (const m of this.chatRows(itemId)) entries.push({ at: m.at as number, who: m.role as string, actor: m.actor as string, text: this.withMarkers(m) });
+      const messages = this.chatRows(itemId);
+      const turn = messages.find((m) => m.seq === seq)!;
+      const entries: { at: number; who: string; actor: string; text: string; ref: string | null }[] = [];
+      for (const n of this.workerNotes(itemId)) entries.push({ at: n.at as number, who: "agent", actor: n.actor as string, text: n.text as string, ref: n.ref as string | null });
+      for (const m of messages) {
+        const text = this.withMarkers(m);
+        entries.push({ at: m.at as number, who: m.role as string, actor: m.actor as string,
+          text: m.status === "context_waiting" ? `［判断待ちだった発言］${text}` : text, ref: m.ref as string | null });
+      }
       entries.sort((a, b) => a.at - b.at);
       let total = 0;
       const kept: typeof entries = [];
@@ -771,22 +791,38 @@ export class Store {
         if (total > CHAT_TRANSCRIPT_CHARS && kept.length) break;
         kept.unshift(entries[i]);
       }
+      const truncated = kept.length < entries.length;
+      if (truncated && num(r.context_confirmed) === 0) {
+        this.sql.exec("UPDATE chat_messages SET status='context_waiting',taken_by=NULL,taken_at=NULL WHERE seq=?", seq);
+        // Return, rather than throw, so the wait is committed with the refusal.
+        return { ok: false, error: { code: "CHAT_CONFIRMATION_REQUIRED", detail: "Earlier conversation was omitted. The owner must confirm a new turn." } };
+      }
+      this.sql.exec("UPDATE chat_messages SET status='taken',taken_by=?,taken_at=? WHERE seq=?", actor, Date.now(), seq);
+      const chatPath = `/chat#${encodeURIComponent(itemId)}`;
+      const chatUrl = (this.chatOrigin ?? "") + chatPath;
+      const resultRefs = [...new Set(entries.slice().reverse().flatMap(({ ref }) => ref ? [ref] : []))].slice(0, CHAT_RESULT_LINKS);
+      // Existing workers already consume transcript entries, including when a
+      // wrapper does not yet read the structured context fields.
+      if (truncated || resultRefs.length) {
+        const notice = [
+          truncated ? "古いやり取りは一部省略されています。持ち主は今回の指示を確認して送り直しました。必要な承認が今回の指示に無ければ、実行せず確認を求めてください。" : "",
+          `元の会話: ${chatUrl}`,
+          resultRefs.length ? `最近の成果リンク（参照用）: ${JSON.stringify(resultRefs)}` : "",
+        ].filter(Boolean).join("\n");
+        kept.unshift({ at: 0, who: "system", actor: "iris", text: notice, ref: null });
+      }
       return {
         ok: true,
         turn: {
-          item_id: itemId, seq, text: this.turnText(itemId, seq),
-          attachments: ((this.chatRows(itemId).find((m) => m.seq === seq)?.attachments ?? []) as Record<string, unknown>[])
+          item_id: itemId, seq, text: this.withMarkers(turn),
+          attachments: ((turn.attachments ?? []) as Record<string, unknown>[])
             .map((a) => ({ id: a.id, name: a.name, bytes: a.bytes, chars: a.chars, mime: a.mime ?? null })),
         },
         item: { item_id: item.item_id, project: item.project, title: item.title, source_ref: item.source_ref },
         handoff: handoff === null ? null : { request_id: handoff.request_id, title: handoff.title, accepted_by: handoff.accepted_by },
-        transcript: kept, transcript_truncated: kept.length < entries.length,
+        transcript: kept, transcript_truncated: truncated, chat_url: chatUrl, result_refs: resultRefs,
       };
     });
-  }
-  private turnText(itemId: string, seq: number): string {
-    const m = this.chatRows(itemId).find((x) => x.seq === seq);
-    return m ? this.withMarkers(m) : "";
   }
   /** The `board_chat_reply` tool: answer the turn this worker took. */
   chatReply(actor: string, input: unknown): Record<string, unknown> {
