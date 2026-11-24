@@ -1573,19 +1573,26 @@ export class Store {
     // it. For such items the page also gets the newest event that is not a
     // state change (last_note), to show the result on the card. Writers'
     // board_list is unchanged.
+    const pageItems = data.items as (Record<string, unknown> & { item_id: string; last_event: { kind: string } | null })[];
+    const needingPreviousEvent = pageItems.filter(item => item.last_event?.kind === "state_change").map(item => item.item_id);
     const notes = new Map<string, Record<string, unknown>>();
+    // Look backwards through the (item_id, seq) index only for cards that
+    // display a previous event. One bound array also works on large boards.
     for (const r of this.sql.exec(
-      `SELECT e.seq,e.item_id,e.at,e.actor,e.kind,e.text,e.ref FROM board_events e
-       WHERE e.seq IN (SELECT MAX(seq) FROM board_events WHERE kind<>'state_change' GROUP BY item_id)`,
+      `SELECT e.seq,e.item_id,e.at,e.actor,e.kind,e.text,e.ref
+       FROM json_each(?) AS wanted
+       JOIN board_events e ON e.seq=(
+         SELECT seq FROM board_events WHERE item_id=wanted.value AND kind<>'state_change'
+         ORDER BY seq DESC LIMIT 1
+       )`, JSON.stringify(needingPreviousEvent),
     ).toArray() as Row[]) {
       notes.set(str(r.item_id), { seq: num(r.seq), at: num(r.at), actor: str(r.actor), kind: str(r.kind), text: str(r.text), ref: strOrNull(r.ref) });
     }
     const chats = this.chatSummary();
-    const items = (data.items as Record<string, unknown>[]).map((item) => {
-      const last = item.last_event as { kind?: string } | null;
-      const note = notes.get(item.item_id as string);
-      const withNote = last && last.kind === "state_change" && note ? { ...item, last_note: note } : item;
-      const chat = chats.get(item.item_id as string);
+    const items = pageItems.map((item) => {
+      const note = notes.get(item.item_id);
+      const withNote = note ? { ...item, last_note: note } : item;
+      const chat = chats.get(item.item_id);
       return chat ? { ...withNote, chat } : withNote;
     });
     return {

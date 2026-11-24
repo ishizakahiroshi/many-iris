@@ -94,3 +94,32 @@ body.chat-open::before{content:"";position:fixed;inset:0;background:rgba(36,31,2
 .board-result { margin: .35rem 0 0; display: flex; flex-wrap: wrap; gap: .4rem; align-items: baseline; font-size: .9rem; }
 .board-result-label { font-weight: 600; }
 .board-result a { word-break: break-all; }
+
+.board-list-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, 32%); align-items: start; gap: 1rem; }
+.board-list-heading { display: flex; align-items: center; gap: .6rem; margin: 1rem 0 .45rem; }
+.board-list-groups { min-width: 0; }
+.board-summary {
+  display: grid; grid-template-columns: minmax(3rem, .8fr) auto minmax(7rem, 3fr) minmax(3rem,.8fr) minmax(4rem,.9fr);
+  align-items: center; gap: .55rem; width: 100%; padding: .5rem .55rem; min-height: 44px;
+  background: var(--card); color: var(--ink); border: 0; border-bottom: 1px solid var(--line);
+  border-radius: 0; text-align: left; font-size: .87rem;
+}
+.board-summary:hover:not(:disabled), .board-summary[aria-expanded="true"] { background: #fff1e6; }
+.board-summary[aria-expanded="true"] { box-shadow: inset 3px 0 0 var(--accent); }
+.board-summary-name { overflow-wrap: anywhere; }
+.board-summary-id, .board-summary time, .board-summary-who, .board-summary-name small {
+  display: block; color: var(--soft); font-size: .73rem; font-weight: 400; overflow-wrap: anywhere;
+}
+.board-summary-id { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.board-detail-pane {
+  position: sticky; top: 1rem; max-height: calc(100dvh - 2rem); overflow: auto;
+  background: var(--card); padding: .75rem; border: 1px solid var(--line); border-radius: 10px;
+}
+.board-detail-pane > button { margin-bottom: .6rem; }
+.board-detail-id { margin: 0 0 .4rem; color: var(--soft); font-size: .78rem; overflow-wrap: anywhere; }
+@media (max-width: 800px) {
+  .board-list-layout { display: block; }
+  .board-detail-pane { position: fixed; inset: auto .5rem .5rem; max-height: 62dvh; z-index: 12; box-shadow: 0 -4px 22px #241f1a33; }
+  .board-summary { grid-template-columns: minmax(2.2rem,.65fr) auto minmax(5rem,2fr) minmax(2.1rem,.65fr) minmax(3.2rem,.7fr); gap: .3rem; padding-inline: .3rem; }
+  .board-summary .badge { padding-inline: .35rem; }
+}

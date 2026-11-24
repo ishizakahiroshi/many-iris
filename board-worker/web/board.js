@@ -40,6 +40,11 @@
   try { shownProject = localStorage.getItem(PROJECT_KEY) || ''; } catch { shownProject = ''; }
   let foundId = null;
   let lastData = null;
+  let selectedItemId = null;
+  let clearDetail = null;
+  try {
+    if (localStorage.getItem('iris-board-view') === 'list') $('board-view').value = 'list';
+  } catch { /* Use the default view when storage is unavailable. */ }
   // True when the board says it takes the owner's writes from this page.
   let canWrite = false;
 
@@ -704,6 +709,83 @@
     };
     return { tree: list(roots, 0), unlinked: list(unlinked, 0), unlinkedCount: unlinked.length };
   }
+  function compactList(items) {
+    const layout = el('div', 'board-list-layout');
+    const rows = el('div', 'board-list-groups');
+    const pane = el('section', 'board-detail-pane');
+    pane.setAttribute('aria-label', '選んだ項目の詳細');
+    pane.id = 'board-detail-' + items[0].item_id;
+    pane.hidden = true;
+    const byId = new Map(items.map(item => [item.item_id, item]));
+    const children = new Map();
+    for (const item of items) {
+      if (!children.has(item.parent_id)) children.set(item.parent_id, []);
+      children.get(item.parent_id).push(item);
+    }
+    const open = el('div');
+    const closed = el('div');
+    const visited = new Set();
+    function select(item, button, focus) {
+      if (clearDetail) clearDetail();
+      selectedItemId = item.item_id;
+      button.setAttribute('aria-expanded', 'true');
+      const close = el('button', 'quiet', '詳細を閉じる');
+      close.type = 'button';
+      clearDetail = () => {
+        button.setAttribute('aria-expanded', 'false');
+        pane.replaceChildren();
+        pane.hidden = true;
+        selectedItemId = null;
+        clearDetail = null;
+      };
+      const dismiss = () => { clearDetail(); button.focus(); };
+      close.addEventListener('click', dismiss);
+      pane.onkeydown = event => {
+        if (event.key === 'Escape' && !event.defaultPrevented) dismiss();
+      };
+      pane.replaceChildren(close, el('p', 'board-detail-id', item.item_id), card(item, items));
+      pane.hidden = false;
+      if (focus) close.focus({ preventScroll: true });
+    }
+    function append(item, depth) {
+      if (visited.has(item.item_id)) return;
+      visited.add(item.item_id);
+      const isClosed = item.state === 'done' || item.state === 'stopped';
+      const button = el('button', 'board-summary');
+      button.type = 'button';
+      button.setAttribute('aria-controls', pane.id);
+      button.setAttribute('aria-expanded', 'false');
+      const title = el('span', 'board-summary-name', item.title);
+      const parent = byId.get(item.parent_id);
+      const kids = children.get(item.item_id) || [];
+      const counts = new Map();
+      for (const child of kids) counts.set(child.state, (counts.get(child.state) || 0) + 1);
+      const context = [];
+      if (parent) context.push('親：' + parent.title);
+      else if (item.kind === 'task') context.push('まだ結ばれていない作業');
+      if (kids.length) context.push('直属 ' + kids.length + ' 件（' + [...counts].map(([s, n]) => (states[s] || s) + n).join('・') + '）');
+      if (context.length) title.append(el('small', null, context.join(' ／ ')));
+      if (!isClosed) title.style.paddingInlineStart = Math.min(depth, 4) * 0.55 + 'rem';
+      const assignee = item.handoff?.accepted_by || item.handoff?.to;
+      const id = el('span', 'board-summary-id', item.item_id);
+      id.title = item.item_id;
+      const time = el('time', null, when(item.updated_at));
+      button.append(id, stateBadge(item.state), title, el('span', 'board-summary-who', assignee ? targetLabel(assignee) : '—'), time);
+      button.addEventListener('click', () => select(item, button, true));
+      (isClosed ? closed : open).append(button);
+      if (selectedItemId === item.item_id) select(item, button, false);
+      for (const child of kids) append(child, depth + 1);
+    }
+    for (const item of items) if (!byId.has(item.parent_id)) append(item, 0);
+    for (const item of items) if (!visited.has(item.item_id)) append(item, 0);
+    for (const [label, group] of [['進行中・予定・待ち', open], ['完了・停止', closed]]) {
+      const heading = el('h3', 'board-list-heading', label);
+      heading.append(el('span', 'count', group.childElementCount + ' 件'));
+      rows.append(heading, group);
+    }
+    layout.append(rows, pane);
+    return layout;
+  }
   function render(data) {
     const items = Array.isArray(data.items) ? data.items : [];
     const events = Array.isArray(data.events) ? data.events : [];
@@ -716,6 +798,7 @@
     // The chat page exists on the Worker board only (the one with the owner's order).
     $('board-chat-link').hidden = !(canWrite && data.route);
     const host = $('board-projects');
+    clearDetail = null;
     host.replaceChildren();
     if (!items.length) host.append(el('p', 'empty', 'まだ項目がありません。'));
     const byProject = new Map();
@@ -727,13 +810,18 @@
     for (const [project, list] of byProject) {
       if (shownProject && project !== shownProject) continue;
       const section = el('section', 'board-project');
-      const { tree, unlinked, unlinkedCount } = forest(list);
       const scoped = Boolean(data.scopes && data.scopes[project] === 'local');
       const title = el('h2', null, project);
       if (scoped) title.append(el('span', 'badge board-scope-badge', '手元だけ'));
       section.append(title);
       if (canWrite && data.scopes) section.append(scopeControl(project, scoped));
       if (canWrite) section.append(addControl(project, list));
+      if ($('board-view').value === 'list') {
+        section.append(compactList(list));
+        host.append(section);
+        continue;
+      }
+      const { tree, unlinked, unlinkedCount } = forest(list);
       section.append(tree);
       const loose = el('div', 'board-unlinked');
       const heading = el('h3', null, 'まだ結ばれていない作業');
@@ -788,12 +876,19 @@
       || items.find((i) => i.item_id.toLowerCase().includes(lower) || String(i.title).toLowerCase().includes(lower));
     if (!hit) { foundId = null; status.textContent = '「' + short(q) + '」は見つかりませんでした。'; render(lastData); return; }
     foundId = hit.item_id;
+    selectedItemId = hit.item_id;
     status.textContent = '見つかりました：' + hit.project + ' ／ ' + short(hit.title);
     showProject(hit.project);
-    const target = [...document.querySelectorAll('.board-card')].find((n) => n.dataset.itemId === hit.item_id);
+    const target = $('board-view').value === 'list'
+      ? document.querySelector('.board-summary[aria-expanded="true"]')
+      : [...document.querySelectorAll('.board-card')].find((n) => n.dataset.itemId === hit.item_id);
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   $('board-project').addEventListener('change', (event) => { foundId = null; $('board-search-status').textContent = ''; showProject(event.target.value); });
+  $('board-view').addEventListener('change', () => {
+    try { localStorage.setItem('iris-board-view', $('board-view').value); } catch { /* Device preference only. */ }
+    if (lastData) render(lastData);
+  });
   $('board-search').addEventListener('submit', (event) => { event.preventDefault(); search($('board-search-input').value); });
   // `force` is a reload the person asked for, or one that follows their own write.
   async function load(force) {
