@@ -141,12 +141,9 @@
   // A new chat belongs to no project unless one is chosen: it goes under
   // NO_PROJECT, which the server's workers run in a plain folder (no repository).
   function renderProjects() {
-    const select = $('chat-start-project');
     if (!board) return;
-    const keep = select.value || NO_PROJECT;
     const names = [...new Set(board.items.map((i) => i.project))].filter((n) => n !== NO_PROJECT).sort((a, b) => a.localeCompare(b, 'ja'));
-    select.replaceChildren(option(NO_PROJECT, '案件なし'), ...names.map((n) => option(n, n)));
-    select.value = names.includes(keep) ? keep : NO_PROJECT;
+    $('chat-projects').replaceChildren(...names.map((n) => option(n, n)));
   }
   async function loadBoard() {
     try {
@@ -563,7 +560,18 @@
 
     const startText = $('chat-start-text');
     const count = () => { $('chat-start-count').textContent = [...startText.value].length + ' / 200'; grow(startText, 220); };
-    startText.addEventListener('input', count);
+    const projectField = $('chat-start-project');
+    let projectEdited = false;
+    projectField.addEventListener('input', () => { projectEdited = true; });
+    startText.addEventListener('input', () => {
+      count();
+      if (projectEdited) return;
+      // A leading repo name and matching checkout path identify the same target.
+      // A path mentioned later in the request may just be a reference.
+      const target = startText.value.trimStart().match(/^([a-z0-9][a-z0-9._-]{0,59})\s+[a-z]:[\\/]([^\s]+)(?:\s|$)/i);
+      const folder = target?.[2].replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+      projectField.value = target && folder === target[1] ? target[1] : '';
+    });
     sendOnEnter(startText, $('chat-start-form'));
     // The same attachments as in a conversation: a long paste, a chosen or dropped file.
     startText.addEventListener('paste', (event) => onPaste(event, $('chat-start-status'), addStart));
@@ -574,17 +582,18 @@
       event.preventDefault();
       const status = $('chat-start-status');
       const text = startText.value.trim().replace(/\s+/g, ' ');
-      const project = $('chat-start-project').value;
+      const project = projectField.value.trim() || NO_PROJECT;
+      const newRepository = project !== NO_PROJECT && !board?.items.some((item) => item.project === project);
       // With only attachments, the first line of the first one (or its name) is the title.
       const title = text || startTitle();
       if (!title) { status.textContent = '書くか、添付してから送ってください。'; return; }
-      if (!project) { status.textContent = '案件を選んでください。'; return; }
+      if (newRepository && !/^[a-z0-9][a-z0-9._-]{0,59}$/i.test(project)) { status.textContent = '新規案件にはリポジトリ名だけを入力してください。'; return; }
       const send = $('chat-start-send');
       send.disabled = true;
       status.textContent = '送っています…';
       try {
         const day = today();
-        const added = await write({ op: 'add', project, title: [...title].slice(0, 200).join(''), day });
+        const added = await write({ op: 'add', project, title: [...title].slice(0, 200).join(''), day, ...(newRepository ? { new_repository: true } : {}) });
         if (!added.ok) { status.textContent = added.text; return; }
         const itemId = added.answer.item.item_id;
         const to = $('chat-start-partner').value;
@@ -595,7 +604,8 @@
         for (const a of startPending) forget(a);
         startPending = [];
         renderStartPending();
-        $('chat-start-project').value = NO_PROJECT;
+        projectField.value = '';
+        projectEdited = false;
         count();
         await loadBoard();
         // The conversation page shows its own status line; route() says there what did not go.

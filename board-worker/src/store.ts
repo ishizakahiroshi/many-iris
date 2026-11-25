@@ -1862,14 +1862,19 @@ export class Store {
       });
     }
     if (op === "add") {
-      onlyKeys(obj, ["op", "project", "title", "parent_id", "day"]);
+      onlyKeys(obj, ["op", "project", "title", "parent_id", "day", "new_repository"]);
       const project = requiredStr(obj, "project");
       const title = requiredStr(obj, "title");
       const parentId = optionalStr(obj, "parent_id");
-      // A project is made by a writer; a typing slip here must not start a new one.
-      // The one exception is CHAT_PROJECT, where a chat with no project goes (chat page).
+      // The owner's chat can start work in a repository not yet on the board.
+      // Ordinary board additions still refer to an existing project.
+      const newRepository = obj.new_repository === true;
+      if (has(obj, "new_repository")) {
+        if (!newRepository || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$/.test(project)) throw invalid("Invalid repository name");
+        this.requireChatAllowed(project);
+      }
       const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
-      if (known === 0 && project !== CHAT_PROJECT) throw new BoardError("NOT_FOUND", "No such project");
+      if (known === 0 && project !== CHAT_PROJECT && !newRepository) throw new BoardError("NOT_FOUND", "No such project");
       // The page's own calendar day, for the id only (see newBacklogId).
       const day = optionalStr(obj, "day");
       const args: Record<string, unknown> = { item_id: newId(day), project, kind: "task", title, state: "planned", expected_revision: 0 };

@@ -123,7 +123,7 @@ const statusOnly = { schema_version: 1, status_only: [{ project: "quiet", actor:
 
 function writeTestEnv() {
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=27\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=28\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
 }
 async function main() {
   mkdirSync(temp, { recursive: true });
@@ -772,6 +772,9 @@ check("the chat list knows when it last moved", typeof pageChat?.chat?.last_at =
 check("the chat page needs Access", (await fetch(`${base}/chat`)).status === 401);
 check("a new chat with no project goes under the project chat", (await ownerCode({ op: "add", project: "chat", title: "ふつうの会話", day: "20261121" })) === "200 OK");
 check("another unknown project is still refused", (await ownerCode({ op: "add", project: "no-such-project", title: "x" })) === "404 NOT_FOUND");
+const firstRepo = await (await ownerPost({ op: "add", project: "sample-tabs", title: "inspect tabs", new_repository: true })).json();
+check("a chat can start in a named repository before it has any cards", firstRepo.item?.project === "sample-tabs");
+check("a repository path is not a project name", (await ownerCode({ op: "add", project: "../other", title: "x", new_repository: true })) === "400 INVALID");
 const chatPage = await fetch(`${base}/chat`, { headers: jar });
 check("the chat page is served", chatPage.status === 200 && (await chatPage.text()).includes('src="/chat.js"'));
   check("the owner can switch partners", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "Devin でも見て", to: "vps-devin" })) === "200 OK" &&
@@ -1118,14 +1121,14 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
   const quietDone = await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", text: "状態：完了" });
   check("a status-word completion closes the work", quietDone.ok === true && quietDone.item?.state === "done", JSON.stringify(quietDone));
 
-  // --- the item limit (27 in this run)
+  // --- the item limit (28 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 27 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 28 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 27, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 28, String(list.counts.items));
   // The counts are kept by triggers (issue #38), not counted per call: they must
   // still match the rows. Events are never deleted and seq is the rowid, so
   // the newest seq is the number of events.
