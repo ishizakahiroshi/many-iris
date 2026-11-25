@@ -12,6 +12,7 @@ import {
   ATTACHMENT_TTL_MS, IMAGE_MAX_BYTES, READ_MAX_CHARS, isImageType, markerText, validAttachmentId,
 } from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
+import { pollView } from "./poll";
 import { MUSE_DEV, ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
@@ -111,6 +112,13 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS writer_seen(
     actor TEXT PRIMARY KEY NOT NULL,
     at INTEGER NOT NULL
+  )`,
+  // Successful queue observations only (an empty project means an unfiltered read).
+  `CREATE TABLE IF NOT EXISTS writer_poll(
+    actor TEXT NOT NULL,
+    project TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    PRIMARY KEY(actor, project)
   )`,
 ];
 
@@ -220,6 +228,7 @@ export class Store {
     private limits: Limits,
     private chatOrigin: string | null = null,
     statusOnlyEntries: StatusOnlyEntry[] = [],
+    private pollCadences = new Map<string, number>(),
   ) {
     this.statusOnlyMap = statusOnlyActors(statusOnlyEntries);
   }
@@ -1610,11 +1619,26 @@ export class Store {
     const refs = (this.sql.exec(
       "SELECT at,actor,ref FROM board_events WHERE item_id=? AND ref IS NOT NULL ORDER BY seq DESC LIMIT 10", itemId,
     ).toArray() as Row[]).map((r) => ({ at: num(r.at), actor: str(r.actor), ref: str(r.ref) }));
+    const now = Date.now();
     const lifecycle = deriveLifecycle(
       { item: { item_id: item.item_id, state: item.state, updated_at: item.updated_at, updated_by: item.updated_by }, handoff, dispatch, refs },
-      Date.now(),
+      now,
     );
-    return { ok: true, item_id: itemId, request_id: handoff?.request_id ?? null, lifecycle };
+    const actor = handoff?.to;
+    const poll = handoff?.state === "requested" && actor && actor !== "devin" && !UNTAKEN_TARGETS.has(actor) && handoff.requester_declined_at == null
+      ? this.pollFor(actor, item.project, now) : null;
+    return { ok: true, item_id: itemId, request_id: handoff?.request_id ?? null, lifecycle, poll };
+  }
+
+  private pollFor(actor: string, project: string, now: number) {
+    const last = this.sql.exec(
+      "SELECT MAX(at) AS last FROM writer_poll WHERE actor=? AND project IN ('',?)", actor, project,
+    ).one().last;
+    return this.projectPoll(actor, last, now);
+  }
+
+  private projectPoll(actor: string, last: unknown, now: number) {
+    return pollView(actor, typeof last === "number" ? last : null, this.pollCadences.get(actor), now);
   }
 
   /**
@@ -1648,8 +1672,20 @@ export class Store {
         "SELECT COUNT(*) AS n FROM chat_messages WHERE role='owner' AND status='waiting' AND to_target=?", actor,
       ).one() as Row).n)
       : 0;
-    if (restricted) return { ok: true, paused: pause.paused, items };
-    return { ok: true, paused: pause.paused, items, chat_turns: turns, scopes: this.projectScopes() };
+    const result = restricted ? { ok: true, paused: pause.paused, items }
+      : { ok: true, paused: pause.paused, items, chat_turns: turns, scopes: this.projectScopes() };
+    if (!pause.paused) {
+      try {
+        // No arbitrary project names in storage: a scoped read only records an existing project.
+        this.sql.exec(
+          `INSERT INTO writer_poll(actor,project,at)
+           SELECT ?,?,? WHERE ?='' OR EXISTS (SELECT 1 FROM board_items WHERE project=?)
+           ON CONFLICT(actor,project) DO UPDATE SET at=MAX(writer_poll.at,excluded.at)`,
+          actor, project ?? "", Date.now(), project ?? "", project ?? "",
+        );
+      } catch { /* Don't lose a valid queue read if the observation can't be stored. */ }
+    }
+    return result;
   }
 
   /** The `board_list` tool: arguments `project` and `since_seq`. */
@@ -1672,7 +1708,23 @@ export class Store {
     const { epoch, version } = this.sql.exec("SELECT epoch,version FROM page_revision WHERE id=1").one();
     const revision = `${epoch}.${version}`;
     const route = this.routeOrder();
-    const live = { revision, history_epoch: epoch, generated_at: now, can_write: true,
+    // Live also on unchanged snapshots: a patrol and its expiry aren't item mutations.
+    const polls = this.sql.exec(
+      `SELECT DISTINCT i.handoff_to AS actor,i.project,g.at AS global_at,p.at AS project_at
+       FROM board_items i
+       LEFT JOIN writer_poll g ON g.actor=i.handoff_to AND g.project=''
+       LEFT JOIN writer_poll p ON p.actor=i.handoff_to AND p.project=i.project
+       WHERE i.handoff_state='requested' AND i.handoff_to IS NOT NULL
+         AND i.handoff_to NOT IN ('owner','hold','devin') AND i.handoff_declined_at IS NULL
+       ORDER BY i.handoff_to,i.project`,
+    ).toArray() as Row[];
+    const poll_by_queue = Object.fromEntries(polls.map((r) => {
+      const actor = str(r.actor);
+      const readings = [r.global_at, r.project_at].filter((v): v is number => typeof v === "number");
+      return [JSON.stringify([actor, str(r.project)]),
+        this.projectPoll(actor, readings.length ? Math.max(...readings) : null, now)];
+    }));
+    const live = { revision, history_epoch: epoch, generated_at: now, can_write: true, poll_by_queue,
       route: this.routeView(route, devinReady, now), paused: this.pauseState(), scopes: route.scopes };
     if (since === revision) return { ok: true, unchanged: true, ...live };
     const data = this.list(null, 0, PAGE_EVENT_LIMIT, true);

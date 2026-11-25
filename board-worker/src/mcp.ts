@@ -79,7 +79,7 @@ export const TOOLS: Json[] = [
   ),
   tool(
     "board_request_status",
-    "Read-only: where one request really is. Separates saved on the board (board_upsert_item) from handed over, taken by a writer, running (the run reported in after taking it), silent (lease expired), unknown and completed, with the evidence, what the board cannot confirm, whether it is stalled, result links, and the options a person has. Never starts, retries or re-queues anything, so asking for progress cannot run the work twice. An open GitHub Issue is not evidence of anything here.",
+    "Read-only: where one request really is. Separates saved on the board (board_upsert_item) from handed over, taken by a writer, running (the run reported in after taking it), silent (lease expired), unknown and completed, with the evidence, what the board cannot confirm, whether it is stalled, result links, and the options a person has. Never starts, retries or re-queues anything, so asking for progress cannot run the work twice. The poll field is the assigned queue's latest observed read, optional sourced estimate and overdue flag, or null when not applicable. An open GitHub Issue is not evidence of anything here.",
     { item_id: text("The item to look at") },
     ["item_id"],
   ),
