@@ -573,7 +573,24 @@
     return sent.ok ? '' : '添付を送れませんでした（' + sent.text + '）';
   }
 
+  function showSubmissionRecovery() {
+    $('chat-start-recovery').hidden = !museSubmission;
+    if (museSubmission) $('chat-start-previous').hash = encodeURIComponent('chat-muse/' + museSubmission);
+  }
+
+  function clearSubmission() {
+    museSubmission = null;
+    try { sessionStorage.removeItem('iris-muse-submission'); } catch { /* in-memory state is clear */ }
+    showSubmissionRecovery();
+  }
+
   function setup() {
+    try { museSubmission = sessionStorage.getItem('iris-muse-submission'); } catch { /* storage may be disabled */ }
+    showSubmissionRecovery();
+    $('chat-start-separate').addEventListener('click', () => {
+      clearSubmission();
+      $('chat-start-status').textContent = '次の送信で別の依頼を作成します。';
+    });
     for (const id of ['chat-start-partner', 'chat-partner', 'chat-muse-replacement']) for (const [v, l] of partners) $(id).append(option(v, l));
     $('chat-start-partner').append(option(museDev, 'MuseDev'));
     $('chat-muse-reroute').addEventListener('submit', async (event) => {
@@ -647,17 +664,18 @@
         if (to === museDev) {
           // Keep only the opaque id across an interrupted send or reload. The
           // server recognizes the same item and never restarts the request.
-          try { submission = sessionStorage.getItem('iris-muse-submission'); } catch { /* storage may be disabled */ }
-          submission = submission || museSubmission || crypto.randomUUID();
+          $('chat-start-recovery').hidden = true;
+          submission = museSubmission || crypto.randomUUID();
           museSubmission = submission;
           try { sessionStorage.setItem('iris-muse-submission', submission); } catch { /* keep it in memory */ }
         }
         const added = await write(to === museDev ? { op: 'chat_start_muse', submission_id: submission, ...common } : { op: 'add', ...common });
-        if (!added.ok) { status.textContent = added.text; return; }
-        if (to === museDev) {
-          museSubmission = null;
-          try { sessionStorage.removeItem('iris-muse-submission'); } catch { /* storage may be disabled */ }
+        if (!added.ok) {
+          status.textContent = added.text;
+          showSubmissionRecovery();
+          return;
         }
+        if (to === museDev) clearSubmission();
         const itemId = added.answer.item.item_id;
         const handed = to === museDev ? added : await write({ op: 'hand', item_id: itemId, day, to });
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }

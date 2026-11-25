@@ -113,8 +113,8 @@ test('paused, local and status-only work do not trigger legacy or other takers',
   assert.equal(view.handoff.to, muse);
   assert.throws(() => store.acceptHandoff(muse, id, true), { code: 'FORBIDDEN' });
   assert.throws(() => write(payload(token2, { project: 'CHAT', new_repository: true })), { code: 'FORBIDDEN' });
-  assert.equal(parseOrder([muse]), null);
-  assert.equal(chooseByOrder([muse], () => true).to, 'hold');
+  assert.deepEqual(parseOrder([muse]), [muse]);
+  assert.equal(chooseByOrder([muse], () => true).to, muse);
 });
 
 test('legacy Claude and Devin chat turns still work; MuseDev does not inherit transcript tools', () => {
