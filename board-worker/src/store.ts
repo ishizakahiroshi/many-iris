@@ -17,6 +17,9 @@ import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
 } from "./resume";
+import {
+  STATUS_ONLY_COMPLETION, STATUS_ONLY_PROGRESS, statusOnlyActors, type StatusOnlyEntry,
+} from "./status-only";
 
 export interface Limits {
   items: number;
@@ -208,11 +211,16 @@ function rowItem(r: Row, prefix = ""): Item {
 }
 
 export class Store {
+  /** project -> its status-only takers (#50). From the Worker's environment, never from a request. */
+  private statusOnlyMap: Map<string, Set<string>>;
   constructor(
     private storage: DurableObjectStorage,
     private limits: Limits,
     private chatOrigin: string | null = null,
-  ) {}
+    statusOnlyEntries: StatusOnlyEntry[] = [],
+  ) {
+    this.statusOnlyMap = statusOnlyActors(statusOnlyEntries);
+  }
 
   private get sql() {
     return this.storage.sql;
@@ -951,6 +959,11 @@ export class Store {
     );
   }
 
+  /** The actors registered status-only for a project, or null when the project is not registered. */
+  private statusOnlyFor(project: string | null): Set<string> | null {
+    if (project === null) return null;
+    return this.statusOnlyMap.get(project) ?? null;
+  }
   private loadItem(id: string): Item | null {
     const rows = this.sql.exec(`SELECT ${ITEM_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id).toArray();
     return rows.length ? rowItem(rows[0] as Row) : null;
@@ -1095,7 +1108,11 @@ export class Store {
     if (!validLine(text, 2000, true)) throw invalid("text must be 1 to 2000 characters");
     if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
     return this.tx(() => {
-      if (this.loadItem(itemId) === null) throw new BoardError("NOT_FOUND", "No such item");
+      const target = this.loadItem(itemId);
+      if (target === null) throw new BoardError("NOT_FOUND", "No such item");
+      if (this.statusOnlyFor(target.project)?.has(actor)
+        && (kind !== "note" || reference !== null || !(STATUS_ONLY_PROGRESS as readonly string[]).includes(text)))
+        throw new BoardError("FORBIDDEN", "This work reports status only: a note of 状態：着手, 状態：作業中 or 状態：要確認, without a link");
       this.guardGenericWrite(actor, itemId, fence);
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
@@ -1158,6 +1175,12 @@ export class Store {
         throw new BoardError("FORBIDDEN", UNTAKEN_TARGETS.has(to)
           ? `This request is on ${to}: nobody takes it until the owner routes it to someone`
           : `This request is for ${to}, not for ${actor}`);
+      // A project registered status-only runs only as its registered taker,
+      // taken explicitly: anybody else would report freely, and a request
+      // without that destination waits to be routed rather than change hands.
+      const registered = this.statusOnlyFor(target.project);
+      if (registered !== null && (!registered.has(actor) || to !== actor))
+        throw new BoardError("FORBIDDEN", `Project ${target.project} reports status only: only its registered taker may run it, taken as its named destination`);
       // COALESCE: a request made before generations existed has none yet;
       // the accept is where its run begins, so it gets the first one here.
       this.sql.exec(
@@ -1239,6 +1262,9 @@ export class Store {
     if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
     return this.tx(() => {
       this.checkRun(itemId, actor, request, generation, restricted);
+      if (this.statusOnlyFor(this.loadItem(itemId)?.project ?? null)?.has(actor)
+        && (kind !== "note" || reference !== null || !(STATUS_ONLY_PROGRESS as readonly string[]).includes(text)))
+        throw new BoardError("FORBIDDEN", "This work reports status only: a note of 状態：着手, 状態：作業中 or 状態：要確認, without a link");
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
       const phase = kind === "note" && reference === null ? PHASE_NOTE.exec(text)?.[1] : null;
@@ -1272,6 +1298,9 @@ export class Store {
     const now = Date.now();
     this.tx(() => {
       this.checkRun(itemId, actor, request, generation, restricted);
+      if (this.statusOnlyFor(this.loadItem(itemId)?.project ?? null)?.has(actor)
+        && (ref !== null || commit !== null || (text !== null && !(STATUS_ONLY_COMPLETION as readonly string[]).includes(text))))
+        throw new BoardError("FORBIDDEN", "This work reports status only: 状態：完了 or 状態：要確認, without a link or a commit");
       this.sql.exec(
         "UPDATE board_items SET handoff_state='completed',handoff_lease_until=NULL,handoff_result_ref=?,handoff_result_commit=? WHERE item_id=?",
         ref, commit, itemId,

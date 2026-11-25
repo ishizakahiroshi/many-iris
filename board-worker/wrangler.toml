@@ -56,6 +56,10 @@ new_sqlite_classes = ["BoardStore"]
 
 # Secrets (set with `wrangler secret put`, never in this file):
 #   BOARD_WRITERS       key list of the writers (hashes only)
+#   BOARD_STATUS_ONLY   optional status-only registration (#50):
+#                       {"schema_version":1,"status_only":[{"project","actor"}]}
+#                       — a project may run only as its registered taker and
+#                       reports the fixed status words 状態：着手/作業中/要確認/完了
 #   ACCESS_TEAM_DOMAIN  https://<team>.cloudflareaccess.com
 #   ACCESS_AUD          Application Audience (AUD) tag of the Access application
 #   BOARD_OWNERS        comma-separated emails allowed to read the page
