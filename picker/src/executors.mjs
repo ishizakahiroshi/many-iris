@@ -44,6 +44,7 @@ const OUTPUT_MAX = 256 * 1024;
 
 // fd 3 is for explicit milestones. Worker stdout/stderr may contain private data.
 const phases = new Map([
+  ["worker_started", "担当AI起動"], ["checking_submission", "提出前検査中"],
   ["investigating", "調査中"], ["implementing", "実装中"], ["testing", "テスト中"], ["awaiting_input", "回答待ち"],
 ]);
 async function forwardPhases(pipe, progress, signal) {

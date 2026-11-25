@@ -126,6 +126,7 @@ try {
     console.error('awaiting_input');
     writeSync(3, 'investig');
     writeSync(3, 'ating\\n' + 'x'.repeat(128) + 'testing\\n' + 'testing\\ntesting\\n');
+    writeSync(3, 'worker_started\\nchecking_submission\\n');
     console.log('fixture result');
   `;
   const command = new CommandExecutor({ command: process.execPath, args: ["-e", fixture] });
@@ -134,9 +135,9 @@ try {
   const phaseBoard = await alpha.call("board_list", { since_seq: 0 });
   const phaseNotes = phaseBoard.events.filter(e => e.item_id === "phase-job" && e.text.startsWith("工程："));
   check("only explicit changes are published, in order, before completion",
-    phaseNotes.map(e => e.text).join("/") === "工程：作業コマンド起動/工程：調査中/工程：テスト中", JSON.stringify(phaseNotes));
+    phaseNotes.map(e => e.text).join("/") === "工程：作業コマンド起動/工程：調査中/工程：テスト中/工程：担当AI起動/工程：提出前検査中", JSON.stringify(phaseNotes));
   const latest = phaseBoard.items.find(i => i.item_id === "phase-job").handoff;
-  check("the stored phase has its own report time", latest.phase === "テスト中" && latest.phase_at === phaseNotes.at(-1)?.at);
+  check("the stored phase has its own report time", latest.phase === "提出前検査中" && latest.phase_at === phaseNotes.at(-1)?.at);
 
   const restrictedClient = new BoardClient({ url: `${base}/board/mcp`, key: K.restricted });
   const restrictedMine = await restrictedClient.listMine();

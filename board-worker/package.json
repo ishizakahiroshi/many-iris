@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "deploy:check": "node scripts/deploy.mjs",
+    "deploy": "node scripts/deploy.mjs --apply",
     "test": "node test/route.test.mjs && node test/resume.test.mjs && node test/lifecycle.test.mjs && node test/activity.test.mjs && node test/board.test.mjs && node test/dispatch.test.mjs && node test/watch.test.mjs && node test/attachments.test.mjs && node test/readme.test.mjs"
   },
   "devDependencies": {
