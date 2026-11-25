@@ -116,9 +116,14 @@ async function call(token, tool, args) {
 }
 const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 
+// Work in the "quiet" project may only run as muse and reports status words
+// only (src/status-only.ts, #50). Registration is board configuration, like
+// the writer keys — never something a request can switch on.
+const statusOnly = { schema_version: 1, status_only: [{ project: "quiet", actor: "muse" }] };
+
 function writeTestEnv() {
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=27\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=27\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
 }
 async function main() {
   mkdirSync(temp, { recursive: true });
@@ -1065,6 +1070,53 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     dotsItem?.handoff?.request_id === dotsRequest.request_id && dotsItem.handoff.state === "completed" &&
     dotsItem.last_note?.actor === "dots" && dotsItem.last_note.text === "15 / 3 = 5");
   check("dots has no outstanding work after completion", (await call(dotsToken, "board_my_work", {})).items?.length === 0);
+
+  // --- status-only reporting (#50): the "quiet" project runs as muse and
+  // reports the fixed status words only. The receiving side refuses free
+  // text, links and unknown states before anything is saved.
+  // The fixture is already at the item limit, so the open request on
+  // foreign-p0 (planned, addressed to muse) is moved to the quiet project.
+  check("a request cannot switch a job's reporting mode", code(await call(K.alpha, "board_request_handoff", { item_id: "foreign-p0", to: "muse", status_only: true })) === -32602);
+  await call(K.alpha, "board_upsert_item", { item_id: "foreign-p0", project: "quiet" });
+  const quietJob = "foreign-p0";
+  const quietRequest = () => call(K.alpha, "board_request_status", { item_id: quietJob }).then((s) => s.request_id);
+  await call(K.alpha, "board_route_handoff", { item_id: quietJob, to: "vps-claude" });
+  check("the named-but-unregistered taker cannot run it",
+    code(await call(K.vps, "board_accept_handoff", { item_id: quietJob, request_id: await quietRequest() })) === "FORBIDDEN");
+  check("the registered taker cannot take work addressed elsewhere either",
+    code(await call(K.muse, "board_accept_handoff", { item_id: quietJob, request_id: await quietRequest() })) === "FORBIDDEN");
+  check("the mismatched job stays parked as requested",
+    (await call(K.alpha, "board_list", {})).items.find(i => i.item_id === quietJob)?.handoff?.state === "requested");
+  await call(K.alpha, "board_route_handoff", { item_id: quietJob, to: null });
+  check("a registered project without a destination holds too",
+    code(await call(K.muse, "board_accept_handoff", { item_id: quietJob, request_id: await quietRequest() })) === "FORBIDDEN");
+  await call(K.alpha, "board_route_handoff", { item_id: quietJob, to: "muse" });
+  const quietFence = { item_id: quietJob, request_id: await quietRequest() };
+  check("a taker missing its registration cannot accept", code(await call(K.muse, "board_accept_handoff", quietFence)) === "FORBIDDEN");
+  const quietAccepted = await call(K.muse, "board_accept_handoff", { ...quietFence, report_mode: "status_only" });
+  check("the registered taker takes status-only work", quietAccepted.handoff?.accepted_by === "muse", JSON.stringify(quietAccepted));
+  const fence = { ...quietFence, generation: quietAccepted.handoff?.generation };
+  const quietBaseline = (await call(K.alpha, "board_list", {})).items.find(i => i.item_id === quietJob);
+  const quietEventsBefore = (await call(K.alpha, "board_list", { since_seq: 0 })).events.filter(e => e.item_id === quietJob).length;
+  check("another writer cannot append free text to a restricted card", code(await call(K.alpha, "board_add_event", { item_id: quietJob, kind: "note", text: "fixture detail" })) === "FORBIDDEN");
+  check("the status-only taker cannot use a generic write for its report", code(await call(K.muse, "board_upsert_item", { ...fence, title: "fixture detail" })) === "FORBIDDEN");
+  check("a stopped status cannot close the card as done", code(await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", text: "状態：要確認" })) === "FORBIDDEN");
+  check("free text is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "MARKER-FREETEXT-2f6c1d detail" })) === "FORBIDDEN");
+  check("an unknown status is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "状態：できました" })) === "FORBIDDEN");
+  check("a link is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "状態：作業中", ref: "https://example.com/x" })) === "FORBIDDEN");
+  check("a session event is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "session_start", text: "状態：作業中" })) === "FORBIDDEN");
+  check("a free-text completion is refused", code(await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", text: "MARKER-DONE-8a4e2b" })) === "FORBIDDEN");
+  check("a result link is refused", code(await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", ref: "https://example.com/pr/1" })) === "FORBIDDEN");
+  check("a commit is refused", code(await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", commit: "0123abc" })) === "FORBIDDEN");
+  check("the plain event path is refused too", code(await call(K.muse, "board_add_event", { item_id: quietJob, kind: "note", text: "MARKER-PLAIN-9d3b7e" })) === "FORBIDDEN");
+  const quietAfter = (await call(K.alpha, "board_list", {})).items.find(i => i.item_id === quietJob);
+  const quietEventsAfter = (await call(K.alpha, "board_list", { since_seq: 0 })).events.filter(e => e.item_id === quietJob).length;
+  check("nothing was saved: card and history are unchanged",
+    quietAfter.state === quietBaseline.state && quietAfter.revision === quietBaseline.revision && quietEventsAfter === quietEventsBefore,
+    JSON.stringify({ state: quietAfter.state, revision: quietAfter.revision, events: quietEventsAfter }));
+  check("a status word is taken", (await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "状態：作業中" })).ok === true);
+  const quietDone = await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", text: "状態：完了" });
+  check("a status-word completion closes the work", quietDone.ok === true && quietDone.item?.state === "done", JSON.stringify(quietDone));
 
   // --- the item limit (27 in this run)
   let lastCode = "OK";

@@ -94,6 +94,7 @@ export const TOOLS: Json[] = [
       item_id: text("The item that was handed over"),
       request_id: text("handoff.request_id of that item"),
       versions: text("Optional: what this taker runs with, as name=commit pairs separated by commas (e.g. picker=1a2b3c4,rules=5d6e7f8; up to 8, commits 7 to 40 hex). Recorded on the handoff and in the accept's event"),
+      report_mode: { type: "string", enum: ["status_only"], description: "Required for a status-only handoff. Confirm that local registration matches this writer and board. Omit versions." },
     },
     ["item_id", "request_id"],
   ),

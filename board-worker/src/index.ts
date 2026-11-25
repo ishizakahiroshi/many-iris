@@ -22,6 +22,7 @@ import { DISPATCH_ACTOR, runDispatcher, spawnDevinSession, type DispatchDeps } f
 import { authenticate } from "./keys";
 import { handle } from "./mcp";
 import { SCOPE, authorize } from "./oauth";
+import { parseStatusOnly } from "./status-only";
 import { validActor, validItemId } from "./rules";
 import { DEFAULT_LIMITS, Store, guarded, type Limits } from "./store";
 import { HANDOFF_LEASE_MS } from "./resume";
@@ -38,6 +39,10 @@ export interface Env {
   BOARD_PUBLIC_ORIGIN?: string;
   /** JSON: {"schema_version":1,"writers":[{"actor","token_sha256","enabled"}]} */
   BOARD_WRITERS?: string;
+  /** JSON: {"schema_version":1,"status_only":[{"project","actor"}]} — work in these
+   * projects may only be taken by the registered actor as its named destination,
+   * and its runs report the fixed status words (status-only.ts, #50). */
+  BOARD_STATUS_ONLY?: string;
   /** Cloudflare Access settings for the people who read the page (see access.ts). */
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
@@ -76,7 +81,9 @@ export class BoardStore extends DurableObject<Env> {
   private store: Store;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN));
+    const policies = env.BOARD_STATUS_ONLY === undefined ? [] : parseStatusOnly(env.BOARD_STATUS_ONLY);
+    if (!policies) throw new Error("Invalid BOARD_STATUS_ONLY configuration");
+    this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN), policies);
     ctx.blockConcurrencyWhile(async () => this.store.init());
   }
   async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted"): Promise<Record<string, unknown>> {

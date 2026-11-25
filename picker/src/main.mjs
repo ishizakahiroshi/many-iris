@@ -92,6 +92,38 @@ export function configFromEnv(env) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 50) throw new Error("PICKER_MAX_RUNS_PER_DAY must be 0 (no cap) or an integer from 1 to 50");
       return value;
     })(),
+    // Status-only reporting (#50): a JSON array of
+    // {"project","writer","board"} entries binds a project's reporting to one
+    // taker and one board. A job in a registered project reports the fixed
+    // status words only; one whose entry names another writer or board is
+    // held, never run with ordinary reporting. Nothing in the work itself
+    // can switch this on or off.
+    statusOnly: (() => {
+      const raw = env.PICKER_STATUS_ONLY;
+      if (typeof raw !== "string" || raw.trim() === "") return [];
+      const bad = () => { throw new Error('PICKER_STATUS_ONLY must be a JSON array of {"project","writer","board"} entries (project 1 to 80 characters, writer ^[a-z0-9-]{1,32}$, board the MCP endpoint https URL; at most 64, distinct projects)'); };
+      let value;
+      try { value = JSON.parse(raw); } catch { bad(); }
+      if (!Array.isArray(value) || value.length > 64) bad();
+      const entries = [];
+      const seen = new Set();
+      for (const e of value) {
+        if (e === null || typeof e !== "object" || Array.isArray(e)) bad();
+        if (Object.keys(e).some((k) => !["project", "writer", "board"].includes(k))) bad();
+        if (typeof e.project !== "string" || e.project.length === 0 || e.project.length > 80) bad();
+        if (typeof e.writer !== "string" || !/^[a-z0-9-]{1,32}$/.test(e.writer)) bad();
+        if (typeof e.board !== "string") bad();
+        const board = e.board.replace(/\/+$/, "");
+        let endpoint;
+        try { endpoint = new URL(board); } catch { bad(); }
+        const loopback = endpoint.protocol === "http:" && ["127.0.0.1", "localhost"].includes(endpoint.hostname);
+        if ((endpoint.protocol !== "https:" && !loopback) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) bad();
+        if (seen.has(e.project)) bad();
+        seen.add(e.project);
+        entries.push({ project: e.project, writer: e.writer, board });
+      }
+      return entries;
+    })(),
     stateFile: env.PICKER_STATE_FILE ?? "picker-state.json",
     // What this picker runs with, sent with every accept (#46 Q8), e.g.
     // "picker=<commit>,rules=<commit>": the picker's own commit, and the
@@ -197,7 +229,7 @@ async function pass(config, executor) {
   }
   try {
     // A conversation turn first: the owner is waiting on the other end.
-    const chat = await runChatPass({ client, executor, log, attachDir: config.attachDir });
+    const chat = await runChatPass({ client, executor, log, attachDir: config.attachDir, config });
     if (chat.kind !== "nothing") return chat;
     return await runPass({ client, config, executor, state: fileState(config.stateFile), log });
   } finally {
