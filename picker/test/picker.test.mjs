@@ -85,6 +85,9 @@ class FakeBoard {
     }
     const it = this.items.find((i) => i.item_id === args.item_id);
     switch (tool) {
+      case "board_report_requester_declined":
+        it.handoff.requester_declined_at = Date.now();
+        return { ok: true };
       case "board_accept_handoff": {
         if (!it || !it.handoff) throw new BoardRefusal("NOT_FOUND", "No such item");
         const h = it.handoff;
@@ -213,6 +216,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   check("nothing eligible means nothing taken", outcome.kind === "nothing", JSON.stringify(outcome));
   check("no accept was attempted for unrelated work", board.callsOf("board_accept_handoff").length === 0);
   check("the executor never ran", executor.jobs.length === 0);
+}
+
+{
+  const board = new FakeBoard([item({}, { requested_by: "another-writer" })]);
+  const executor = new RecordExecutor();
+  for (let pass = 0; pass < 2; pass++)
+    await runPass({ client: board, config: baseConfig, executor, state: state() });
+  check("a requester refusal is reported once and never runs", board.callsOf("board_report_requester_declined").length === 1 && executor.jobs.length === 0);
 }
 
 // --- a second picker finds the work gone ----------------------------

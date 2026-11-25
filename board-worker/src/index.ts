@@ -104,6 +104,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.listForTool(args);
         case "board_my_work":
           return this.store.myWork(actor, args, policy === "restricted");
+        case "board_report_requester_declined":
+          return this.store.reportRequesterDeclined(actor, args);
         case "board_request_status":
           return this.store.requestStatus(args);
         case "board_request_handoff":

@@ -178,7 +178,7 @@ const num = (v: SqlStorageValue) => Number(v);
 const HANDOFF_COLUMNS = [
   "handoff_state", "handoff_request", "handoff_at", "handoff_actor", "handoff_accepted_at", "handoff_to", "handoff_by",
   "handoff_to_by", "handoff_title", "handoff_generation", "handoff_heartbeat_at", "handoff_lease_until",
-  "handoff_versions", "handoff_result_ref", "handoff_result_commit", "handoff_phase", "handoff_phase_at",
+  "handoff_versions", "handoff_result_ref", "handoff_result_commit", "handoff_phase", "handoff_phase_at", "handoff_declined_at",
 ];
 // Only exact notes from the current, fenced run can change its reported phase.
 const PHASE_NOTE = /^工程：(作業コマンド起動|担当AI起動|調査中|実装中|テスト中|回答待ち|提出前検査中)$/u;
@@ -288,6 +288,7 @@ export class Store {
     this.addColumn("handoff_result_commit", "TEXT");
     this.addColumn("handoff_phase", "TEXT");
     this.addColumn("handoff_phase_at", "INTEGER");
+    this.addColumn("handoff_declined_at", "INTEGER");
     // Every tool call looks for requested handoffs (watchTargets, after each
     // answer) and the dispatcher does every ten minutes; without this index
     // each look read the whole item table (issue #38).
@@ -901,7 +902,7 @@ export class Store {
       const handoff = this.loadHandoff(itemId);
       if (handoff === null || handoff.state !== "requested" || handoff.request_id !== request || handoff.to !== null)
         return { ok: true, changed: false, handoff };
-      this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, toSetBy, itemId);
+      this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=?,handoff_declined_at=NULL WHERE item_id=?", to, toSetBy, itemId);
       this.insertEvent(itemId, Date.now(), actor, "note", text, null);
       return { ok: true, changed: true, handoff: this.loadHandoff(itemId) };
     });
@@ -934,6 +935,7 @@ export class Store {
       generation: view.generation,
       heartbeat_at: heartbeatAt === null ? null : num(heartbeatAt),
       phase: r[prefix + "handoff_phase"] ?? null,
+      ...(state === "requested" && r[prefix + "handoff_declined_at"] != null ? { requester_declined_at: num(r[prefix + "handoff_declined_at"]) } : {}),
       phase_at: r[prefix + "handoff_phase_at"] ?? null,
       lease_until: view.lease_until,
       lease_expired: leaseExpired(view, Date.now()),
@@ -968,7 +970,7 @@ export class Store {
   /** Clears a handoff back to the pile. The generation stays, on purpose. */
   private clearHandoff(itemId: string): void {
     this.sql.exec(
-      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state=NULL,handoff_request=NULL,handoff_at=NULL,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=NULL,handoff_by=NULL,handoff_to_by=NULL,handoff_title=NULL,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL,handoff_declined_at=NULL WHERE item_id=?",
       itemId,
     );
   }
@@ -1488,7 +1490,7 @@ export class Store {
     const request = newId(day, "REQ-");
     const now = Date.now();
     this.sql.exec(
-      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL WHERE item_id=?",
+      "UPDATE board_items SET handoff_state='requested',handoff_request=?,handoff_at=?,handoff_actor=NULL,handoff_accepted_at=NULL,handoff_to=?,handoff_by=?,handoff_to_by=?,handoff_title=?,handoff_generation=?,handoff_heartbeat_at=NULL,handoff_lease_until=NULL,handoff_versions=NULL,handoff_result_ref=NULL,handoff_result_commit=NULL,handoff_phase=NULL,handoff_phase_at=NULL,handoff_declined_at=NULL WHERE item_id=?",
       request, now, to, actor, to === null ? null : actor, item.title, nextGeneration(this.loadGeneration(item.item_id)), item.item_id,
     );
     this.insertEvent(item.item_id, now, actor, "note", handedText(request, to), null, "requested");
@@ -1509,7 +1511,7 @@ export class Store {
     if (handoff.to === to) return false;
     const item = this.loadItem(itemId);
     if (item !== null) this.checkScope(item.project, to);
-    this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=? WHERE item_id=?", to, to === null ? null : actor, itemId);
+    this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=?,handoff_declined_at=NULL WHERE item_id=?", to, to === null ? null : actor, itemId);
     this.insertEvent(itemId, now, actor, "note", `routed ${String(handoff.request_id)} to ${to ?? "the board's choice"}`, null);
     return true;
   }
@@ -1555,6 +1557,21 @@ export class Store {
       this.withdraw(actor, itemId, handoff, Date.now());
       return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
     });
+  }
+
+  reportRequesterDeclined(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "request_id", "to_set_by"]);
+    const id = requiredStr(obj, "item_id");
+    const request = requiredStr(obj, "request_id");
+    const routedBy = requiredStr(obj, "to_set_by");
+    // One fixed receipt, scoped to the exact pending request and routing decision.
+    // Stale reports and retries have no effect and disclose no item information.
+    this.sql.exec(
+      "UPDATE board_items SET handoff_declined_at=? WHERE item_id=? AND handoff_request=? AND handoff_to=? AND handoff_to_by=? AND handoff_state='requested' AND handoff_declined_at IS NULL",
+      Date.now(), id, request, actor, routedBy,
+    );
+    return { ok: true };
   }
 
   /**
@@ -1810,7 +1827,7 @@ export class Store {
           ).toArray() as Row[]) {
             const to = str(r.handoff_to);
             if (UNTAKEN_TARGETS.has(to) || isLocalTarget(to)) continue;
-            this.sql.exec("UPDATE board_items SET handoff_to=NULL,handoff_to_by=NULL WHERE item_id=?", str(r.item_id));
+            this.sql.exec("UPDATE board_items SET handoff_to=NULL,handoff_to_by=NULL,handoff_declined_at=NULL WHERE item_id=?", str(r.item_id));
             this.insertEvent(str(r.item_id), now, actor, "note",
               `routed ${String(r.handoff_request)} to the board's choice: project ${project} became 手元だけ, and ${to} is outside it`, null);
             rerouted += 1;

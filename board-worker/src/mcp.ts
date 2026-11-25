@@ -12,7 +12,7 @@ export type ToolRunner = (tool: string, args: Json) => Promise<Json>;
 export type ToolPolicy = "trusted" | "restricted";
 
 const RESTRICTED_TOOLS = new Set([
-  "board_my_work", "board_accept_handoff",
+  "board_my_work", "board_accept_handoff", "board_report_requester_declined",
   "board_heartbeat_handoff", "board_progress_handoff", "board_complete_handoff",
 ]);
 
@@ -70,6 +70,12 @@ export const TOOLS: Json[] = [
     "Read only what concerns you: work handed to you that waits to be taken (handoff.state requested, handoff.to = you), your own runs (accepted or unknown), how many conversation turns wait for you, the projects the owner marked 手元だけ (scopes), and whether the owner stopped everything (paused: while true, take nothing; accepts and chat takes are refused with PAUSED, and heartbeats answer stop: true). Much cheaper than board_list for a taker that polls.",
     { project: text("Only this project") },
     [],
+  ),
+  tool(
+    "board_report_requester_declined",
+    "Record that this picker saw its pending request and declined the requester or route setter under its local admission policy. Does not take or run the work.",
+    { item_id: text("Item ID"), request_id: text("Observed request ID"), to_set_by: text("Observed routing actor") },
+    ["item_id", "request_id", "to_set_by"],
   ),
   tool(
     "board_request_status",
