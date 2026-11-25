@@ -12,8 +12,11 @@
  * the cloud (the board starts its sessions), `vps-*` run on the always-on
  * server, `local-*` on the owner's PC. `owner` and `hold` are not writers.
  */
+// The existing MuseDev card recipient, separate from Muse and Devin.
+export const MUSE_DEV = "muse-dev";
+
 export const HANDOFF_TARGETS = [
-  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "dots", "owner", "hold",
+  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", MUSE_DEV, "muse", "grokbot", "dots", "owner", "hold",
 ] as const;
 export type HandoffTarget = (typeof HANDOFF_TARGETS)[number];
 

@@ -2,6 +2,7 @@
 // same JSON as the Rust board's writers file). The actor always comes from the
 // key, never from the request body.
 import { HANDOFF_TARGETS, MAX_KEYS, validActor } from "./rules";
+import { MUSE_DEV } from "./route";
 
 interface KeyEntry {
   actor: string;
@@ -43,7 +44,7 @@ export function parseKeys(raw: string | undefined): KeyEntry[] | null {
     if (typeof e.token_sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(e.token_sha256)) return null;
     if (typeof e.enabled !== "boolean") return null;
     if (e.policy !== undefined && e.policy !== "trusted" && e.policy !== "restricted") return null;
-    const policy = (e.policy ?? "trusted") as "trusted" | "restricted";
+    const policy = e.actor === MUSE_DEV ? "restricted" : (e.policy ?? "trusted") as "trusted" | "restricted";
     // OAuth-generated actor names share these reserved identities. A restricted
     // key must never inherit a broader OAuth principal through an actor collision.
     if (policy === "restricted" && (!HANDOFF_TARGETS.includes(e.actor as typeof HANDOFF_TARGETS[number]) || e.actor === "owner" || e.actor === "hold")) return null;

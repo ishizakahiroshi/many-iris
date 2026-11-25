@@ -14,7 +14,7 @@ function check(name, condition, detail = "") {
 
 // --- pure parts: the destinations, the order and who is alive
 check("destinations are a tool and the place it runs", ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin"].every((t) => HANDOFF_TARGETS.includes(t)));
-check("owner and hold cannot be in the order", !ORDERABLE.includes("owner") && !ORDERABLE.includes("hold") && ORDERABLE.length === HANDOFF_TARGETS.length - 2);
+check("the configured order supports MuseDev and excludes owner and hold", HANDOFF_TARGETS.includes("muse-dev") && !ORDERABLE.includes("owner") && !ORDERABLE.includes("hold") && ORDERABLE.includes("muse-dev") && ORDERABLE.length === HANDOFF_TARGETS.length - 2);
 check("the default order is the server, the PC, then Devin", DEFAULT_ORDER.join(",") === "vps-claude,local-claude,devin");
 check("an order is distinct destinations in order", parseOrder(["devin", "vps-claude"])?.join(",") === "devin,vps-claude");
 check("an empty order is allowed (everything goes to hold)", parseOrder([])?.length === 0);

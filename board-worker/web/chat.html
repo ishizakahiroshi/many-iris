@@ -48,6 +48,11 @@
             <button id="chat-start-send" type="submit" class="chat-send" aria-label="送る">↑</button>
           </div>
         </form>
+        <div id="chat-start-recovery" hidden>
+          <p>MuseDev への前回の送信結果を確認できていません。同じ内容を再送すると、元の依頼を照合します。</p>
+          <a id="chat-start-previous" href="#">前回の会話を開く</a>
+          <button id="chat-start-separate" type="button">別の依頼を始める</button>
+        </div>
         <p id="chat-start-status" class="chat-status" role="status"></p>
         <p class="chat-hint">最初のひとことが仕事の題名になり、そのまま相手に任せます（200 字まで）。詳しいことは、続けて書けます。返事は 1〜数分で届きます。</p>
       </section>
@@ -56,7 +61,13 @@
         <div id="chat-log" class="chat-log"></div>
         <div class="chat-foot">
           <p id="chat-state" class="chat-state" role="status"></p>
-          <form id="chat-form" class="chat-box">
+          <form id="chat-muse-reroute" hidden>
+              <label>未受理の依頼の宛先を変更
+                <select id="chat-muse-replacement" required><option value="">相手を選ぶ</option></select>
+              </label>
+              <button id="chat-muse-reroute-button" type="submit">この依頼の宛先を変更</button>
+            </form>
+            <form id="chat-form" class="chat-box">
             <ul id="chat-attach" class="chat-attach" aria-label="添付" hidden></ul>
             <label class="sr-only" for="chat-text">送る文</label>
             <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>
