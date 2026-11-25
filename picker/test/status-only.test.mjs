@@ -47,6 +47,7 @@ function item(overrides = {}, handoffOverrides = {}) {
     state: "planned",
     handoff: {
       state: "requested",
+      report_mode: (overrides.project ?? "quiet") === "quiet" ? "status_only" : undefined,
       request_id: "REQ-1",
       to: "muse",
       requested_by: "page:owner",

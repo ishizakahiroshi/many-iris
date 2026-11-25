@@ -81,7 +81,9 @@ export class BoardStore extends DurableObject<Env> {
   private store: Store;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN), parseStatusOnly(env.BOARD_STATUS_ONLY) ?? []);
+    const policies = env.BOARD_STATUS_ONLY === undefined ? [] : parseStatusOnly(env.BOARD_STATUS_ONLY);
+    if (!policies) throw new Error("Invalid BOARD_STATUS_ONLY configuration");
+    this.store = new Store(ctx.storage, limitsFrom(env), publicOrigin(env.BOARD_PUBLIC_ORIGIN), policies);
     ctx.blockConcurrencyWhile(async () => this.store.init());
   }
   async run(tool: string, actor: string, args: Record<string, unknown>, policy: "trusted" | "restricted" = "trusted"): Promise<Record<string, unknown>> {

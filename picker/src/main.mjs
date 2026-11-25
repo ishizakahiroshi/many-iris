@@ -114,7 +114,10 @@ export function configFromEnv(env) {
         if (typeof e.writer !== "string" || !/^[a-z0-9-]{1,32}$/.test(e.writer)) bad();
         if (typeof e.board !== "string") bad();
         const board = e.board.replace(/\/+$/, "");
-        if (!board.startsWith("https://") && !board.startsWith("http://127.0.0.1") && !board.startsWith("http://localhost")) bad();
+        let endpoint;
+        try { endpoint = new URL(board); } catch { bad(); }
+        const loopback = endpoint.protocol === "http:" && ["127.0.0.1", "localhost"].includes(endpoint.hostname);
+        if ((endpoint.protocol !== "https:" && !loopback) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) bad();
         if (seen.has(e.project)) bad();
         seen.add(e.project);
         entries.push({ project: e.project, writer: e.writer, board });
@@ -226,7 +229,7 @@ async function pass(config, executor) {
   }
   try {
     // A conversation turn first: the owner is waiting on the other end.
-    const chat = await runChatPass({ client, executor, log, attachDir: config.attachDir });
+    const chat = await runChatPass({ client, executor, log, attachDir: config.attachDir, config });
     if (chat.kind !== "nothing") return chat;
     return await runPass({ client, config, executor, state: fileState(config.stateFile), log });
   } finally {

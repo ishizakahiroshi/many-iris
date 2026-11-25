@@ -59,10 +59,10 @@ function makeBoard(name, port, writerEntries, statusOnlyActor) {
   const base = `http://127.0.0.1:${port}`;
   const writers = { schema_version: 1, writers: writerEntries };
   const statusOnly = { schema_version: 1, status_only: [{ project: "quiet", actor: statusOnlyActor }] };
-  const board = { name, dir, port, base, child: null, env: () => {
+  const board = { name, dir, port, base, child: null, statusOnly, env: () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "test.env"),
-      `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nACCESS_TEAM_DOMAIN=http://127.0.0.1:9\nACCESS_AUD=${randomBytes(32).toString("hex")}\nBOARD_OWNERS=owner@example.com\nBOARD_LEASE_MS=60000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+      `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(board.statusOnly)}'\nACCESS_TEAM_DOMAIN=http://127.0.0.1:9\nACCESS_AUD=${randomBytes(32).toString("hex")}\nBOARD_OWNERS=owner@example.com\nBOARD_LEASE_MS=60000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
   } };
   boards.push(board);
   return board;
@@ -202,19 +202,17 @@ try {
     JSON.stringify(calls(muse.sent, "board_progress_handoff").map((r) => r.params.arguments.text)));
 
   // --- acceptance 3: two boards, one item number, separate keys -----------
-  const wrongKey = async (base, badKey) => (await fetch(`${base}/board/mcp`, {
+  const wrongKey = async (base, badKey, write = false) => (await fetch(`${base}/board/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${badKey}` },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_list", arguments: {} } }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: write
+      ? { name: "board_upsert_item", arguments: { item_id: "shared-1", title: "fixture change" } }
+      : { name: "board_list", arguments: {} } }),
   })).status;
-  check("A's key cannot read B, B's key cannot read A",
+  check("each board refuses reads using the other board's key",
     await wrongKey(boardB.base, K.muse) === 401 && await wrongKey(boardA.base, K.grokbot) === 401);
-  check("A's key cannot write B either",
-    (await fetch(`${boardB.base}/board/mcp`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${K.muse}` },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_upsert_item", arguments: { item_id: "shared-1", title: "hijack" } } }),
-    })).status === 401);
+  check("each board refuses writes using the other board's key",
+    await wrongKey(boardB.base, K.muse, true) === 401 && await wrongKey(boardA.base, K.grokbot, true) === 401);
 
   const runSharedA = await runPass({ client: muse.client, config: pickerA, state: freshState(),
     executor: new ScriptedExecutor({ result: { outcome: "done", text: JSON.stringify({ summary: "SHARED-A-11aa22", ref: "https://example.com/a/1" }) } }) });
@@ -268,16 +266,31 @@ try {
   check("the held job stays requested and unrun",
     itemOf(await listed(alpha), "quiet-held")?.handoff?.state === "requested");
 
-  // A picker without the registration takes the job as ordinary work; the
-  // board refuses its free-text report and the run is fenced out before
-  // the executor could start (実行も報告も始まらない).
+  // Check both ends before acceptance or transmission of any free-text report.
+  const beforeBare = muse.sent.length;
   const bareExecutor = new ScriptedExecutor();
   const bare = await runPass({ client: muse.client, state: freshState(), executor: bareExecutor,
     config: { ...pickerA, statusOnly: [] } });
-  check("an unregistered picker is fenced out by the board's own refusal",
-    bare.kind === "fenced-out" && bareExecutor.jobs.length === 0, JSON.stringify(bare));
+  check("missing picker registration leaves the job pending without a run or report",
+    bare.kind === "held" && bareExecutor.jobs.length === 0 &&
+    ["board_accept_handoff", "board_progress_handoff", "board_complete_handoff"].every(t => calls(muse.sent.slice(beforeBare), t).length === 0) &&
+    itemOf(await listed(alpha), "quiet-held")?.handoff?.state === "requested", JSON.stringify(bare));
+  await hand(beta, "missing-board-registration", "new-project", "grokbot");
+  const missingBoard = await runPass({ client: grokbot.client, state: freshState(), executor: bareExecutor,
+    config: { ...pickerB, statusOnly: [{ project: "new-project", writer: "grokbot", board: urlB }] } });
+  check("missing board registration leaves the job pending", missingBoard.kind === "held" && bareExecutor.jobs.length === 0 &&
+    itemOf(await listed(beta), "missing-board-registration")?.handoff?.state === "requested");
   check("its ordinary report never landed",
     eventsFor(await listed(alpha), "quiet-held").every((t) => !t.includes("開始") && !t.startsWith("状態：")));
+  stop(boardA);
+  boardA.statusOnly = { schema_version: 1, status_only: [] };
+  await start(boardA);
+  const restored = itemOf(await listed(alpha), "quiet-held");
+  check("removing the policy after a restart keeps the restriction",
+    restored?.handoff?.report_mode === "status_only" &&
+    await code(muse.client.call("board_accept_handoff", { item_id: "quiet-held",
+      request_id: restored.handoff.request_id, report_mode: "status_only" })) === "FORBIDDEN");
+
 } finally {
   for (const board of boards) stop(board);
   // Windows keeps the state directory locked for a moment after wrangler dev

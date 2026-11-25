@@ -1092,11 +1092,15 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     code(await call(K.muse, "board_accept_handoff", { item_id: quietJob, request_id: await quietRequest() })) === "FORBIDDEN");
   await call(K.alpha, "board_route_handoff", { item_id: quietJob, to: "muse" });
   const quietFence = { item_id: quietJob, request_id: await quietRequest() };
-  const quietAccepted = await call(K.muse, "board_accept_handoff", quietFence);
+  check("a taker missing its registration cannot accept", code(await call(K.muse, "board_accept_handoff", quietFence)) === "FORBIDDEN");
+  const quietAccepted = await call(K.muse, "board_accept_handoff", { ...quietFence, report_mode: "status_only" });
   check("the registered taker takes status-only work", quietAccepted.handoff?.accepted_by === "muse", JSON.stringify(quietAccepted));
   const fence = { ...quietFence, generation: quietAccepted.handoff?.generation };
   const quietBaseline = (await call(K.alpha, "board_list", {})).items.find(i => i.item_id === quietJob);
   const quietEventsBefore = (await call(K.alpha, "board_list", { since_seq: 0 })).events.filter(e => e.item_id === quietJob).length;
+  check("another writer cannot append free text to a restricted card", code(await call(K.alpha, "board_add_event", { item_id: quietJob, kind: "note", text: "fixture detail" })) === "FORBIDDEN");
+  check("the status-only taker cannot use a generic write for its report", code(await call(K.muse, "board_upsert_item", { ...fence, title: "fixture detail" })) === "FORBIDDEN");
+  check("a stopped status cannot close the card as done", code(await call(K.muse, "board_complete_handoff", { ...fence, outcome: "done", text: "状態：要確認" })) === "FORBIDDEN");
   check("free text is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "MARKER-FREETEXT-2f6c1d detail" })) === "FORBIDDEN");
   check("an unknown status is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "状態：できました" })) === "FORBIDDEN");
   check("a link is refused", code(await call(K.muse, "board_progress_handoff", { ...fence, kind: "note", text: "状態：作業中", ref: "https://example.com/x" })) === "FORBIDDEN");

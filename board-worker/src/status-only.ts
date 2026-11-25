@@ -25,8 +25,7 @@ const validActor = (s: string) => /^[a-z0-9-]{1,32}$/.test(s);
 /**
  * Parses `{"schema_version":1,"status_only":[{"project","actor"}]}` — the
  * same strict shape as the writer key list: anything unexpected makes the
- * whole list unusable (null), so a half-written registration silently
- * narrows nothing.
+ * whole list unusable (null). The Worker refuses to start with an invalid list.
  */
 export function parseStatusOnly(raw: string | undefined): StatusOnlyEntry[] | null {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > 65536) return null;

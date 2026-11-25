@@ -88,6 +88,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     else parts.push('工程未報告');
     if (h.state === 'unknown' || h.lease_expired) parts.push('要確認：担当の状態を確認');
     else if (h.phase === '回答待ち') parts.push('あなたの回答が必要');
+    else if (h.phase === '要確認') parts.push('実行端末で確認');
     else if (item.state === 'waiting') parts.push('待ち理由を確認');
     else parts.push('続報待ち');
     if (Number.isFinite(h.heartbeat_at)) parts.push('最終通信 ' + phaseTime.format(h.heartbeat_at));

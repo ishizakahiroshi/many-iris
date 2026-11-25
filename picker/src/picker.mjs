@@ -205,7 +205,8 @@ export async function runPass({ client, config, executor, state, log = () => {},
       // A status-only registration that names another writer or board holds
       // the job here: it stays requested and is never run with ordinary
       // reporting (the board refuses the accept the same way).
-      if (statusOnlyFor(run.project, config) === "held") {
+      const registration = statusOnlyFor(run.project, config);
+      if (registration === "held" || (item.handoff.report_mode ?? null) !== (registration === "restricted" ? "status_only" : null)) {
         held.push(run.itemId);
         continue;
       }
@@ -233,7 +234,8 @@ export async function runPass({ client, config, executor, state, log = () => {},
   let accepted;
   try {
     const acceptArgs = { item_id: chosen.itemId, request_id: chosen.requestId };
-    if (typeof config.versions === "string" && config.versions.length > 0) acceptArgs.versions = config.versions;
+    if (restricted) acceptArgs.report_mode = "status_only";
+    else if (typeof config.versions === "string" && config.versions.length > 0) acceptArgs.versions = config.versions;
     accepted = await client.call("board_accept_handoff", acceptArgs);
   } catch (error) {
     if (error instanceof BoardRefusal) {
@@ -463,7 +465,7 @@ export function privateTurnDir(base, prefix) {
   }
 }
 
-export async function runChatPass({ client, executor, log = () => {}, attachDir = null }) {
+export async function runChatPass({ client, executor, log = () => {}, attachDir = null, config = {} }) {
   let pending;
   try {
     pending = await client.call("board_chat_pending", {});
@@ -471,7 +473,7 @@ export async function runChatPass({ client, executor, log = () => {}, attachDir 
     if (error instanceof BoardUnreachable || error instanceof BoardRefusal) return { kind: "nothing" };
     throw error;
   }
-  const turn = Array.isArray(pending?.turns) ? pending.turns[0] : undefined;
+  const turn = Array.isArray(pending?.turns) ? pending.turns.find(t => !statusOnlyFor(t.project, config)) : undefined;
   if (!turn || typeof turn.item_id !== "string" || !Number.isSafeInteger(turn.seq)) return { kind: "nothing" };
   let taken;
   try {

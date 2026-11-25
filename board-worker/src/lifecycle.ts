@@ -156,7 +156,7 @@ export function deriveLifecycle(input: LifecycleInput, now: number): Lifecycle {
       out.summary = `${h.accepted_by ?? "担当"} が受け付けました。ただし、受付のあとの連絡（進捗・心拍）はまだありません。`;
       out.unconfirmed.push("着手したかどうかは、受付のあとの連絡が来るまで確認できません");
     }
-    if (h.phase === "回答待ち") out.needs_attention = true;
+    if (h.phase === "回答待ち" || h.phase === "要確認") out.needs_attention = true;
     return out;
   }
 

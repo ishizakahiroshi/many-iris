@@ -230,6 +230,13 @@ export class Store {
   }
 
   init(): void {
+    // A missing taker registration must hold previously restricted work, including after a restart.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS status_only_projects(project TEXT PRIMARY KEY)");
+    for (const project of this.statusOnlyMap.keys()) this.sql.exec("INSERT OR IGNORE INTO status_only_projects VALUES(?)", project);
+    for (const row of this.sql.exec("SELECT project FROM status_only_projects")) {
+      const project = str(row.project);
+      if (!this.statusOnlyMap.has(project)) this.statusOnlyMap.set(project, new Set());
+    }
     for (const statement of SCHEMA) this.sql.exec(statement);
     for (const statement of CHAT_SCHEMA) this.sql.exec(statement);
     try { this.sql.exec("SELECT context_confirmed FROM chat_messages LIMIT 0"); } catch {
@@ -341,7 +348,7 @@ export class Store {
     const rows = this.sql.exec(
       "SELECT item_id,project,title,source_ref,handoff_request,handoff_at,handoff_to,handoff_by FROM board_items WHERE handoff_state='requested' ORDER BY handoff_at",
     ).toArray() as Row[];
-    const items = rows.map((r) => ({
+    const items = rows.filter(r => !this.statusOnlyFor(str(r.project))).map((r) => ({
       item_id: str(r.item_id), project: str(r.project), title: str(r.title),
       source_ref: strOrNull(r.source_ref), request_id: strOrNull(r.handoff_request), requested_at: num(r.handoff_at),
       to: strOrNull(r.handoff_to ?? null), requested_by: strOrNull(r.handoff_by ?? null),
@@ -629,6 +636,7 @@ export class Store {
       const item = this.loadItem(itemId);
       if (item === null) throw new BoardError("NOT_FOUND", "No such item");
       if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) has a conversation");
+      this.requireChatAllowed(item.project);
       const sums = this.sql.exec(
         "SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS b, COALESCE(SUM(CASE WHEN seq IS NULL THEN 1 ELSE 0 END),0) AS u FROM chat_attachments WHERE item_id=?", itemId,
       ).one() as Row;
@@ -665,6 +673,7 @@ export class Store {
     onlyKeys(obj, ["attachment_id", "offset", "limit"]);
     if (!isChatTarget(actor)) throw new BoardError("FORBIDDEN", "Only the server's workers read attachments");
     const meta = this.attachmentMeta(requiredStr(obj, "attachment_id"));
+    this.requireChatAllowed(this.loadItem(meta.item_id)?.project ?? null);
     const offset = has(obj, "offset") ? obj.offset : 0;
     const limit = has(obj, "limit") ? obj.limit : READ_MAX_CHARS;
     if (!nonNegativeInteger(offset)) throw invalid("offset must be a non-negative integer");
@@ -737,6 +746,7 @@ export class Store {
       if (item === null) throw new BoardError("NOT_FOUND", "No such item");
       if (item.kind !== "task") throw new BoardError("FORBIDDEN", "Only work (kind task) has a conversation");
       // The conversation partners are the server's workers: a 手元だけ project's work does not go to the server.
+      this.requireChatAllowed(item.project);
       if (this.projectIsLocal(item.project))
         throw new BoardError("FORBIDDEN", `Project ${item.project} is 手元だけ: its work is not talked over with the server's AI`);
       const open = num((this.sql.exec(
@@ -774,6 +784,7 @@ export class Store {
     const turns = (this.sql.exec(
       `SELECT c.seq,c.item_id,c.at,i.project,i.title FROM chat_messages c JOIN board_items i ON i.item_id=c.item_id
        WHERE c.role='owner' AND c.to_target=? AND (c.status='waiting' OR (c.status='taken' AND c.taken_by=? AND c.taken_at<?))
+       AND NOT EXISTS (SELECT 1 FROM status_only_projects p WHERE p.project=i.project)
        ORDER BY c.seq LIMIT 20`,
       actor, actor, stale,
     ).toArray() as Row[]).map((r) => ({ item_id: str(r.item_id), seq: num(r.seq), at: num(r.at), project: str(r.project), title: str(r.title) }));
@@ -798,6 +809,7 @@ export class Store {
       const mine = r.status === "taken" && r.taken_by === actor;
       if (!(r.status === "waiting" || mine)) throw new BoardError("HANDOFF_CONFLICT", "This turn is not open");
       const item = this.loadItem(itemId) as Item;
+      this.requireChatAllowed(item.project);
       const handoff = this.loadHandoff(itemId);
       // The conversation so far, oldest first: the work as handed over, what
       // the workers reported on the item, and the messages. The newest
@@ -857,6 +869,7 @@ export class Store {
     const obj = asObject(input);
     onlyKeys(obj, ["item_id", "seq", "text", "ref", "failed"]);
     const itemId = requiredStr(obj, "item_id");
+    this.requireChatAllowed(this.loadItem(itemId)?.project ?? null);
     if (!nonNegativeInteger(obj.seq)) throw invalid("seq must be the turn's number");
     const seq = obj.seq as number;
     const text = requiredStr(obj, "text");
@@ -910,6 +923,7 @@ export class Store {
     };
     return {
       state: view.state, request_id: view.request_id,
+      ...(this.statusOnlyFor(str(r[prefix + "project"])) ? { report_mode: "status_only" } : {}),
       requested_at: at === null ? null : num(at),
       accepted_by: view.accepted_by,
       accepted_at: acceptedAt === null ? null : num(acceptedAt),
@@ -930,7 +944,7 @@ export class Store {
   }
   private loadHandoff(id: string): Record<string, unknown> | null {
     const rows = this.sql.exec(
-      `SELECT ${HANDOFF_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id,
+      `SELECT project,${HANDOFF_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id,
     ).toArray() as Row[];
     return rows.length ? this.handoffOf(rows[0]) : null;
   }
@@ -963,6 +977,10 @@ export class Store {
   private statusOnlyFor(project: string | null): Set<string> | null {
     if (project === null) return null;
     return this.statusOnlyMap.get(project) ?? null;
+  }
+
+  private requireChatAllowed(project: string | null): void {
+    if (this.statusOnlyFor(project)) throw new BoardError("FORBIDDEN", "Conversations are disabled for status-only work");
   }
   private loadItem(id: string): Item | null {
     const rows = this.sql.exec(`SELECT ${ITEM_COLUMNS.join(",")} FROM board_items WHERE item_id=?`, id).toArray();
@@ -1031,6 +1049,9 @@ export class Store {
     const now = Date.now();
     return this.tx(() => {
       const existing = this.loadItem(itemId);
+      if (!internal && (this.statusOnlyFor(existing?.project ?? null)?.has(actor) || this.statusOnlyFor(project)?.has(actor)
+          || (existing && project && project !== existing.project && this.statusOnlyFor(existing.project))))
+        throw new BoardError("FORBIDDEN", "Status-only takers use the fenced reporting tools");
       if (!internal && existing !== null) this.guardGenericWrite(actor, itemId, fence);
       const current = existing ? existing.revision : 0;
       if (expected !== null && expected !== current)
@@ -1110,9 +1131,7 @@ export class Store {
     return this.tx(() => {
       const target = this.loadItem(itemId);
       if (target === null) throw new BoardError("NOT_FOUND", "No such item");
-      if (this.statusOnlyFor(target.project)?.has(actor)
-        && (kind !== "note" || reference !== null || !(STATUS_ONLY_PROGRESS as readonly string[]).includes(text)))
-        throw new BoardError("FORBIDDEN", "This work reports status only: a note of 状態：着手, 状態：作業中 or 状態：要確認, without a link");
+      if (this.statusOnlyFor(target.project)) throw new BoardError("FORBIDDEN", "Use the fenced status-only reporting tool");
       this.guardGenericWrite(actor, itemId, fence);
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
@@ -1127,7 +1146,7 @@ export class Store {
    */
   acceptHandoff(actor: string, input: unknown, restricted = false): Record<string, unknown> {
     const obj = asObject(input);
-    onlyKeys(obj, ["item_id", "request_id", "versions"]);
+    onlyKeys(obj, ["item_id", "request_id", "versions", "report_mode"]);
     const itemId = requiredStr(obj, "item_id");
     const request = requiredStr(obj, "request_id");
     // What the taker runs with, e.g. "picker=1a2b3c4,rules=5d6e7f8" (#46 Q8): recorded, never acted on.
@@ -1143,6 +1162,9 @@ export class Store {
       if (restricted && (target === null || handoff === null || handoff.request_id !== request || (handoff.to !== actor && handoff.accepted_by !== actor)))
         throw new BoardError("NOT_FOUND", "No such request");
       if (target === null) throw new BoardError("NOT_FOUND", "No such item");
+      const registration = this.statusOnlyFor(target.project);
+      if (registration ? (obj.report_mode !== "status_only" || versions !== null || !registration.has(actor) || handoff?.to !== actor) : has(obj, "report_mode"))
+        throw new BoardError("FORBIDDEN", "The board and taker must agree on the registered reporting mode");
       // Idempotent retry: the same writer asking again for the request it
       // already took (its first answer may have been lost on the wire) gets
       // the same handoff back, not a conflict and never a second run.
@@ -1178,9 +1200,6 @@ export class Store {
       // A project registered status-only runs only as its registered taker,
       // taken explicitly: anybody else would report freely, and a request
       // without that destination waits to be routed rather than change hands.
-      const registered = this.statusOnlyFor(target.project);
-      if (registered !== null && (!registered.has(actor) || to !== actor))
-        throw new BoardError("FORBIDDEN", `Project ${target.project} reports status only: only its registered taker may run it, taken as its named destination`);
       // COALESCE: a request made before generations existed has none yet;
       // the accept is where its run begins, so it gets the first one here.
       this.sql.exec(
@@ -1219,6 +1238,9 @@ export class Store {
     if (item === null) throw new BoardError("NOT_FOUND", "No such item");
     const verdict = checkFence(view, actor, request, generation);
     if (!verdict.ok) throw new BoardError(verdict.code, verdict.detail);
+    const policy = this.statusOnlyFor(item.project);
+    if (policy && (!policy.has(actor) || handoff?.to !== actor))
+      throw new BoardError("FORBIDDEN", "The taker registration has changed");
     if (requireLiveLease && (view.lease_until === null || view.lease_until <= Date.now()))
       throw new BoardError("STALE_GENERATION", "This run's lease expired; stop and wait for the owner to recover it");
     return view;
@@ -1262,12 +1284,13 @@ export class Store {
     if (reference !== null && !validHttpsUrl(reference)) throw invalid("ref must be an https URL of 500 characters at most");
     return this.tx(() => {
       this.checkRun(itemId, actor, request, generation, restricted);
-      if (this.statusOnlyFor(this.loadItem(itemId)?.project ?? null)?.has(actor)
+      const statusOnly = this.statusOnlyFor(this.loadItem(itemId)?.project ?? null);
+      if (statusOnly
         && (kind !== "note" || reference !== null || !(STATUS_ONLY_PROGRESS as readonly string[]).includes(text)))
         throw new BoardError("FORBIDDEN", "This work reports status only: a note of 状態：着手, 状態：作業中 or 状態：要確認, without a link");
       const at = Date.now();
       const seq = this.insertEvent(itemId, at, actor, kind, text, reference);
-      const phase = kind === "note" && reference === null ? PHASE_NOTE.exec(text)?.[1] : null;
+      const phase = statusOnly ? text.slice("状態：".length) : kind === "note" && reference === null ? PHASE_NOTE.exec(text)?.[1] : null;
       if (phase) this.sql.exec("UPDATE board_items SET handoff_phase=?,handoff_phase_at=? WHERE item_id=? AND handoff_phase IS NOT ?", phase, at, itemId, phase);
       this.sql.exec("UPDATE board_items SET handoff_heartbeat_at=?,handoff_lease_until=? WHERE item_id=?", at, at + this.leaseMs, itemId);
       return { ok: true, event: { seq, item_id: itemId, at, actor, kind, text, ref: reference }, handoff: this.loadHandoff(itemId), ...this.stopSignal() };
@@ -1298,8 +1321,8 @@ export class Store {
     const now = Date.now();
     this.tx(() => {
       this.checkRun(itemId, actor, request, generation, restricted);
-      if (this.statusOnlyFor(this.loadItem(itemId)?.project ?? null)?.has(actor)
-        && (ref !== null || commit !== null || (text !== null && !(STATUS_ONLY_COMPLETION as readonly string[]).includes(text))))
+      if (this.statusOnlyFor(this.loadItem(itemId)?.project ?? null)
+        && (ref !== null || commit !== null || text !== STATUS_ONLY_COMPLETION[outcome === "done" ? 0 : 1]))
         throw new BoardError("FORBIDDEN", "This work reports status only: 状態：完了 or 状態：要確認, without a link or a commit");
       this.sql.exec(
         "UPDATE board_items SET handoff_state='completed',handoff_lease_until=NULL,handoff_result_ref=?,handoff_result_commit=? WHERE item_id=?",
@@ -1309,7 +1332,7 @@ export class Store {
       this.insertEvent(itemId, now, actor, "note", commit !== null && !base.includes(commit) ? truncateLine(`${base} (commit ${commit})`) : base, ref);
     });
     const item = this.loadItem(itemId);
-    const written = item !== null && item.state !== outcome ? this.upsertItem(actor, { item_id: itemId, state: outcome }) : { item };
+    const written = item !== null && item.state !== outcome ? this.upsertItem(actor, { item_id: itemId, state: outcome }, true) : { item };
     return { ok: true, changed: true, item: restricted && written.item ? withoutParent(written.item) : written.item, handoff: this.loadHandoff(itemId) };
   }
 
@@ -1416,7 +1439,7 @@ export class Store {
     });
     if (backToPile) {
       const item = this.loadItem(itemId);
-      if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" });
+      if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" }, true);
     }
     return { ok: true, changed: true, item: this.loadItem(itemId), handoff: this.loadHandoff(itemId) };
   }
@@ -1727,7 +1750,7 @@ export class Store {
       });
       if (backToPile) {
         const item = this.loadItem(itemId);
-        if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" });
+        if (item !== null && item.state === "in_progress") this.upsertItem(actor, { item_id: itemId, state: "planned" }, true);
         result.item = this.loadItem(itemId);
       }
       return result;
