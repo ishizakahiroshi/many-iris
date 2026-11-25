@@ -156,6 +156,29 @@ import { mountConfirmations } from './confirmations.js';
     box.append(row);
     return box;
   }
+  // Fold a piece of work shut from the page: stopped or done. Items whose
+  // request is still open keep their own controls (取り下げ・状態不明の
+  // 復旧), so this stays out of them.
+  function closeControl(item) {
+    const box = el('details', 'board-write');
+    box.append(el('summary', null, '畳む'));
+    const row = el('div', 'board-write-row');
+    const status = el('span', 'board-write-status');
+    status.setAttribute('role', 'status');
+    for (const [outcome, label] of [['stopped', '停止にする'], ['done', '完了にする']]) {
+      const button = el('button', 'quiet', label);
+      button.type = 'button';
+      button.setAttribute('aria-label', '「' + short(item.title) + '」を' + label);
+      button.addEventListener('click', async () => {
+        const done = await write({ op: 'close', item_id: item.item_id, outcome, expected_revision: item.revision }, status, button);
+        if (done) load(true);
+      });
+      row.append(button);
+    }
+    row.append(status);
+    box.append(row);
+    return box;
+  }
   // Up and down within the pile: the planned work next to this one.
   function orderControl(item) {
     const row = el('div', 'board-order');
@@ -685,6 +708,8 @@ import { mountConfirmations } from './confirmations.js';
     if (canWrite && item.kind === 'task' && sessionItem.test(item.item_id)) box.append(continueControl(item, peers));
     if (canWrite && canTalk(item)) box.append(talkControl(item));
     if (canWrite && item.kind === 'task') box.append(moveControl(item, peers));
+    if (canWrite && item.kind === 'task' && item.state !== 'done' && item.state !== 'stopped'
+      && !(item.handoff && ['requested', 'accepted', 'unknown'].includes(item.handoff.state))) box.append(closeControl(item));
     return box;
   }
   // One project's items as two lists: the tree, and the work (kind task) that

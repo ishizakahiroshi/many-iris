@@ -118,8 +118,10 @@ async function call(token, tool, args) {
 const code = (res) => res?.error?.code ?? res?.rpcError?.code ?? "OK";
 
 function writeTestEnv() {
+  // BOARD_LIMIT_ITEMS is a shared budget: every section that adds an item spends
+  // it. Raise it together with the limit checks near the end of this file.
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=27\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=32\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
 }
 async function main() {
   mkdirSync(temp, { recursive: true });
@@ -180,7 +182,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("twenty-three tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch,iris_request_confirmation,iris_confirmation_status,iris_close_confirmation",
+  check("twenty-four tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_close_item,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch,iris_request_confirmation,iris_confirmation_status,iris_close_confirmation",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -690,6 +692,41 @@ async function main() {
   check("taking the continuation back allows another one", (await ownerCode({ op: "take_back", item_id: continuation })) === "200 OK" &&
     (await ownerCode({ op: "continue", item_id: "session/77", to: "vps-claude" })) === "200 OK");
 
+  // --- folding an item shut (op close / board_close_item)
+  r = await ownerPost({ ...addBody, title: "stray memo to fold", day: dayOf(0) });
+  const stray = (await r.json()).item?.item_id ?? "";
+  check("closing an unknown item is not found", (await ownerCode({ op: "close", item_id: "nope" })) === "404 NOT_FOUND");
+  check("the page folds only work, not plans", (await ownerCode({ op: "close", item_id: "c1" })) === "403 FORBIDDEN");
+  check("an outcome other than done or stopped is refused", (await ownerCode({ op: "close", item_id: stray, outcome: "paused" })) === "400 INVALID");
+  check("a stale revision is refused on close", (await ownerCode({ op: "close", item_id: stray, expected_revision: 9 })) === "409 REVISION_CONFLICT");
+  await ownerPost({ op: "hand", item_id: stray, to: "hold" });
+  check("work with an open request cannot be folded", (await ownerCode({ op: "close", item_id: stray })) === "403 FORBIDDEN");
+  check("the owner takes it back first", (await ownerCode({ op: "take_back", item_id: stray })) === "200 OK");
+  r = await ownerPost({ op: "close", item_id: stray, outcome: "stopped", expected_revision: 1 });
+  out = await r.json();
+  check("the owner folds a stray piece of work", r.status === 200 && out.item?.state === "stopped", JSON.stringify(out));
+  check("the fold is recorded as a state change", (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === stray && e.kind === "state_change" && e.text === "planned -> stopped" && e.actor === "page:owner"));
+  check("folding what is already shut is a no-op", (await ownerCode({ op: "close", item_id: stray })) === "200 OK" && (await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === stray)?.revision === 2);
+  r = await ownerPost({ ...addBody, title: "done by hand", day: dayOf(0) });
+  const doneWork = (await r.json()).item?.item_id ?? "";
+  check("the owner can also fold it as done", (await ownerCode({ op: "close", item_id: doneWork, outcome: "done" })) === "200 OK" &&
+    (await call(K.alpha, "board_list", {})).items.find((i) => i.item_id === doneWork)?.state === "done");
+  // board_close_item: the writer-side form. The note lands just before the state change, and the same open-request guard applies.
+  check("closing unknown work is not found", code(await call(K.alpha, "board_close_item", { item_id: "nope" })) === "NOT_FOUND");
+  check("a bad outcome is refused", code(await call(K.alpha, "board_close_item", { item_id: stray, outcome: "paused" })) === "INVALID");
+  check("a note over 2000 characters is refused", code(await call(K.alpha, "board_close_item", { item_id: stray, note: "x".repeat(2001) })) === "INVALID");
+  check("a stale revision is refused by the tool too", code(await call(K.alpha, "board_close_item", { item_id: stray, expected_revision: 9 })) === "REVISION_CONFLICT");
+  await call(K.alpha, "board_upsert_item", { item_id: "close1", project: "demo", kind: "task", title: "writer stray work", state: "planned" });
+  out = await call(K.alpha, "board_close_item", { item_id: "close1", outcome: "stopped", note: "not needed after all" });
+  check("a writer folds an item with a note", out.item?.state === "stopped" &&
+    (await call(K.alpha, "board_list", {})).events.some((e) => e.item_id === "close1" && e.kind === "note" && e.text === "not needed after all" && e.actor === "alpha"), JSON.stringify(out));
+  await call(K.alpha, "board_upsert_item", { item_id: "close2", project: "demo", kind: "task", title: "to be run then folded", state: "planned" });
+  const closeReq = (await call(K.alpha, "board_request_handoff", { item_id: "close2" })).handoff?.request_id ?? "";
+  check("a requested item cannot be folded", code(await call(K.alpha, "board_close_item", { item_id: "close2" })) === "FORBIDDEN");
+  await call(K.muse, "board_accept_handoff", { item_id: "close2", request_id: closeReq });
+  check("an accepted item cannot be folded either", code(await call(K.alpha, "board_close_item", { item_id: "close2" })) === "FORBIDDEN");
+  check("the page cannot fold it while it is run", (await ownerCode({ op: "close", item_id: "close2" })) === "403 FORBIDDEN");
+
   // --- the owner's order for "おまかせ" (op order) and who is picking up
   const routeOf = async () => (await (await fetch(`${base}/api/board`, { headers: jar })).json()).route;
   let route = await routeOf();
@@ -1081,14 +1118,14 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     dotsItem.last_note?.actor === "dots" && dotsItem.last_note.text === "15 / 3 = 5");
   check("dots has no outstanding work after completion", (await call(dotsToken, "board_my_work", {})).items?.length === 0);
 
-  // --- the item limit (27 in this run)
+  // --- the item limit (32 in this run)
   let lastCode = "OK";
-  for (let n = 0; n < 27 && lastCode === "OK"; n++) {
+  for (let n = 0; n < 32 && lastCode === "OK"; n++) {
     lastCode = code(await call(K.alpha, "board_upsert_item", { item_id: `fill${n}`, project: "demo", kind: "task", title: `f${n}`, state: "planned" }));
   }
   check("item limit", lastCode === "BOARD_ITEM_LIMIT");
   list = await call(K.alpha, "board_list", {});
-  check("item count stays at the limit", list.counts.items === 27, String(list.counts.items));
+  check("item count stays at the limit", list.counts.items === 32, String(list.counts.items));
   // The counts are kept by triggers (issue #38), not counted per call: they must
   // still match the rows. Events are never deleted and seq is the rowid, so
   // the newest seq is the number of events.

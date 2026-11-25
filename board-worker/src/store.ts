@@ -1098,6 +1098,44 @@ export class Store {
   }
 
   /**
+   * The `board_close_item` tool (and the page's 畳む through ownerWrite): fold
+   * an item shut by setting its state to done or stopped, optionally writing
+   * a note just before the change so the record says why. An item whose
+   * request is still open (requested, accepted or unknown) is refused: that
+   * record belongs to the hand-off's own tools (board_take_back_handoff, or
+   * the run's board_complete_handoff).
+   */
+  closeItem(actor: string, input: unknown): Record<string, unknown> {
+    const obj = asObject(input);
+    onlyKeys(obj, ["item_id", "outcome", "note", "expected_revision"]);
+    const itemId = requiredStr(obj, "item_id");
+    const outcome = optionalStr(obj, "outcome") ?? "stopped";
+    if (outcome !== "done" && outcome !== "stopped") throw invalid("outcome must be done or stopped");
+    const note = optionalStr(obj, "note");
+    if (note !== null && !validLine(note, 2000, true)) throw invalid("note must be 1 to 2000 characters");
+    let expected: number | null = null;
+    if (has(obj, "expected_revision")) {
+      if (!nonNegativeInteger(obj.expected_revision)) throw invalid("expected_revision must be a non-negative integer");
+      expected = obj.expected_revision;
+    }
+    const closing = this.tx(() => {
+      const item = this.loadItem(itemId);
+      if (item === null) throw new BoardError("NOT_FOUND", "No such item");
+      const handoff = this.loadHandoff(itemId);
+      if (handoff !== null && ["requested", "accepted", "unknown"].includes(String(handoff.state)))
+        throw new BoardError("FORBIDDEN", "A request on this item is still open: take it back or let the run finish first");
+      if (expected !== null && expected !== item.revision)
+        throw new BoardError("REVISION_CONFLICT", `expected_revision ${expected} does not match the current revision ${item.revision}`);
+      if (item.state === outcome) return false;
+      if (note !== null) this.insertEvent(itemId, Date.now(), actor, "note", note, null);
+      return true;
+    });
+    if (!closing) return { ok: true, changed: false, item: this.loadItem(itemId) };
+    const written = this.upsertItem(actor, { item_id: itemId, state: outcome });
+    return { ok: true, changed: written.changed, item: written.item };
+  }
+
+  /**
    * The `board_accept_handoff` tool: a writer takes the request the owner made
    * for `item_id`. The request id must be the one on the item, and only the
    * first writer gets it; the item then becomes in progress under that writer.
@@ -1850,7 +1888,22 @@ export class Store {
         return { ok: true, changed: true, order: pile };
       });
     }
-    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, chat_send, pause, scope, mark_unknown, release or resume");
+    if (op === "close") {
+      // {op:"close", item_id, outcome?, expected_revision}: 畳む — fold a
+      // piece of work (kind task) shut, stopped or done. The same write
+      // board_close_item makes for writers; only the kind is narrower here.
+      // An open request is refused inside closeItem.
+      onlyKeys(obj, ["op", "item_id", "outcome", "expected_revision"]);
+      const closeArgs: Record<string, unknown> = { item_id: requiredStr(obj, "item_id") };
+      const outcome = optionalStr(obj, "outcome");
+      if (outcome !== null) closeArgs.outcome = outcome;
+      if (has(obj, "expected_revision")) closeArgs.expected_revision = obj.expected_revision;
+      const target = this.loadItem(String(closeArgs.item_id));
+      if (target !== null && target.kind !== "task")
+        throw new BoardError("FORBIDDEN", "Only work (kind task) can be closed from the page");
+      return this.closeItem(actor, closeArgs);
+    }
+    throw invalid("op must be add, attach, move, hand, continue, route, take_back, order, chat_send, pause, scope, mark_unknown, release, resume or close");
   }
 
   /** All items of the project (or of every project), each with its latest

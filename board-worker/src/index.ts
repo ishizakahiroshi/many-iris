@@ -103,6 +103,8 @@ export class BoardStore extends DurableObject<Env> {
           return this.store.upsertItem(actor, args);
         case "board_add_event":
           return this.store.addEvent(actor, args);
+        case "board_close_item":
+          return this.store.closeItem(actor, args);
         case "board_list":
           return this.store.listForTool(args);
         case "board_my_work":

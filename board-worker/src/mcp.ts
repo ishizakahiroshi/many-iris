@@ -117,6 +117,17 @@ export const TOOLS: Json[] = [
     ["item_id"],
   ),
   tool(
+    "board_close_item",
+    "Fold an item shut: set its state to done or stopped, optionally writing a note first so the record says why — the writer-side form of the page's \"畳む\". Refused while a request on the item is open (requested, accepted or unknown): take it back with board_take_back_handoff or let the run finish with board_complete_handoff.",
+    {
+      item_id: text("An existing item"),
+      outcome: { type: "string", enum: ["done", "stopped"], description: "done or stopped; stopped when left out" },
+      note: text("Optional note written just before the state change (1 to 2000 characters)"),
+      expected_revision: { type: "integer", description: "Refuses the write when the item is at another revision" },
+    },
+    ["item_id"],
+  ),
+  tool(
     "board_heartbeat_handoff",
     "Say the run that took a request is still working, and extend its lease (handoff.lease_until). Send the item's handoff.request_id and the handoff.generation the accept returned. A stale generation is refused (STALE_GENERATION): a replaced run must stop. While the owner has stopped everything (全部止める) the answer carries stop: true: stop the run and give the work back (board_release_handoff). Writes no event.",
     {
@@ -311,7 +322,7 @@ export async function handle(request: unknown, run: ToolRunner, policy: ToolPoli
         serverInfo: SERVER_INFO,
         instructions: policy === "restricted"
           ? "Use board_my_work for your assigned work. If paused or empty, do not start. Accept a requested item with its item_id and request_id; use the returned generation with board_heartbeat_handoff, board_progress_handoff and board_complete_handoff."
-          : "Many Iris board. Read with board_list. Work you take with board_accept_handoff is reported with the fenced tools (board_progress_handoff, board_complete_handoff); plain writes with board_upsert_item and board_add_event stay for everything else, and for your own writes on an item you are running they must carry the run's request_id and generation. Your name on the board comes from your key.",
+          : "Many Iris board. Read with board_list. Work you take with board_accept_handoff is reported with the fenced tools (board_progress_handoff, board_complete_handoff); plain writes with board_upsert_item and board_add_event stay for everything else (board_close_item folds an item to done or stopped), and for your own writes on an item you are running they must carry the run's request_id and generation. Your name on the board comes from your key.",
       });
     }
     case "server/discover":
