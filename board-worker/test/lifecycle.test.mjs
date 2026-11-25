@@ -6,6 +6,7 @@
 //   node test/lifecycle.test.mjs
 import { REQUEST_STALL_MS, STAGES, deriveLifecycle } from "../src/lifecycle.ts";
 import { HANDOFF_LEASE_MS } from "../src/resume.ts";
+import { POLL_GRACE_MS, pollIntervals, pollView } from "../src/poll.ts";
 
 let passed = 0;
 const failures = [];
@@ -25,6 +26,19 @@ const accepted = (over = {}) => handoff({
   lease_until: NOW - 600_000 + HANDOFF_LEASE_MS, ...over,
 });
 const derive = (over = {}) => deriveLifecycle({ item: item(), handoff: null, dispatch: null, refs: [], ...over }, NOW);
+
+// --- polling estimates use a separately observed queue read
+{
+  const interval = pollIntervals('{"example-picker":600}').get("example-picker");
+  const empty = pollView("example-picker", null, interval, NOW);
+  const manual = pollView("manual", NOW, undefined, NOW + 1_000_000);
+  const scheduled = pollView("example-picker", NOW, interval, NOW + 600_000 + POLL_GRACE_MS);
+  check("no initial patrol means no estimated date", empty.last_poll_at === null && empty.next_poll_at === null && !empty.overdue);
+  check("activity is known but schedule can be unknown", manual.last_poll_at === NOW && manual.next_poll_source === null && manual.next_poll_at === null && !manual.overdue);
+  check("configured estimate allows the grace window", scheduled.next_poll_at === NOW + 600_000 && scheduled.next_poll_source === "configured_interval_estimate" && !scheduled.overdue);
+  check("an unobserved patrol beyond the grace window is overdue", pollView("example-picker", NOW, interval, NOW + 600_000 + POLL_GRACE_MS + 1).overdue);
+  check("invalid config cannot synthesize a schedule", pollIntervals('{"example-picker":600,"bad":0}').size === 0);
+}
 
 // --- saved is not handed over (the case this was written for)
 {

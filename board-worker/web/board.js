@@ -679,6 +679,17 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     meta.append(el('span', null, '更新：' + when(item.updated_at) + ' / ' + item.updated_by));
     if (item.source_ref) { const s = el('span', null, '原本：'); s.append(sourceNode(item.source_ref)); meta.append(s); }
     box.append(meta);
+    const h = item.handoff;
+    if (h?.state === 'requested' && !h.requester_declined_at) {
+      const poll = lastData?.poll_by_queue?.[JSON.stringify([h.to, item.project])];
+      if (poll) {
+        const last = Number.isFinite(poll.last_poll_at) ? '最終巡回 ' + phaseTime.format(poll.last_poll_at) : '巡回実績なし';
+        const next = Number.isFinite(poll.next_poll_at) && poll.next_poll_source === 'configured_interval_estimate'
+          ? '次回目安 ' + phaseTime.format(poll.next_poll_at) + ' 頃（登録間隔からの推定）' : '次回予定は未提供';
+        const heading = poll.overdue ? poll.assignee + ' の巡回を確認できていません' : '受付待ち：' + poll.assignee;
+        box.append(el('p', 'board-wait', [heading, last, next].join(' ｜ ')));
+      }
+    }
     const progress = runProgress(item);
     if (progress) box.append(progress);
     if (item.last_event) {
@@ -1058,7 +1069,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
       const clockOnly = next.unchanged && previous.items === next.items && previous.can_write === next.can_write &&
         (selectedView() === 'cards' || renderedHistoryCursor === next.next_since_seq) &&
         boardDay(previous.generated_at) === boardDay(next.generated_at) &&
-        ['paused', 'route', 'scopes'].every(key => JSON.stringify(previous[key]) === JSON.stringify(next[key]));
+        ['paused', 'route', 'scopes', 'poll_by_queue'].every(key => JSON.stringify(previous[key]) === JSON.stringify(next[key]));
       if (clockOnly) updateConnection(next);
       else render(next);
       const through = next.next_since_seq;
