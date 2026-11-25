@@ -8,7 +8,9 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const partners = [['vps-claude', 'VPS の claude -p'], ['vps-devin', 'Devin（VPS）']];
-  const partnerLabel = (who) => (partners.find(([t]) => t === who) || [null, who])[1];
+  const museDev = 'muse-dev';
+  const isMuseChat = (id) => typeof id === 'string' && id.startsWith('chat-muse/');
+  const partnerLabel = (who) => who === museDev ? 'MuseDev' : (partners.find(([t]) => t === who) || [null, who])[1];
   const isPartner = (who) => partners.some(([t]) => t === who);
   const states = { planned: '予定', in_progress: '進行中', waiting: '待ち', done: '完了', stopped: '停止' };
   const errors = {
@@ -29,6 +31,7 @@
   let shown = null;       // the open conversation's data
   let chatTimer = null;
   let busy = false;
+  let museSubmission = null;
   let chosenPartner = null; // the partner the owner picked in the open conversation (kept across the 8-second refresh)
   let pending = [];       // attachments uploaded for the next message: {id, name, bytes, chars}
   let uploading = 0;
@@ -110,12 +113,14 @@
   function conversations() {
     if (!board || !Array.isArray(board.items)) return [];
     return board.items
-      .filter((item) => item.kind === 'task' && (item.chat || (item.handoff && (isPartner(item.handoff.to) || isPartner(item.handoff.accepted_by)))))
+      .filter((item) => item.kind === 'task' && (item.chat || isMuseChat(item.item_id) || (item.handoff && (isPartner(item.handoff.to) || isPartner(item.handoff.accepted_by) || item.handoff.to === museDev))))
       .sort((a, b) => activity(b) - activity(a));
   }
   function mark(item) {
     if (item.chat && item.chat.open) return ['wait', '返事待ち'];
     const h = item.handoff;
+    if (h?.state === 'requested' && h.to === museDev && !h.requester_declined_at) return ['wait', 'MuseDev に送信済み・未受理'];
+    if (h?.state === 'accepted' && h.accepted_by === museDev) return ['work', 'MuseDev が受理'];
     if (h?.requester_declined_at) return ['wait', '受付条件により見送り'];
     if (h && (h.state === 'requested' || h.state === 'accepted')) return ['work', '作業中'];
     return null;
@@ -229,7 +234,23 @@
     }
     const open = data.open;
     let wait = '';
-    if (open && open.status === 'waiting') wait = partnerLabel(open.to) + ' が 1 分以内に拾います…';
+    const h = data.handoff;
+    const linked = isMuseChat(data.item.item_id);
+    const reroute = $('chat-muse-reroute');
+    reroute.hidden = !(linked && h?.state === 'requested' && h.to === museDev && !data.project_local);
+    if (h?.state === 'requested' && (linked || h.to === museDev)) {
+      const name = partnerLabel(h.to);
+      wait = name + (h.requester_declined_at ? ' が受付条件により見送りました。' :
+        data.project_local ? ' に送信済み・未受理。この案件は手元だけのため受理できません。' :
+        data.paused ? ' に送信済み・未受理。看板は一時停止中です。' :
+        ' に送信済み・未受理。受理時刻は未確認です。');
+    } else if (h?.state === 'accepted' && (linked || h.accepted_by === museDev)) {
+      wait = partnerLabel(h.accepted_by) + ' が受理しました。';
+    } else if (h?.state === 'unknown' && linked) {
+      wait = '受理後の実行状態が不明です。自動でやり直しません。';
+    } else if (!h && linked) {
+      wait = '現在の依頼はありません。取り下げられた依頼を自動で送り直しません。';
+    } else if (open && open.status === 'waiting') wait = partnerLabel(open.to) + ' が 1 分以内に拾います…';
     else if (open && open.status === 'taken') wait = partnerLabel(open.to) + ' が考えています（' + Math.max(1, Math.round((Date.now() - open.at) / 60000)) + ' 分）…';
     else if (data.handoff && ['requested', 'accepted'].includes(data.handoff.state)) wait = partnerLabel(data.handoff.accepted_by || data.handoff.to) + ' が作業しています。終わると、ここに結果が出ます…';
     if (wait) log.append(el('div', 'chat-typing', wait));
@@ -243,9 +264,10 @@
     confirm.dataset.seq = confirmationSeq;
     const partner = $('chat-partner');
     if (document.activeElement !== partner) partner.value = chosenPartner || data.partner || 'vps-claude';
-    const blocked = Boolean(open);
+    const blocked = Boolean(open) || (linked && h?.state !== 'completed');
     $('chat-text').disabled = blocked;
     $('chat-send').disabled = blocked;
+    $('chat-file').disabled = blocked;
     $('chat-text').placeholder = blocked ? '返事が来るまで待ってください' : '続けて書く（20,000 字まで）';
     if (nearBottom || !log.dataset.shown) { log.scrollTop = log.scrollHeight; log.dataset.shown = '1'; }
   }
@@ -552,7 +574,27 @@
   }
 
   function setup() {
-    for (const id of ['chat-start-partner', 'chat-partner']) for (const [v, l] of partners) $(id).append(option(v, l));
+    for (const id of ['chat-start-partner', 'chat-partner', 'chat-muse-replacement']) for (const [v, l] of partners) $(id).append(option(v, l));
+    $('chat-start-partner').append(option(museDev, 'MuseDev'));
+    $('chat-muse-reroute').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = $('chat-muse-reroute-button');
+      const h = shown?.handoff;
+      const item = current;
+      const select = $('chat-muse-replacement');
+      const to = select.value;
+      if (button.disabled || !isPartner(to) || h?.state !== 'requested' || h.to !== museDev || !item) return;
+      button.disabled = true;
+      try {
+        const done = await write({ op: 'chat_reroute_muse', item_id: item, request_id: h.request_id, to });
+        if (item === current) {
+          $('chat-status').textContent = done.ok ? '宛先を ' + partnerLabel(to) + ' に変更しました。' : done.text;
+          select.value = '';
+          await refreshConversation();
+        }
+        if (done.ok) loadBoard();
+      } finally { button.disabled = false; }
+    });
     $('chat-new').addEventListener('click', () => { if (location.hash) location.hash = ''; else route(); });
     $('chat-side-open').addEventListener('click', openSide);
     $('chat-side-close').addEventListener('click', closeSide);
@@ -590,15 +632,34 @@
       if (!title) { status.textContent = '書くか、添付してから送ってください。'; return; }
       if (newRepository && !/^[a-z0-9][a-z0-9._-]{0,59}$/i.test(project)) { status.textContent = '新規案件にはリポジトリ名だけを入力してください。'; return; }
       const send = $('chat-start-send');
+      if (send.disabled) return;
+      const to = $('chat-start-partner').value;
+      if (to === museDev && startPending.length) {
+        status.textContent = 'MuseDev への最初の依頼は本文だけ送れます。添付を外してから送ってください。';
+        return;
+      }
       send.disabled = true;
       status.textContent = '送っています…';
       try {
         const day = today();
-        const added = await write({ op: 'add', project, title: [...title].slice(0, 200).join(''), day, ...(newRepository ? { new_repository: true } : {}) });
+        const common = { project, title: [...title].slice(0, 200).join(''), day, ...(newRepository ? { new_repository: true } : {}) };
+        let submission = null;
+        if (to === museDev) {
+          // Keep only the opaque id across an interrupted send or reload. The
+          // server recognizes the same item and never restarts the request.
+          try { submission = sessionStorage.getItem('iris-muse-submission'); } catch { /* storage may be disabled */ }
+          submission = submission || museSubmission || crypto.randomUUID();
+          museSubmission = submission;
+          try { sessionStorage.setItem('iris-muse-submission', submission); } catch { /* keep it in memory */ }
+        }
+        const added = await write(to === museDev ? { op: 'chat_start_muse', submission_id: submission, ...common } : { op: 'add', ...common });
         if (!added.ok) { status.textContent = added.text; return; }
+        if (to === museDev) {
+          museSubmission = null;
+          try { sessionStorage.removeItem('iris-muse-submission'); } catch { /* storage may be disabled */ }
+        }
         const itemId = added.answer.item.item_id;
-        const to = $('chat-start-partner').value;
-        const handed = await write({ op: 'hand', item_id: itemId, day, to });
+        const handed = to === museDev ? added : await write({ op: 'hand', item_id: itemId, day, to });
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }
         const missed = startPending.length ? await sendStartAttachments(itemId, to) : '';
         startText.value = '';
@@ -630,6 +691,7 @@
       const status = $('chat-status');
       const body = text.value.trim();
       if (uploading) { status.textContent = '添付を保管しています。少し待ってください。'; return; }
+      if (isMuseChat(current) && shown?.handoff?.state !== 'completed') return;
       if (!current || (!body && !pending.length)) { status.textContent = '書いてから送ってください。'; return; }
       const reconfirm = !$('chat-reconfirm').hidden;
       if (reconfirm && (!body || !$('chat-context-confirmed').checked)) {

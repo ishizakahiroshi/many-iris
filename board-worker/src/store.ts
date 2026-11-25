@@ -12,7 +12,7 @@ import {
   ATTACHMENT_TTL_MS, IMAGE_MAX_BYTES, READ_MAX_CHARS, isImageType, markerText, validAttachmentId,
 } from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
-import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
+import { MUSE_DEV, ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
@@ -158,6 +158,8 @@ export const CHAT_TEXT_MAX = 20000;
 export /** The project of a chat started with no project (the chat page's 案件なし). */
 const CHAT_PROJECT = "chat";
 const CHAT_TARGETS = ["vps-claude", "vps-devin"] as const;
+const CHAT_WORKERS = [...CHAT_TARGETS, MUSE_DEV];
+const MUSE_CHAT_ID = /^chat-muse\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 /** A turn taken this long ago without an answer may be taken again by the same worker (its run died). */
 export const CHAT_TAKE_MS = 40 * 60 * 1000;
 const MAX_CHAT_MESSAGES = 100000;
@@ -684,8 +686,8 @@ export class Store {
   /** The item's notes written by the server's workers (its runs' progress and results), oldest first. */
   private workerNotes(itemId: string): Record<string, unknown>[] {
     return (this.sql.exec(
-      `SELECT seq,at,actor,text,ref FROM board_events WHERE item_id=? AND kind<>'state_change' AND actor IN (${CHAT_TARGETS.map(() => "?").join(",")}) ORDER BY seq`,
-      itemId, ...CHAT_TARGETS,
+      `SELECT seq,at,actor,text,ref FROM board_events WHERE item_id=? AND kind<>'state_change' AND actor IN (${CHAT_WORKERS.map(() => "?").join(",")}) ORDER BY seq`,
+      itemId, ...CHAT_WORKERS,
     ).toArray() as Row[]).map((r) => ({ seq: num(r.seq), at: num(r.at), actor: str(r.actor), text: str(r.text), ref: strOrNull(r.ref ?? null) }));
   }
   /** Who the next message goes to by default: the last one talked to, else the worker the work was handed to. */
@@ -709,6 +711,8 @@ export class Store {
       ok: true,
       item: { item_id: item.item_id, project: item.project, title: item.title, state: item.state, kind: item.kind },
       handoff, notes: this.workerNotes(itemId), messages, open,
+      project_local: this.projectIsLocal(item.project),
+      paused: this.pauseState().paused,
       partner: this.chatPartner(itemId, handoff), targets: [...CHAT_TARGETS], text_max: CHAT_TEXT_MAX,
       attachment_limits: {
         max_bytes: ATTACHMENT_MAX_BYTES, image_max_bytes: IMAGE_MAX_BYTES, total_bytes: ATTACHMENT_TOTAL_BYTES, max_count: ATTACHMENT_MAX_COUNT,
@@ -750,6 +754,9 @@ export class Store {
       this.requireChatAllowed(item.project);
       if (this.projectIsLocal(item.project))
         throw new BoardError("FORBIDDEN", `Project ${item.project} is 手元だけ: its work is not talked over with the server's AI`);
+      const activeHandoff = this.loadHandoff(itemId);
+      if (MUSE_CHAT_ID.test(itemId) && activeHandoff?.state !== "completed")
+        throw new BoardError("HANDOFF_CONFLICT", "The linked request is not complete");
       const open = num((this.sql.exec(
         "SELECT COUNT(*) AS n FROM chat_messages WHERE item_id=? AND status IN ('waiting','taken')", itemId,
       ).one() as Row).n);
@@ -1505,10 +1512,12 @@ export class Store {
   }
 
   /** Changes the destination of an open request; false when it already had that one. Runs inside a transaction. */
-  private reroute(actor: string, itemId: string, handoff: Record<string, unknown> | null, to: string | null, now: number): boolean {
+  private reroute(actor: string, itemId: string, handoff: Record<string, unknown> | null, to: string | null, now: number, explicitChat = false): boolean {
     if (handoff === null || handoff.state !== "requested")
       throw new BoardError("HANDOFF_CONFLICT", "Only a request that nobody has taken yet can be routed");
     if (handoff.to === to) return false;
+    if (MUSE_CHAT_ID.test(itemId) && !explicitChat)
+      throw new BoardError("FORBIDDEN", "Change the MuseDev chat recipient explicitly from the original conversation");
     const item = this.loadItem(itemId);
     if (item !== null) this.checkScope(item.project, to);
     this.sql.exec("UPDATE board_items SET handoff_to=?,handoff_to_by=?,handoff_declined_at=NULL WHERE item_id=?", to, to === null ? null : actor, itemId);
@@ -1793,6 +1802,56 @@ export class Store {
         return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
       });
     }
+    if (op === "chat_start_muse") {
+      if (actor !== "page:owner") throw new BoardError("FORBIDDEN", "Only the owner may start this chat");
+      onlyKeys(obj, ["op", "submission_id", "project", "title", "day", "new_repository"]);
+      const itemId = "chat-muse/" + requiredStr(obj, "submission_id");
+      if (!MUSE_CHAT_ID.test(itemId)) throw invalid("submission_id must be a v4 UUID");
+      const project = requiredStr(obj, "project");
+      const title = requiredStr(obj, "title");
+      const day = optionalStr(obj, "day");
+      if (!validLine(title, 200, false)) throw invalid("title must be 1 to 200 characters on one line");
+      return this.tx(() => {
+        const existing = this.loadItem(itemId);
+        if (existing !== null) {
+          const h = this.loadHandoff(itemId);
+          if ((existing.updated_by !== actor && h?.requested_by !== actor) ||
+              existing.project !== project || (h?.title ?? existing.title) !== title)
+            throw new BoardError("HANDOFF_CONFLICT", "This submission identifier was already used");
+          // Never create a new handoff on retry, even if the prior one was taken back.
+          return { ok: true, changed: false, item: existing, handoff: h };
+        }
+        const registered = [...this.statusOnlyMap.keys()].find(name => name.toLowerCase() === project.toLowerCase());
+        this.requireChatAllowed(registered ?? project);
+        const local = Object.keys(this.projectScopes()).find(name => name.toLowerCase() === project.toLowerCase());
+        this.checkScope(local ?? project, MUSE_DEV);
+        const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
+        if (known === 0 && project !== CHAT_PROJECT &&
+            !(obj.new_repository === true && /^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$/.test(project)))
+          throw new BoardError("NOT_FOUND", "No such project");
+        const { item } = this.upsertItem(actor, { item_id: itemId, project, kind: "task", title, state: "planned", expected_revision: 0 });
+        this.handOver(actor, item, day, MUSE_DEV, newId);
+        return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
+      });
+    }
+    if (op === "chat_reroute_muse") {
+      if (actor !== "page:owner") throw new BoardError("FORBIDDEN", "Only the owner may change this chat recipient");
+      onlyKeys(obj, ["op", "item_id", "request_id", "to"]);
+      const itemId = requiredStr(obj, "item_id");
+      const request = requiredStr(obj, "request_id");
+      const to = requiredStr(obj, "to");
+      if (!MUSE_CHAT_ID.test(itemId) || !isChatTarget(to))
+        throw invalid("Select a specific supported replacement for the MuseDev chat");
+      return this.tx(() => {
+        const item = this.loadItem(itemId);
+        const h = this.loadHandoff(itemId);
+        if (item === null || h?.state !== "requested" || h.request_id !== request || h.to !== MUSE_DEV)
+          throw new BoardError("HANDOFF_CONFLICT", "The requested MuseDev chat has changed or has already been accepted");
+        this.requireChatAllowed(item.project);
+        this.reroute(actor, itemId, h, to, Date.now(), true);
+        return { ok: true, changed: true, item, handoff: this.loadHandoff(itemId) };
+      });
+    }
     if (op === "chat_send") return this.chatSend(actor, obj);
     if (op === "pause") {
       // {op:"pause", paused:true|false}: 全部止める / 再開 (see pauseState).
@@ -1826,7 +1885,7 @@ export class Store {
             "SELECT item_id,handoff_request,handoff_to FROM board_items WHERE project=? AND handoff_state='requested' AND handoff_to IS NOT NULL", project,
           ).toArray() as Row[]) {
             const to = str(r.handoff_to);
-            if (UNTAKEN_TARGETS.has(to) || isLocalTarget(to)) continue;
+            if (UNTAKEN_TARGETS.has(to) || isLocalTarget(to) || MUSE_CHAT_ID.test(str(r.item_id))) continue;
             this.sql.exec("UPDATE board_items SET handoff_to=NULL,handoff_to_by=NULL,handoff_declined_at=NULL WHERE item_id=?", str(r.item_id));
             this.insertEvent(str(r.item_id), now, actor, "note",
               `routed ${String(r.handoff_request)} to the board's choice: project ${project} became 手元だけ, and ${to} is outside it`, null);

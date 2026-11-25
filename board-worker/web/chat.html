@@ -56,7 +56,13 @@
         <div id="chat-log" class="chat-log"></div>
         <div class="chat-foot">
           <p id="chat-state" class="chat-state" role="status"></p>
-          <form id="chat-form" class="chat-box">
+          <form id="chat-muse-reroute" hidden>
+              <label>未受理の依頼の宛先を変更
+                <select id="chat-muse-replacement" required><option value="">相手を選ぶ</option></select>
+              </label>
+              <button id="chat-muse-reroute-button" type="submit">この依頼の宛先を変更</button>
+            </form>
+            <form id="chat-form" class="chat-box">
             <ul id="chat-attach" class="chat-attach" aria-label="添付" hidden></ul>
             <label class="sr-only" for="chat-text">送る文</label>
             <textarea id="chat-text" rows="1" maxlength="20000" placeholder="続けて書く（20,000 字まで）" enterkeyhint="send"></textarea>

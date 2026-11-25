@@ -12,13 +12,16 @@
  * the cloud (the board starts its sessions), `vps-*` run on the always-on
  * server, `local-*` on the owner's PC. `owner` and `hold` are not writers.
  */
+// The existing MuseDev card recipient, separate from Muse and Devin.
+export const MUSE_DEV = "muse-dev";
+
 export const HANDOFF_TARGETS = [
-  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "dots", "owner", "hold",
+  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", MUSE_DEV, "muse", "grokbot", "dots", "owner", "hold",
 ] as const;
 export type HandoffTarget = (typeof HANDOFF_TARGETS)[number];
 
 /** The destinations the owner may put in the order (every writer; not owner, not hold). */
-export const ORDERABLE = HANDOFF_TARGETS.filter((t) => t !== "owner" && t !== "hold");
+export const ORDERABLE = HANDOFF_TARGETS.filter((t) => t !== "owner" && t !== "hold" && t !== MUSE_DEV);
 
 /** The order until the owner sets one: the server first, then the PC, then Devin in the cloud. */
 export const DEFAULT_ORDER: readonly string[] = ["vps-claude", "local-claude", "devin"];
@@ -71,7 +74,7 @@ export interface RouteDecision {
 export function chooseByOrder(order: readonly string[], alive: (target: string) => boolean): RouteDecision {
   const skipped: string[] = [];
   for (const [index, target] of order.entries()) {
-    if (!(HANDOFF_TARGETS as readonly string[]).includes(target) || target === "owner" || target === "hold") continue;
+    if (!(HANDOFF_TARGETS as readonly string[]).includes(target) || target === "owner" || target === "hold" || target === MUSE_DEV) continue;
     if (alive(target)) {
       const why = skipped.length ? ` (${skipped.join(", ")} not picking up)` : "";
       return { to: target as HandoffTarget, rank: index + 1, text: `routed to ${target}: number ${index + 1} in the owner's order${why}` };
