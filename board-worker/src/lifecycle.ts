@@ -34,7 +34,7 @@ export interface LifecycleInput {
   handoff: {
     state: string; request_id: string | null; requested_at: number | null; accepted_by: string | null;
     accepted_at: number | null; to: string | null; generation: number | null; heartbeat_at: number | null;
-    lease_until: number | null; phase?: string | null; phase_at?: number | null;
+    lease_until: number | null; phase?: string | null; phase_at?: number | null; requester_declined_at?: number;
   } | null;
   /** The dispatcher's newest row for this request (devin only), or null. */
   dispatch: { status: string; at: number; session_id: string | null; attempts: number } | null;
@@ -107,6 +107,13 @@ export function deriveLifecycle(input: LifecycleInput, now: number): Lifecycle {
     out.stage = "requested";
     out.evidence.push(to === null ? "no destination yet: the board chooses on its next pass" : `destination: ${to}`);
     out.summary = `依頼は出ていますが、まだ誰も受け付けていません${to ? `（宛先: ${to}）` : "（宛先は看板が選ぶところです）"}。`;
+    if (typeof h.requester_declined_at === "number") {
+      out.needs_attention = true;
+      out.summary = `${to} が依頼元または宛先指定者の受付条件により、この依頼を見送りました。`;
+      out.evidence.push(`picker reported at ${stamp(h.requester_declined_at)}`);
+      out.options.push("未受理を確認して取り下げ、担当が許可している依頼元から宛先を指定して引き渡してください。");
+      return out;
+    }
     out.unconfirmed.push("実行者が依頼を読んだか、そもそも存在するかは、受付の記録が出るまで確認できません");
     if (dispatch !== null) {
       out.evidence.push(`dispatcher: ${dispatch.attempts} attempt(s), last "${dispatch.status}" at ${stamp(dispatch.at)}${dispatch.session_id ? ` (session ${dispatch.session_id})` : ""}`);

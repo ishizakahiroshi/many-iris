@@ -86,7 +86,7 @@ export function statusOnlyFor(project, config) {
  * ({ itemId, project, requestId, title }) or null. Pure: unit tests
  * measure this directly against board_list-shaped items.
  */
-export function eligible(item, config) {
+function addressedRequest(item, config) {
   if (item === null || typeof item !== "object") return null;
   const handoff = item.handoff;
   if (handoff === null || typeof handoff !== "object") return null;
@@ -96,13 +96,20 @@ export function eligible(item, config) {
   if (typeof handoff.request_id !== "string" || handoff.request_id.length === 0) return null;
   // Addressed to somebody else, or to nobody yet: not this picker's.
   if (handoff.to !== config.writer) return null;
-  if (config.ownerOnly) {
-    const trusted = new Set([OWNER_ACTOR, ...(config.trustedRequesters ?? [])]);
-    if (!trusted.has(handoff.requested_by) || !trusted.has(handoff.to_set_by)) return null;
-  }
   const title = typeof handoff.title === "string" ? handoff.title.trim() : "";
   if (title.length === 0) return null;
   return { itemId: item.item_id, project: item.project ?? null, requestId: handoff.request_id, title };
+}
+
+function requesterAllowed(handoff, config) {
+  if (!config.ownerOnly) return true;
+  const trusted = new Set([OWNER_ACTOR, ...(config.trustedRequesters ?? [])]);
+  return trusted.has(handoff.requested_by) && trusted.has(handoff.to_set_by);
+}
+
+export function eligible(item, config) {
+  const job = addressedRequest(item, config);
+  return job && requesterAllowed(item.handoff, config) ? job : null;
 }
 
 /**
@@ -200,8 +207,22 @@ export async function runPass({ client, config, executor, state, log = () => {},
       throw error;
     }
     for (const item of items) {
-      const run = eligible(item, config);
+      const run = addressedRequest(item, config);
       if (run === null) continue;
+      if (!requesterAllowed(item.handoff, config)) {
+        if (item.handoff.requester_declined_at == null && item.handoff.to_set_by) {
+          try {
+            await client.call("board_report_requester_declined", {
+              item_id: run.itemId, request_id: run.requestId, to_set_by: item.handoff.to_set_by,
+            });
+          } catch (error) {
+            // Older or unavailable board: preserve the refusal and continue to other work.
+            if (!(error instanceof BoardRefusal || error instanceof BoardUnreachable)) throw error;
+            log("could not record the picker admission decision");
+          }
+        }
+        continue;
+      }
       // A status-only registration that names another writer or board holds
       // the job here: it stays requested and is never run with ordinary
       // reporting (the board refuses the accept the same way).

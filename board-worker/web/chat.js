@@ -116,6 +116,7 @@
   function mark(item) {
     if (item.chat && item.chat.open) return ['wait', '返事待ち'];
     const h = item.handoff;
+    if (h?.requester_declined_at) return ['wait', '受付条件により見送り'];
     if (h && (h.state === 'requested' || h.state === 'accepted')) return ['work', '作業中'];
     return null;
   }

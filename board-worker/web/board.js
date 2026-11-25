@@ -11,6 +11,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
   // when Iris keeps such requests; the board holds none yet.
   const workMark = (item) => {
     if (item.handoff && item.handoff.state === 'requested' && item.handoff.to === 'hold') return '任せた・保留中';
+    if (item.handoff?.requester_declined_at) return '受付条件により見送り';
     if (item.handoff && item.handoff.state === 'requested') return '任せた・まだ受けていない';
     if (item.handoff && item.handoff.state === 'accepted') return '任せた・受けた';
     if (item.handoff && item.handoff.state === 'unknown') return '任せた・状態不明';
@@ -546,6 +547,7 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
     const open = data.open;
     if (open && open.status === 'waiting') state.textContent = '送りました。' + talkerLabel(open.to) + ' が 1 分以内に拾います。';
     else if (open && open.status === 'taken') state.textContent = talkerLabel(open.to) + ' が受けました。考えています（' + Math.max(1, Math.round((Date.now() - open.at) / 60000)) + ' 分）。';
+    else if (data.handoff?.requester_declined_at) state.textContent = '担当が受付条件により見送りました。取り下げて、許可された依頼元から任せ直してください。';
     else if (data.handoff && ['requested', 'accepted'].includes(data.handoff.state)) state.textContent = '任せた仕事を進めています。終わると、ここに結果が出ます。';
     else state.textContent = '';
     const partner = $('board-chat-partner');

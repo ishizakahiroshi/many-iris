@@ -184,7 +184,7 @@ async function main() {
   check("initialize answers", res.status === 200 && res.body.result.protocolVersion === "2025-06-18" && res.body.result.serverInfo.name === "many-iris-board");
   check("notification gets 202", (await mcpRaw(K.alpha, { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
   res = await rpc(K.alpha, "tools/list");
-  check("twenty tools", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
+  check("board tool inventory", res.body.result?.tools?.map((t) => t.name).join(",") === "board_upsert_item,board_add_event,board_list,board_my_work,board_report_requester_declined,board_request_status,board_request_handoff,board_accept_handoff,board_route_handoff,board_take_back_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff,board_mark_handoff_unknown,board_release_handoff,board_resume_handoff,board_chat_pending,board_chat_take,board_chat_attachment,board_chat_reply,board_resolve_dispatch",
     `${res.status} ${JSON.stringify(res.body).slice(0, 300)}`);
   check("unknown method is 404", (await rpc(K.alpha, "resources/list")).status === 404);
   check("unsupported per-request version is refused",
@@ -192,7 +192,7 @@ async function main() {
   check("unknown tool", code(await call(K.alpha, "board_delete", {})) === -32602);
   res = await rpc(K.restricted, "tools/list");
   check("restricted discovery exposes only own-work and run reporting",
-    res.body.result?.tools?.map((t) => t.name).join(",") === "board_my_work,board_accept_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff");
+    res.body.result?.tools?.map((t) => t.name).join(",") === "board_my_work,board_report_requester_declined,board_accept_handoff,board_heartbeat_handoff,board_progress_handoff,board_complete_handoff");
   check("restricted call cannot reach legacy attachment reads", code(await call(K.restricted, "board_chat_attachment", { attachment_id: "0".repeat(32) })) === -32602);
   check("restricted call cannot reach board_list", code(await call(K.restricted, "board_list", {})) === -32602);
   check("restricted call cannot reach request status", code(await call(K.restricted, "board_request_status", { item_id: "synthetic-b" })) === -32602);
@@ -539,7 +539,18 @@ async function main() {
   const writerHanded = await handoffOf("pile3");
   check("a request handed by a writer names the writer", writerHanded?.requested_by === "alpha" && writerHanded?.to_set_by === "alpha", JSON.stringify(writerHanded));
   check("a request for muse cannot be taken by another writer", code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
+  const decline = { item_id: "pile3", request_id: museRequest, to_set_by: "alpha" };
+  const statusOfPile = async () => (await call(K.alpha, "board_request_status", { item_id: "pile3" })).lifecycle;
+  await call(K.alpha, "board_report_requester_declined", decline);
+  await call(K.muse, "board_report_requester_declined", { ...decline, request_id: "older" });
+  check("other writers and stale requests cannot report a refusal", !(await statusOfPile()).needs_attention);
+  await call(K.muse, "board_report_requester_declined", decline);
+  const receipt = (await handoffOf("pile3")).requester_declined_at;
+  await call(K.muse, "board_report_requester_declined", decline);
+  const refused = await statusOfPile();
+  check("the assigned picker records one refusal without taking work", typeof receipt === "number" && (await handoffOf("pile3")).requester_declined_at === receipt && refused.stage === "requested" && refused.needs_attention && refused.summary.includes("受付条件"));
   check("the owner routes the request to hold", (await ownerCode({ op: "route", item_id: "pile3", to: "hold" })) === "200 OK" && (await handoffOf("pile3"))?.to === "hold");
+  check("a new route clears the previous receipt", !(await handoffOf("pile3")).requester_declined_at);
   check("nobody takes a request on hold", code(await call(K.muse, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN" &&
     code(await call(K.alpha, "board_accept_handoff", { item_id: "pile3", request_id: museRequest })) === "FORBIDDEN");
   check("routing needs a destination", (await ownerCode({ op: "route", item_id: "pile3" })) === "400 INVALID");
