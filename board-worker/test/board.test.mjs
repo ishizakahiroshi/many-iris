@@ -123,7 +123,7 @@ const statusOnly = { schema_version: 1, status_only: [{ project: "quiet", actor:
 
 function writeTestEnv() {
   writeFileSync(join(temp, "test.env"),
-    `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=28\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
+    `BOARD_WRITERS='${JSON.stringify(writers)}'\nBOARD_STATUS_ONLY='${JSON.stringify(statusOnly)}'\nBOARD_POLL_INTERVALS='{"muse":600}'\nACCESS_TEAM_DOMAIN=${team}\nACCESS_AUD=${AUD}\nBOARD_OWNERS=other@example.com, ${OWNER.toUpperCase()}\nBOARD_LIMIT_ITEMS=28\nBOARD_LEASE_MS=2000\nBOARD_PUBLIC_ORIGIN=${base}\n`);
 }
 async function main() {
   mkdirSync(temp, { recursive: true });
@@ -490,13 +490,28 @@ async function main() {
   const handed = await call(K.alpha, "board_request_handoff", { item_id: "status1", to: "muse" });
   st = await call(K.alpha, "board_request_status", { item_id: "status1" });
   check("a handed-over item reports requested, not accepted", st.lifecycle?.stage === "requested" && st.request_id === handed.handoff?.request_id && st.lifecycle?.accepted_by === null, JSON.stringify(st));
+  const pollKey = JSON.stringify(["muse", "demo"]);
+  const beforePoll = await snapshot();
+  await call(K.muse, "board_list", { project: "demo" });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("initial request has no observed or scheduled poll; other API traffic doesn't count",
+    st.poll?.assignee === "muse" && st.poll.last_poll_at === null && st.poll.next_poll_at === null);
+  await call(K.muse, "board_my_work", { project: "unrelated" });
+  check("an unrelated scoped read doesn't count", (await call(K.alpha, "board_request_status", { item_id: "status1" })).poll?.last_poll_at === null);
+  await call(K.muse, "board_my_work", { project: "demo" });
+  st = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  const afterPoll = await snapshot(beforePoll.revision);
+  check("unchanged page and status show the same observed poll and labeled estimate",
+    afterPoll.unchanged && typeof st.poll?.last_poll_at === "number" &&
+    st.poll.next_poll_at === st.poll.last_poll_at + 600000 && st.poll.next_poll_source === "configured_interval_estimate" &&
+    st.poll.overdue === false && JSON.stringify(afterPoll.poll_by_queue?.[pollKey]) === JSON.stringify(st.poll));
   const eventsAfterAsk = (await call(K.alpha, "board_list", { project: "demo" })).events?.length;
   await call(K.alpha, "board_request_status", { item_id: "status1" });
   await call(K.alpha, "board_request_status", { item_id: "status1" });
   check("asking for the status writes nothing", (await call(K.alpha, "board_list", { project: "demo" })).events?.length === eventsAfterAsk && (await call(K.alpha, "board_request_status", { item_id: "status1" })).lifecycle?.stage === "requested");
   const statusRun = await call(K.muse, "board_accept_handoff", { item_id: "status1", request_id: handed.handoff.request_id });
   st = await call(K.alpha, "board_request_status", { item_id: "status1" });
-  check("a taken item reports accepted, with who and when, and no sign of work yet", st.lifecycle?.stage === "accepted" && st.lifecycle?.accepted_by === "muse" && typeof st.lifecycle?.times?.accepted_at === "number", JSON.stringify(st));
+  check("a taken item reports accepted, with who and when, and no sign of work yet", st.lifecycle?.stage === "accepted" && st.poll === null && st.lifecycle?.accepted_by === "muse" && typeof st.lifecycle?.times?.accepted_at === "number", JSON.stringify(st));
   await new Promise((resolve) => setTimeout(resolve, 5));
   await call(K.muse, "board_progress_handoff", { item_id: "status1", request_id: handed.handoff.request_id, generation: statusRun.handoff.generation, kind: "note", text: "working", ref: "https://github.com/example/repo/issues/1" });
   st = await call(K.alpha, "board_request_status", { item_id: "status1" });
@@ -548,6 +563,7 @@ async function main() {
   const receipt = (await handoffOf("pile3")).requester_declined_at;
   await call(K.muse, "board_report_requester_declined", decline);
   const refused = await statusOfPile();
+  check("a recorded refusal takes precedence over poll status", (await call(K.alpha, "board_request_status", { item_id: "pile3" })).poll === null);
   check("the assigned picker records one refusal without taking work", typeof receipt === "number" && (await handoffOf("pile3")).requester_declined_at === receipt && refused.stage === "requested" && refused.needs_attention && refused.summary.includes("受付条件"));
   check("the owner routes the request to hold", (await ownerCode({ op: "route", item_id: "pile3", to: "hold" })) === "200 OK" && (await handoffOf("pile3"))?.to === "hold");
   check("a new route clears the previous receipt", !(await handoffOf("pile3")).requester_declined_at);
