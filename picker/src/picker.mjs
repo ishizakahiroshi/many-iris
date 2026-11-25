@@ -47,11 +47,38 @@ import { takeoverRef } from "./takeover.mjs";
 /** The board page's writer name: the only hander trusted by default. */
 export const OWNER_ACTOR = "page:owner";
 
+/** The status words a status-only run may report (#50): the same words the
+ * board's registration enforces on the receiving side (board-worker
+ * status-only.ts). */
+export const STATUS_STARTED = "状態：着手";
+export const STATUS_WORKING = "状態：作業中";
+export const STATUS_ATTENTION = "状態：要確認";
+export const STATUS_DONE = "状態：完了";
+const STATUS_WORDS = new Set([STATUS_STARTED, STATUS_WORKING, STATUS_ATTENTION]);
+
 const TEXT_MAX = 2000;
 
 export function truncate(text, max = TEXT_MAX) {
   const s = String(text ?? "");
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+/**
+ * Is this job's reporting restricted to the fixed status words? (#50)
+ *   "restricted" – the job's project is registered and this picker (its
+ *     writer and board) is the registered taker: its reports carry only the
+ *     job's identity and the status words.
+ *   "held" – the project is registered but for another writer or board:
+ *     the job waits. It must not run here, and never with ordinary
+ *     reporting — the restriction is not something a request can switch off.
+ *   null – not registered: ordinary reporting.
+ */
+export function statusOnlyFor(project, config) {
+  const entries = Array.isArray(config.statusOnly) ? config.statusOnly : [];
+  const entry = entries.find((e) => e.project === project);
+  if (!entry) return null;
+  const board = (u) => String(u ?? "").replace(/\/+$/, "");
+  return entry.writer === config.writer && board(entry.board) === board(config.boardUrl) ? "restricted" : "held";
 }
 
 /**
@@ -154,6 +181,7 @@ export async function runPass({ client, config, executor, state, log = () => {},
   const projects = config.projects.length > 0 ? config.projects : [null];
   let chosen = null;
   let listed = [];
+  const held = [];
   for (const project of projects) {
     let items;
     try {
@@ -171,13 +199,33 @@ export async function runPass({ client, config, executor, state, log = () => {},
       }
       throw error;
     }
-    chosen = items.map((item) => eligible(item, config)).find((run) => run !== null) ?? null;
+    for (const item of items) {
+      const run = eligible(item, config);
+      if (run === null) continue;
+      // A status-only registration that names another writer or board holds
+      // the job here: it stays requested and is never run with ordinary
+      // reporting (the board refuses the accept the same way).
+      if (statusOnlyFor(run.project, config) === "held") {
+        held.push(run.itemId);
+        continue;
+      }
+      chosen = run;
+      break;
+    }
     if (chosen !== null) {
       listed = items;
       break;
     }
   }
-  if (chosen === null) return { kind: "nothing" };
+  if (chosen === null) {
+    if (held.length > 0) {
+      log(`held ${held.join(", ")}: the status-only registration names a different writer or board`);
+      return { kind: "held", itemIds: held };
+    }
+    return { kind: "nothing" };
+  }
+  if (held.length > 0) log(`held ${held.join(", ")}: the status-only registration names a different writer or board`);
+  const restricted = statusOnlyFor(chosen.project, config) === "restricted";
 
   // Take it. A refusal here means somebody else won, it was taken
   // back, or it was routed elsewhere between listing and accepting:
@@ -236,13 +284,25 @@ export async function runPass({ client, config, executor, state, log = () => {},
   };
   const heartbeat = () => reportToBoard("board_heartbeat_handoff", fence);
   const timer = timers.setInterval(() => { void heartbeat(); }, config.heartbeatMs);
+  let lastStatus = null;
   const progress = async (text) => {
-    await reportToBoard("board_progress_handoff", { ...fence, kind: "note", text: truncate(text) });
+    let note = truncate(text);
+    if (restricted) {
+      // Status-only (#50): only the fixed words go out. Whatever else the
+      // worker reported — free text, links, error details — becomes the
+      // nearest state before any board call is made.
+      const status = text === "工程：回答待ち" ? STATUS_ATTENTION
+        : STATUS_WORDS.has(text) ? text : STATUS_WORKING;
+      if (status === lastStatus) return;
+      lastStatus = status;
+      note = status;
+    }
+    await reportToBoard("board_progress_handoff", { ...fence, kind: "note", text: note });
   };
 
   let result;
   try {
-    await progress(`開始（picker、${config.writer}。任された仕事 ${chosen.requestId} を受けた）`);
+    await progress(restricted ? STATUS_STARTED : `開始（picker、${config.writer}。任された仕事 ${chosen.requestId} を受けた）`);
     if (!abort.signal.aborted) {
       const job = { itemId: chosen.itemId, project: chosen.project, requestId: chosen.requestId, title: chosen.title };
       const takeover = await lookUpTakeover(client, job, listed);
@@ -289,10 +349,17 @@ export async function runPass({ client, config, executor, state, log = () => {},
   }
 
   const outcome = result?.outcome === "done" ? "done" : "stopped";
-  const found = runResult(result);
-  const completion = { ...fence, outcome, text: truncate(found.text) || undefined };
-  if (found.ref !== null) completion.ref = found.ref;
-  if (found.commit !== null) completion.commit = found.commit;
+  const completion = { ...fence, outcome };
+  if (restricted) {
+    // Status-only (#50): the result's own text, link and commit stay on the
+    // terminal; the board learns only the state it ended in.
+    completion.text = outcome === "done" ? STATUS_DONE : STATUS_ATTENTION;
+  } else {
+    const found = runResult(result);
+    completion.text = truncate(found.text) || undefined;
+    if (found.ref !== null) completion.ref = found.ref;
+    if (found.commit !== null) completion.commit = found.commit;
+  }
   try {
     await client.call("board_complete_handoff", completion);
   } catch (error) {

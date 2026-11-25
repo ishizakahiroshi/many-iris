@@ -76,6 +76,7 @@ cron の例（5 分おきに 1 回）:
 | `PICKER_PROJECTS` | | 全て | 見る project（カンマ区切り） |
 | `PICKER_OWNER_ONLY` | | `1` | `0` で「持ち主が任せた仕事だけ」の門を外す（下記） |
 | `PICKER_TRUSTED_REQUESTERS` | | なし | 門を開けたまま、持ち主と同じに扱う書き手（カンマ区切り。下記）。自分の `PICKER_WRITER` は入れられない |
+| `PICKER_STATUS_ONLY` | | なし | 状態のみ報告の登録（JSON 配列 `[{"project","writer","board"}]`。下記「状態のみ報告」）。看板側の `BOARD_STATUS_ONLY` と対で使う |
 | `PICKER_INTERVAL_SECS` | | 300 | `--loop` の間隔（30 以上） |
 | `PICKER_HEARTBEAT_SECS` | | 300 | 実行中のハートビート間隔（リース 30 分より十分短く） |
 | `PICKER_MAX_RUNS_PER_DAY` | | 6 | 1 日に拾う上限（1〜50）。`0` で上限なし（止めるときは `PICKER_STOP_FILE` か cron 側の STOP） |
@@ -104,6 +105,22 @@ JSON 1 行で標準入力に渡します。題名は作業の「名前（デー�
 コマンドを起動すると、picker は「作業コマンド起動」を報告します。作業役は工程が変わったときに、専用のファイル記述子 3 へ `investigating`（調査中）、`implementing`（実装中）、`testing`（テスト中）、`awaiting_input`（回答待ち）のいずれかを改行付きで書けます。たとえばテストを開始するときは、シェルなら `printf 'testing\n' >&3`、Node.jsなら `writeSync(3, "testing\n")` です。通常のコマンド出力やエラーの内容から工程を推測しません。
 
 看板は工程の報告時刻と担当との最終通信時刻を別々に表示します。以前の担当から工程が届いていない依頼には「工程未報告」と表示します。MCPで照会する場合は `board_request_status` の `lifecycle.reported_phase` で確認できます。
+
+## 状態のみ報告（`PICKER_STATUS_ONLY`、#50）
+
+外に出せるのが「いまの状態」だけの案件に使います。看板側が
+`BOARD_STATUS_ONLY` に `{"schema_version":1,"status_only":[{"project":"案件","actor":"担当者"}]}`
+を登録し、picker 側は `PICKER_STATUS_ONLY` に同じ結び付けを
+`[{"project":"案件","writer":"担当者","board":"看板の MCP エンドポイント"}]`
+として登録します。依頼の本文からは変えられません。
+
+- 登録された案件は、報告が状態の決まり文句だけになります:
+  着手時 `状態：着手`、作業中 `状態：作業中`、確認が要るとき `状態：要確認`、
+  完了時 `状態：完了`。中間報告・結果の文・結果リンク・commit・
+  例外の文は看板に送られません（拾い手側で捨て、看板側でも受け付けません）。
+- 登録が別の担当者や別の看板を指す案件は保留します: 実行も通常報告も
+  しません（他の担当への自動切替もしません）。看板側でも、登録案件を
+  登録外の担当者が受ける・宛先なしで受けることは断られます。
 
 ## 手元の PC で動かす（`workers/local-claude.mjs`）
 
