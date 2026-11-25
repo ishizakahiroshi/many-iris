@@ -85,7 +85,7 @@ Cloudflare のアカウントと、Cloudflare で管理しているドメイン�
    - `ACCESS_AUD`：手順 3 で作った全体用のアプリの Application Audience（AUD）タグ
    - `BOARD_OWNERS`：看板を読める人のメールアドレス（カンマ区切り）
    - 任意で `DEVIN_API_KEY`：行き先 `devin` の依頼で Devin を起こすときだけ
-6. `wrangler deploy` で配置します。`workers.dev` とプレビューの住所は、`wrangler.toml` で切ってあります。
+6. 既存の本番を更新する場合は `board-worker/` で `npm run deploy:check` を実行します。配信中の版に対応するコミットと配備候補の差分を確認し、`npm run deploy` で再照合して配置します。保守ブランチから分岐していても、稼働版をマージした結果が候補と同じなら通ります。初回の新設は `wrangler deploy --message "Initial deployment (<GitコミットSHA>)"` を使い、括弧内に実際の SHA を指定します。
 
 鍵のファイルと `<keys.json>` は、リポジトリの外に置いてください。
 

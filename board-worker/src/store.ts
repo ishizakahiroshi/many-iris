@@ -178,7 +178,7 @@ const HANDOFF_COLUMNS = [
   "handoff_versions", "handoff_result_ref", "handoff_result_commit", "handoff_phase", "handoff_phase_at",
 ];
 // Only exact notes from the current, fenced run can change its reported phase.
-const PHASE_NOTE = /^工程：(作業コマンド起動|調査中|実装中|テスト中|回答待ち)$/u;
+const PHASE_NOTE = /^工程：(作業コマンド起動|担当AI起動|調査中|実装中|テスト中|回答待ち|提出前検査中)$/u;
 /** A finished run's result link and commit, or null when it gave neither. */
 function resultOf(r: Row, prefix: string): { ref: string | null; commit: string | null } | null {
   const ref = r[prefix + "handoff_result_ref"] ?? null;
