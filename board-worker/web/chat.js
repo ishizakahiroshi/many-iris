@@ -661,7 +661,7 @@
         const itemId = added.answer.item.item_id;
         const handed = to === museDev ? added : await write({ op: 'hand', item_id: itemId, day, to });
         if (!handed.ok) { status.textContent = '仕事は作りましたが、任せられませんでした（' + handed.text + '）。看板の「任せる」からやり直せます。'; return; }
-        const missed = startPending.length ? await sendStartAttachments(itemId, to) : '';
+        const missed = to !== museDev && startPending.length ? await sendStartAttachments(itemId, to) : '';
         startText.value = '';
         for (const a of startPending) forget(a);
         startPending = [];
