@@ -487,6 +487,11 @@ async function main() {
   check("asking for the status of an unknown item is not found", code(await call(K.alpha, "board_request_status", { item_id: "nope" })) === "NOT_FOUND");
   check("status takes no other argument", code(await call(K.alpha, "board_request_status", { item_id: "status1", extra: 1 })) === -32602);
   check("no key, no status", (await mcpRaw(null, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "board_request_status", arguments: { item_id: "status1" } } })).status === 401);
+  await call(K.alpha, "board_request_handoff", { item_id: "status1", to: "devin" });
+  const cloudStatus = await call(K.alpha, "board_request_status", { item_id: "status1" });
+  check("the board starts cloud Devin, so it has no patrol status", cloudStatus.lifecycle?.stage === "requested" &&
+    cloudStatus.poll === null && !(JSON.stringify(["devin", "demo"]) in (await snapshot()).poll_by_queue));
+  await call(K.alpha, "board_take_back_handoff", { item_id: "status1" });
   const handed = await call(K.alpha, "board_request_handoff", { item_id: "status1", to: "muse" });
   st = await call(K.alpha, "board_request_status", { item_id: "status1" });
   check("a handed-over item reports requested, not accepted", st.lifecycle?.stage === "requested" && st.request_id === handed.handoff?.request_id && st.lifecycle?.accepted_by === null, JSON.stringify(st));

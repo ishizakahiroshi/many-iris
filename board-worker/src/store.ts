@@ -1616,7 +1616,7 @@ export class Store {
       now,
     );
     const actor = handoff?.to;
-    const poll = handoff?.state === "requested" && actor && !UNTAKEN_TARGETS.has(actor) && handoff.requester_declined_at == null
+    const poll = handoff?.state === "requested" && actor && actor !== "devin" && !UNTAKEN_TARGETS.has(actor) && handoff.requester_declined_at == null
       ? this.pollFor(actor, item.project, now) : null;
     return { ok: true, item_id: itemId, request_id: handoff?.request_id ?? null, lifecycle, poll };
   }
@@ -1706,7 +1706,7 @@ export class Store {
        LEFT JOIN writer_poll g ON g.actor=i.handoff_to AND g.project=''
        LEFT JOIN writer_poll p ON p.actor=i.handoff_to AND p.project=i.project
        WHERE i.handoff_state='requested' AND i.handoff_to IS NOT NULL
-         AND i.handoff_to NOT IN ('owner','hold') AND i.handoff_declined_at IS NULL
+         AND i.handoff_to NOT IN ('owner','hold','devin') AND i.handoff_declined_at IS NULL
        ORDER BY i.handoff_to,i.project`,
     ).toArray() as Row[];
     const poll_by_queue = Object.fromEntries(polls.map((r) => {
