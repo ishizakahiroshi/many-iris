@@ -12,7 +12,7 @@ import {
   ATTACHMENT_TTL_MS, IMAGE_MAX_BYTES, READ_MAX_CHARS, isImageType, markerText, validAttachmentId,
 } from "./attachments";
 import { deriveLifecycle, type LifecycleInput } from "./lifecycle";
-import { ALIVE_MS, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
+import { ALIVE_MS, BOARD_STARTED, DEFAULT_ORDER, ORDERABLE, isAlive, isLocalTarget, parseOrder, parseVersions } from "./route";
 import {
   HANDOFF_LEASE_MS, canMarkUnknown, canReleaseUnknown, canResumeUnknown, checkFence,
   checkGenericWrite, isLegacyRun, leaseExpired, nextGeneration, type GenericFence, type HandoffView,
@@ -586,10 +586,11 @@ export class Store {
   }
 
   /** The order and, for every destination that can be in it, whether it is picking up now (for the page). */
-  private routeView(route: Record<string, unknown>, devinReady: boolean, now: number): Record<string, unknown> {
+  private routeView(route: Record<string, unknown>, startedReady: Record<string, boolean>, now: number): Record<string, unknown> {
     const seen = route.seen as Record<string, number>;
     const targets = ORDERABLE.map((target) => ({
-      target, alive: isAlive(target, seen, now, devinReady), seen_at: target === "devin" ? null : (seen[target] ?? null),
+      target, alive: isAlive(target, seen, now, startedReady),
+      seen_at: (BOARD_STARTED as readonly string[]).includes(target) ? null : (seen[target] ?? null),
     }));
     return { order: route.order, set_by_owner: route.set_by_owner, updated_at: route.updated_at, alive_ms: ALIVE_MS, targets };
   }
@@ -1641,13 +1642,13 @@ export class Store {
 
   /** The data of the page. `can_write` tells the page that this board takes
    * the owner's own writes (`ownerWrite`); the Rust board does not send it. */
-  pageData(devinReady = false, since: string | null = null): Record<string, unknown> {
+  pageData(startedReady: Record<string, boolean> = {}, since: string | null = null): Record<string, unknown> {
     const now = Date.now();
     const { epoch, version } = this.sql.exec("SELECT epoch,version FROM page_revision WHERE id=1").one();
     const revision = `${epoch}.${version}`;
     const route = this.routeOrder();
     const live = { revision, history_epoch: epoch, generated_at: now, can_write: true,
-      route: this.routeView(route, devinReady, now), paused: this.pauseState(), scopes: route.scopes };
+      route: this.routeView(route, startedReady, now), paused: this.pauseState(), scopes: route.scopes };
     if (since === revision) return { ok: true, unchanged: true, ...live };
     const data = this.list(null, 0, PAGE_EVENT_LIMIT, true);
     // A run reports its result as a note and then closes the item, so the

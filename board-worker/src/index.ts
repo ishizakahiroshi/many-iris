@@ -58,6 +58,10 @@ export interface Env {
    * A service-user key targets the org-scoped v3 endpoint instead:
    *   https://api.devin.ai/v3/organizations/<org>/sessions */
   DEVIN_SESSIONS_URL?: string;
+  /** MuseDev API key for the scheduled dispatcher (wrangler secret put MUSEDEV_API_KEY). */
+  MUSEDEV_API_KEY?: string;
+  /** Override of the MuseDev sessions endpoint (defaults to DEVIN_SESSIONS_URL's). */
+  MUSEDEV_SESSIONS_URL?: string;
 }
 
 const MCP_PATH = "/board/mcp";
@@ -144,7 +148,8 @@ export class BoardStore extends DurableObject<Env> {
     return result;
   }
   async page(since: string | null = null): Promise<Record<string, unknown>> {
-    return guarded(() => this.store.pageData(Boolean(this.env.DEVIN_API_KEY), since));
+    return guarded(() => this.store.pageData(
+      { devin: Boolean(this.env.DEVIN_API_KEY), musedev: Boolean(this.env.MUSEDEV_API_KEY) }, since));
   }
   async activity(after: number, through: number): Promise<Record<string, unknown>> {
     return guarded(() => this.store.activity(after, through));
@@ -427,10 +432,14 @@ const DEVIN_SESSIONS_URL = "https://api.devin.ai/v1/sessions";
 /** What one dispatcher pass works with (the cron tick, and the pass right after the owner hands work over). */
 function dispatcherDeps(env: Env): DispatchDeps {
   const devinKey = env.DEVIN_API_KEY;
+  const musedevKey = env.MUSEDEV_API_KEY;
   return {
     board: boardStub(env),
     startDevin: devinKey
       ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, devinKey, prompt)
+      : null,
+    startMusedev: musedevKey
+      ? (prompt) => spawnDevinSession((url, init) => fetch(url, init), env.MUSEDEV_SESSIONS_URL ?? env.DEVIN_SESSIONS_URL ?? DEVIN_SESSIONS_URL, musedevKey, prompt)
       : null,
   };
 }

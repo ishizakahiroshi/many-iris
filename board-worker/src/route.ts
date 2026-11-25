@@ -9,13 +9,19 @@
 /**
  * Where a handed-over piece of work should go (the item's handoff.to): a tool
  * and the place it runs (owner decision 2026-11-21, B1). `devin` is Devin in
- * the cloud (the board starts its sessions), `vps-*` run on the always-on
- * server, `local-*` on the owner's PC. `owner` and `hold` are not writers.
+ * the cloud and `musedev` is the Muse family's own Devin; the board starts
+ * their sessions itself (a musedev run returns its result as a Draft PR).
+ * `vps-*` run on the always-on server, `local-*` on the owner's PC. `owner`
+ * and `hold` are not writers.
  */
 export const HANDOFF_TARGETS = [
-  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "muse", "grokbot", "dots", "owner", "hold",
+  "devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "musedev", "muse", "grokbot", "dots", "owner", "hold",
 ] as const;
 export type HandoffTarget = (typeof HANDOFF_TARGETS)[number];
+
+/** The destinations the board starts itself (dispatch.ts): Devin sessions it
+ * launches, so they are alive whenever the board holds their start key. */
+export const BOARD_STARTED = ["devin", "musedev"] as const;
 
 /** The destinations the owner may put in the order (every writer; not owner, not hold). */
 export const ORDERABLE = HANDOFF_TARGETS.filter((t) => t !== "owner" && t !== "hold");
@@ -48,13 +54,14 @@ export function parseOrder(value: unknown): string[] | null {
 }
 
 /**
- * Whether a destination is picking up work now. Devin in the cloud does not
- * come to the board on its own: the board starts it, so it is ready whenever
- * the board has a Devin key. Every other destination is a taker that comes to
+ * Whether a destination is picking up work now. A board-started destination
+ * (BOARD_STARTED) does not come to the board on its own: the board starts it,
+ * so it is ready whenever the board holds the key that starts it
+ * (startedReady[target]). Every other destination is a taker that comes to
  * the board; it is alive when it came within ALIVE_MS.
  */
-export function isAlive(target: string, seen: Record<string, number>, now: number, devinReady: boolean): boolean {
-  if (target === "devin") return devinReady;
+export function isAlive(target: string, seen: Record<string, number>, now: number, startedReady: Record<string, boolean>): boolean {
+  if ((BOARD_STARTED as readonly string[]).includes(target)) return startedReady[target] === true;
   const at = seen[target];
   return typeof at === "number" && now - at <= ALIVE_MS;
 }

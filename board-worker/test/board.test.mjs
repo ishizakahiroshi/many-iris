@@ -19,7 +19,7 @@ const base = `http://127.0.0.1:${port}`;
 
 const key = () => randomBytes(32).toString("hex");
 const sha = (s) => createHash("sha256").update(s).digest("hex");
-const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), devin: key(), local: key(), restricted: key(), restrictedRevoked: key() };
+const K = { alpha: key(), beta: key(), stranger: key(), muse: key(), vps: key(), devin: key(), local: key(), restricted: key(), restrictedRevoked: key(), musedev: key() };
 const writers = { schema_version: 1, writers: [
   { actor: "alpha", token_sha256: sha(K.alpha), enabled: true },
   { actor: "beta", token_sha256: sha(K.beta), enabled: false },
@@ -29,6 +29,7 @@ const writers = { schema_version: 1, writers: [
   { actor: "grokbot", token_sha256: sha(K.restricted), enabled: true, policy: "restricted" },
   { actor: "vps-devin", token_sha256: sha(K.devin), enabled: true },
   { actor: "local-devin", token_sha256: sha(K.restrictedRevoked), enabled: false, policy: "restricted" },
+  { actor: "musedev", token_sha256: sha(K.musedev), enabled: true, policy: "restricted" },
 ] };
 
 // A stand-in for Cloudflare Access: a local server publishes the signing key the
@@ -1074,6 +1075,25 @@ check("the chat page is served", chatPage.status === 200 && (await chatPage.text
     dotsItem?.handoff?.request_id === dotsRequest.request_id && dotsItem.handoff.state === "completed" &&
     dotsItem.last_note?.actor === "dots" && dotsItem.last_note.text === "15 / 3 = 5");
   check("dots has no outstanding work after completion", (await call(dotsToken, "board_my_work", {})).items?.length === 0);
+
+  // --- musedev: a dedicated destination and its own restricted key. The key
+  // may only take work addressed to musedev and report through the fenced
+  // tools; the Draft PR URL comes back as the result's ref. (The fixture is
+  // at the item limit, so the finished stop1 is re-piled like above.)
+  check("the owner re-piles the finished item", (await call(K.alpha, "board_upsert_item", { item_id: "stop1", state: "planned" })).ok === true);
+  check("the owner assigns work directly to musedev", (await ownerCode({ op: "hand", item_id: "stop1", to: "musedev" })) === "200 OK");
+  const mdRequest = (await call(K.alpha, "board_request_status", { item_id: "stop1" })).request_id;
+  check("the restricted musedev key cannot read the board", code(await call(K.musedev, "board_list", {})) === -32602);
+  check("the restricted musedev key cannot take work for another writer",
+    code(await call(K.musedev, "board_accept_handoff", { item_id: other.item_id, request_id: otherRequest })) === "NOT_FOUND");
+  const mdAccept = await call(K.musedev, "board_accept_handoff", { item_id: "stop1", request_id: mdRequest });
+  check("the restricted musedev key takes its own assignment",
+    mdAccept.handoff?.accepted_by === "musedev" && Number.isSafeInteger(mdAccept.handoff?.generation), JSON.stringify(mdAccept));
+  const mdFence = { item_id: "stop1", request_id: mdRequest, generation: mdAccept.handoff.generation };
+  const mdDone = await call(K.musedev, "board_complete_handoff", { ...mdFence, outcome: "done", text: "done as a Draft PR", ref: "https://github.com/example/repo/pull/7" });
+  const mdHandoff = (await handoffOf("stop1"));
+  check("a musedev run returns its result with the Draft PR as its ref",
+    mdDone.ok === true && mdHandoff?.state === "completed" && mdHandoff?.result?.ref === "https://github.com/example/repo/pull/7", JSON.stringify(mdHandoff));
 
   // --- status-only reporting (#50): the "quiet" project runs as muse and
   // reports the fixed status words only. The receiving side refuses free

@@ -201,7 +201,8 @@ import { ActivityHistory, actuals, boardDay, dateLabel, mergeBoard } from './boa
   const targets = [
     ['', 'おまかせ'], ['vps-claude', 'VPS の claude -p'], ['local-claude', '手元 PC の claude -p'],
     ['devin', 'Devin（クラウド）'], ['vps-devin', 'Devin（VPS）'], ['local-devin', 'Devin（手元 PC）'],
-    ['muse', 'Muse'], ['grokbot', 'GrokBot'], ['dots', 'dots'], ['owner', '自分'], ['hold', '保留'],
+    ['musedev', 'MuseDev（結果は Draft PR）'], ['muse', 'Muse'], ['grokbot', 'GrokBot'], ['dots', 'dots'],
+    ['owner', '自分'], ['hold', '保留'],
   ];
   const targetLabel = (to) => (targets.find(([value]) => value === (to || '')) || [null, to])[1];
   // Where おまかせ sent a request, read off the dispatcher's event on it.

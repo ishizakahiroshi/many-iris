@@ -3,7 +3,7 @@
 //
 //   node test/route.test.mjs
 import { ALIVE_MS, DEFAULT_ORDER, HANDOFF_TARGETS, ORDERABLE, chooseByOrder, isAlive, isLocalTarget, orderFor, parseOrder, parseVersions } from "../src/route.ts";
-import { runDispatcher, spawnDevinSession, DISPATCH_MAX_PER_DAY, DISPATCH_MAX_PER_REQUEST } from "../src/dispatch.ts";
+import { runDispatcher, spawnDevinSession, dispatchPrompt, musedevPrompt, DISPATCH_MAX_PER_DAY, DISPATCH_MAX_PER_REQUEST } from "../src/dispatch.ts";
 
 let passed = 0;
 const failures = [];
@@ -13,7 +13,7 @@ function check(name, condition, detail = "") {
 }
 
 // --- pure parts: the destinations, the order and who is alive
-check("destinations are a tool and the place it runs", ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin"].every((t) => HANDOFF_TARGETS.includes(t)));
+check("destinations are a tool and the place it runs", ["devin", "vps-claude", "local-claude", "vps-devin", "local-devin", "musedev", "muse", "grokbot", "dots"].every((t) => HANDOFF_TARGETS.includes(t)));
 check("owner and hold cannot be in the order", !ORDERABLE.includes("owner") && !ORDERABLE.includes("hold") && ORDERABLE.length === HANDOFF_TARGETS.length - 2);
 check("the default order is the server, the PC, then Devin", DEFAULT_ORDER.join(",") === "vps-claude,local-claude,devin");
 check("an order is distinct destinations in order", parseOrder(["devin", "vps-claude"])?.join(",") === "devin,vps-claude");
@@ -21,11 +21,12 @@ check("an empty order is allowed (everything goes to hold)", parseOrder([])?.len
 for (const bad of [null, "devin", ["devin", "devin"], ["owner"], ["hold"], ["someone"], [1], new Array(ORDERABLE.length + 1).fill("devin")])
   check(`a bad order is refused: ${JSON.stringify(bad)?.slice(0, 40)}`, parseOrder(bad) === null);
 const now = 1_000_000_000;
-check("a taker seen lately is alive", isAlive("vps-claude", { "vps-claude": now - 60_000 }, now, false));
-check("a taker seen exactly the limit ago is still alive", isAlive("vps-claude", { "vps-claude": now - ALIVE_MS }, now, false));
-check("a taker not seen for longer than the limit is not", !isAlive("vps-claude", { "vps-claude": now - ALIVE_MS - 1 }, now, false));
-check("a taker never seen is not", !isAlive("local-claude", {}, now, true));
-check("Devin in the cloud is alive when the board can start it", isAlive("devin", {}, now, true) && !isAlive("devin", { devin: now }, now, false));
+check("a taker seen lately is alive", isAlive("vps-claude", { "vps-claude": now - 60_000 }, now, {}));
+check("a taker seen exactly the limit ago is still alive", isAlive("vps-claude", { "vps-claude": now - ALIVE_MS }, now, {}));
+check("a taker not seen for longer than the limit is not", !isAlive("vps-claude", { "vps-claude": now - ALIVE_MS - 1 }, now, {}));
+check("a taker never seen is not", !isAlive("local-claude", {}, now, { devin: true }));
+check("Devin in the cloud is alive when the board can start it", isAlive("devin", {}, now, { devin: true }) && !isAlive("devin", { devin: now }, now, {}));
+check("MuseDev has its own start key", isAlive("musedev", {}, now, { musedev: true }) && !isAlive("musedev", {}, now, { devin: true }));
 const first = chooseByOrder(["vps-claude", "local-claude", "devin"], (t) => t !== "vps-claude");
 check("the first alive destination in the order gets the work, and the event says which number and who was passed over",
   first.to === "local-claude" && first.rank === 2 && first.text === "routed to local-claude: number 2 in the owner's order (vps-claude not picking up)", JSON.stringify(first));
@@ -153,6 +154,42 @@ const startDevin = async () => { devinStarts++; return { session_id: `s${devinSt
   devinStarts = 0;
   await runDispatcher({ board, startDevin });
   check("the day's cap on Devin starts holds", devinStarts === 1 && log.dispatched.length === 1, JSON.stringify(log));
+}
+
+// --- musedev: the board's other start, with its own key, prompt and caps
+{
+  const { board, log } = fakeBoard([item("md", "musedev"), item("dv", "devin")]);
+  const starts = [];
+  const startMusedev = async (prompt) => { starts.push(prompt); return { session_id: "ms1", url: "https://app.devin.ai/sessions/m" }; };
+  devinStarts = 0;
+  await runDispatcher({ board, startDevin, startMusedev });
+  check("work for musedev is started by its own starter", starts.length === 1 && devinStarts === 1 && log.dispatched.includes("REQ-md") && log.dispatched.includes("REQ-dv"), JSON.stringify(log));
+  check("the musedev start names the destination", log.events.some((t) => t === `dispatched REQ-md to musedev session ms1`), JSON.stringify(log.events));
+  check("the musedev prompt carries its own board key and the Draft PR contract",
+    starts[0].includes("MANY_IRIS_BOARD_KEY_MUSEDEV") && starts[0].includes("Draft PR") && starts[0].includes("ref"), "");
+  check("each prompt names its own board key",
+    musedevPrompt(item("x")).includes("$MANY_IRIS_BOARD_KEY_MUSEDEV") && !musedevPrompt(item("x")).includes("$MANY_IRIS_BOARD_KEY;") &&
+    dispatchPrompt(item("x")).includes("$MANY_IRIS_BOARD_KEY;") && !dispatchPrompt(item("x")).includes("MUSEDEV"), "");
+}
+{
+  const { board, log } = fakeBoard([item("md2", "musedev")]);
+  devinStarts = 0;
+  await runDispatcher({ board, startDevin });
+  check("without a MuseDev key, work for musedev is left alone", devinStarts === 0 && log.claims.length === 0 && log.dispatched.length === 0, JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("md3")], { order: ["musedev"] });
+  const starts = [];
+  await runDispatcher({ board, startMusedev: async (prompt) => { starts.push(prompt); return { session_id: "ms2" }; } });
+  check("the order reaches musedev, which starts in the same pass",
+    log.routed[0]?.to === "musedev" && starts.length === 1 && log.dispatched[0] === "REQ-md3", JSON.stringify(log));
+}
+{
+  const { board, log } = fakeBoard([item("md4")], { order: ["musedev", "devin"] });
+  devinStarts = 0;
+  await runDispatcher({ board, startDevin });
+  check("without a MuseDev key the order passes musedev over to Devin",
+    log.routed[0]?.to === "devin" && log.routed[0]?.text.includes("musedev not picking up") && devinStarts === 1, JSON.stringify(log));
 }
 
 // --- the claim before the start: races, lost answers, a person's settlement

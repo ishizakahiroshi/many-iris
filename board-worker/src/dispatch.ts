@@ -2,7 +2,9 @@
 //   1. Work handed over without a destination gets one from the owner's order:
 //      the first destination in it that is picking up work now, or `hold`
 //      when none is (route.ts).
-//   2. Work for `devin` is handed to a new Devin session, which takes it with
+//   2. Work for a destination the board starts itself — `devin`, and
+//      `musedev` (the Muse family's own Devin, whose result comes back as a
+//      Draft PR) — is handed to a new Devin session, which takes it with
 //      board_accept_handoff, does the work and writes the result back. The
 //      start is claimed on the board BEFORE the session is started (one
 //      atomic claim per request, store.ts claimDispatch), so two ticks
@@ -46,6 +48,8 @@ export interface DispatchDeps {
   board: BoardCalls;
   /** Starts a Devin session; absent when no Devin key is set up. */
   startDevin?: ((prompt: string) => Promise<DevinStart>) | null;
+  /** Starts a MuseDev session; absent when no MuseDev key is set up. */
+  startMusedev?: ((prompt: string) => Promise<DevinStart>) | null;
   now?: () => number;
 }
 
@@ -79,7 +83,7 @@ export async function spawnDevinSession(
   }
 }
 
-export function dispatchPrompt(item: Record<string, unknown>): string {
+function handoffPrompt(item: Record<string, unknown>, boardKey: string, finish: string[]): string {
   const ref = typeof item.source_ref === "string" ? item.source_ref : null;
   return [
     "many-iris 看板 (https://iris.ishizakahiroshi.com) の task を1件引き受けてください。",
@@ -88,17 +92,36 @@ export function dispatchPrompt(item: Record<string, unknown>): string {
     ref ? `参照: ${JSON.stringify(plainLine(ref))}` : null,
     "",
     "手順:",
-    "1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $MANY_IRIS_BOARD_KEY; 環境変数になければ secret:personal:MANY_IRIS_BOARD_KEY を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領し、返ってきた handoff.generation を控える",
+    `1. POST /board/mcp (JSON-RPC tools/call, Authorization: Bearer $${boardKey}; 環境変数になければ secret:personal:${boardKey} を exec の env に束縛) で board_accept_handoff({item_id, request_id}) を呼んで受領し、返ってきた handoff.generation を控える`,
     "2. タイトルの作業を実行する。長くかかるときは board_heartbeat_handoff({item_id, request_id, generation}) で連絡を続け、進み具合は board_progress_handoff({item_id, request_id, generation, kind: 'note', text}) で報告する",
-    "3. board_complete_handoff({item_id, request_id, generation, outcome: 'done', text}) で結果を報告して締める（終われなければ outcome: 'stopped'）",
+    ...finish,
     "STALE_GENERATION や HANDOFF_CONFLICT が返ったら、あなたの実行は差し替えられたか状態が変わっています。それ以上書かず、そのまま終了してください。",
     "受領に失敗したら別の作業には移らず、そのまま終了してください。",
   ].filter((line): line is string => line !== null).join("\n");
 }
 
+export function dispatchPrompt(item: Record<string, unknown>): string {
+  return handoffPrompt(item, "MANY_IRIS_BOARD_KEY", [
+    "3. board_complete_handoff({item_id, request_id, generation, outcome: 'done', text}) で結果を報告して締める（終われなければ outcome: 'stopped'）",
+  ]);
+}
+
+/** The prompt for a `musedev` start (the Muse family's own Devin). Its board
+ * key is its own — the restricted `musedev` writer, which can only take work
+ * addressed to musedev and report through the fenced tools — and the work
+ * comes back as a Draft PR: the session pushes a branch, opens a Draft PR,
+ * and names its URL as the result's `ref` so the card's 結果 links to it. */
+export function musedevPrompt(item: Record<string, unknown>): string {
+  return handoffPrompt(item, "MANY_IRIS_BOARD_KEY_MUSEDEV", [
+    "3. 作業結果は Draft PR として返す。変更はブランチにまとめて push し、Draft PR として開く（gh pr create --draft など）。",
+    "4. board_complete_handoff({item_id, request_id, generation, outcome: 'done', text, ref: <開いた Draft PR の URL>}) で結果を報告して締める（終われなければ outcome: 'stopped'）",
+  ]);
+}
+
 /** Gives one request without a destination its place from the owner's order. Returns the destination set, or null when the board kept another state. */
 async function routeOne(deps: DispatchDeps, item: Record<string, unknown>, order: readonly string[], seen: Record<string, number>, now: number): Promise<string | null> {
-  const decision = chooseByOrder(order, (target) => isAlive(target, seen, now, Boolean(deps.startDevin)));
+  const ready = { devin: Boolean(deps.startDevin), musedev: Boolean(deps.startMusedev) };
+  const decision = chooseByOrder(order, (target) => isAlive(target, seen, now, ready));
   // Work the owner handed over and the owner's order placed is the owner's
   // choice (route.ts OWNER_ACTOR); anything else names the dispatcher.
   const toSetBy = decision.to !== "hold" && item.requested_by === OWNER_ACTOR ? OWNER_ACTOR : DISPATCH_ACTOR;
@@ -124,13 +147,16 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
       if (to !== null) item.to = to;
     }
   }
-  if (!deps.startDevin) return;
+  if (!deps.startDevin && !deps.startMusedev) return;
   const now = clock();
   let started = 0;
   for (const item of items) {
     if (started >= DISPATCH_MAX_PER_TICK) break;
-    // Only work for Devin: any other destination is not Devin's to take (the board refuses it).
-    if (item.to !== "devin") continue;
+    // Only work for a destination the board starts itself; any other
+    // destination is left for that writer to pick up.
+    const dest = item.to === "devin" || item.to === "musedev" ? item.to : null;
+    const start = dest === "devin" ? deps.startDevin : dest === "musedev" ? deps.startMusedev : null;
+    if (dest === null || !start) continue;
     const request = item.request_id;
     if (typeof request !== "string") continue;
     const state = await deps.board.dispatchState(request, now - DAY_MS);
@@ -150,7 +176,7 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     started += 1;
     let session: DevinStart = null;
     try {
-      session = await deps.startDevin(dispatchPrompt(item));
+      session = await start(dest === "musedev" ? musedevPrompt(item) : dispatchPrompt(item));
     } catch {
       session = null;
     }
@@ -162,7 +188,7 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
       await deps.board.run("board_add_event", DISPATCH_ACTOR, {
         item_id: item.item_id,
         kind: "note",
-        text: `dispatch of ${request} to devin was refused (HTTP ${session.refused}): no session was started. A later tick tries again, at most ${DISPATCH_MAX_PER_REQUEST} times per request`,
+        text: `dispatch of ${request} to ${dest} was refused (HTTP ${session.refused}): no session was started. A later tick tries again, at most ${DISPATCH_MAX_PER_REQUEST} times per request`,
       });
       continue;
     }
@@ -174,7 +200,7 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
       await deps.board.run("board_add_event", DISPATCH_ACTOR, {
         item_id: item.item_id,
         kind: "note",
-        text: `dispatch of ${request} to devin is unknown: the start's answer was lost, so it will not be retried automatically. Check the Devin side, then settle it with board_resolve_dispatch`,
+        text: `dispatch of ${request} to ${dest} is unknown: the start's answer was lost, so it will not be retried automatically. Check the Devin side, then settle it with board_resolve_dispatch`,
       });
       continue;
     }
@@ -182,7 +208,7 @@ export async function runDispatcher(deps: DispatchDeps): Promise<void> {
     await deps.board.run("board_add_event", DISPATCH_ACTOR, {
       item_id: item.item_id,
       kind: "note",
-      text: `dispatched ${request} to devin session ${session.session_id ?? "unknown"}`,
+      text: `dispatched ${request} to ${dest} session ${session.session_id ?? "unknown"}`,
       // board_add_event takes no null ref; the field is simply left out.
       ...(typeof session.url === "string" ? { ref: session.url } : {}),
     });
