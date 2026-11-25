@@ -775,6 +775,7 @@ check("another unknown project is still refused", (await ownerCode({ op: "add", 
 const firstRepo = await (await ownerPost({ op: "add", project: "sample-tabs", title: "inspect tabs", new_repository: true })).json();
 check("a chat can start in a named repository before it has any cards", firstRepo.item?.project === "sample-tabs");
 check("a repository path is not a project name", (await ownerCode({ op: "add", project: "../other", title: "x", new_repository: true })) === "400 INVALID");
+check("repository intake preserves status-only policy across letter case", (await ownerCode({ op: "add", project: "Quiet", title: "x", new_repository: true })) === "403 FORBIDDEN");
 const chatPage = await fetch(`${base}/chat`, { headers: jar });
 check("the chat page is served", chatPage.status === 200 && (await chatPage.text()).includes('src="/chat.js"'));
   check("the owner can switch partners", (await ownerCode({ op: "chat_send", item_id: orderWork, text: "Devin でも見て", to: "vps-devin" })) === "200 OK" &&

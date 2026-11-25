@@ -1871,7 +1871,10 @@ export class Store {
       const newRepository = obj.new_repository === true;
       if (has(obj, "new_repository")) {
         if (!newRepository || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$/.test(project)) throw invalid("Invalid repository name");
-        this.requireChatAllowed(project);
+        // Repository names on GitHub are case-insensitive. Honor the board's
+        // registered spelling when checking whether this chat may be created.
+        const registered = [...this.statusOnlyMap.keys()].find(name => name.toLowerCase() === project.toLowerCase());
+        this.requireChatAllowed(registered ?? project);
       }
       const known = num((this.sql.exec("SELECT COUNT(*) AS n FROM board_items WHERE project=?", project).one() as Row).n);
       if (known === 0 && project !== CHAT_PROJECT && !newRepository) throw new BoardError("NOT_FOUND", "No such project");
